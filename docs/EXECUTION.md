@@ -23,6 +23,8 @@ The machines (mochi, carbonio) have SLURM on a single node. Submitting each long
 | `P_PROCS` | integer (1) | MPI ranks per study (cfdt, lmpt) or threads (feat, CalculiX), as today. A study's own `procs` overrides it. |
 | `P_TIMEOUT` | seconds | Per study, as today. With SLURM it also sets the job's time limit (below). |
 | `P_WORKERS` | integer (2) | Local pool only. With SLURM, the queue decides how many run at once. |
+| `P_SLURM_MEM` | `auto` \| a size \| `none` (`auto`) | The job's `--mem`. `auto`: from the study (lmpt: 1 GB + 256 MB per rank + 4 kB per atom, at least 2 GB). `none`: SLURM's default. A `--mem…` in `P_SLURM_ARGS` wins. Implemented by lmpt; proposed for all (below, "Memory"). |
+| `P_SLURM_TIME` | `timeout` \| `estimate` (`timeout`) | The job's `--time`. `estimate`: max(`P_SLURM_TIME_MIN` (20), ceil(`P_SLURM_TIME_FACTOR` (3) × the study's estimate) + 10) minutes, at most the `timeout` value; the study's own timeout is 10 minutes less. Implemented by lmpt; proposed for all (below, "Time limits and backfill"). |
 
 A study can also say `"queue": true` (always SLURM) or `"queue": false` (always local). That overrides `P_SLURM_MIN_MINUTES` but not `P_EXECUTOR=local`.
 
@@ -38,13 +40,16 @@ A study can also say `"queue": true` (always SLURM) or `"queue": false` (always 
 #SBATCH --chdir=<request>/<name>
 #SBATCH --output=<request>/<name>/job.log
 #SBATCH --ntasks=<procs>                  # MPI (cfdt, lmpt); feat: --ntasks=1 --cpus-per-task=<procs>
-#SBATCH --time=<ceil(P_TIMEOUT/60) + 10>  # minutes; the translator's own timeout fires first
+#SBATCH --time=<ceil(P_TIMEOUT/60) + 10>  # minutes; the translator's own timeout fires first (P_SLURM_TIME)
+#SBATCH --mem=<P_SLURM_MEM>                # unless none, or P_SLURM_ARGS has --mem
 #SBATCH --export=ALL                      # the server's environment: config/env, backend paths
 exec <sys.executable> -m cfd_translator.cli run-study <request> <name>
 ```
 
 - **Job name.** The `<cli>:` prefix is how `llmt jobs` and the `jobs` tool find the translators' jobs among the user's others.
 - **Time limit.** It is 10 minutes longer than `P_TIMEOUT`, so the translator stops itself first and writes a clean "timed out" result. SLURM's limit is only the backstop.
+- **Memory.** Ask for it. With `SelectTypeParameters=CR_Core_Memory` and no `DefMemPerCPU`/`DefMemPerNode`, SLURM gives a job that does not ask the node's whole memory, so jobs run one at a time whatever the free cores: found on mochi (`DefMemPerNode=UNLIMITED`, every job `mem=60000M`). An estimate from the study (or a fixed `P_SLURM_MEM`) lets jobs share the node; a job that runs out ends `out_of_memory` with what to raise. Setting `DefMemPerCPU` in `slurm.conf` also works, but it changes every user's jobs.
+- **Time limits and backfill.** A job that asks for `P_TIMEOUT` + 10 min (hours) cannot be backfilled: SLURM starts a lower-priority job early only if it ends before the next big job's reserved start. `P_SLURM_TIME=estimate` gives short studies short limits so they fill free cores; the price is that a study that outruns its estimate times out (its result says to rerun with `P_SLURM_TIME=timeout`).
 - **Environment.** The job runs the same Python as the server, so the same venv. `--export=ALL` carries everything `bin/mcp` loaded.
 - **Reproducibility.** `job.sh` is a complete script, so `sbatch job.sh` reruns the study by hand.
 
@@ -52,7 +57,7 @@ exec <sys.executable> -m cfd_translator.cli run-study <request> <name>
 
 ```json
 {"executor": "slurm", "job_id": "12345", "submitted": 1760760000.0, "procs": 9, "time_min": 190,
- "command": ["sbatch", "--parsable", "job.sh"]}
+ "time_from": "timeout", "timeout_s": 10800, "mem": "4096M", "command": ["sbatch", "--parsable", "job.sh"]}
 ```
 
 If `sbatch` fails (not installed, controller down), the study's result is `{"ok": false, "why": "could not submit: <sbatch's message>"}`. The translator never falls back to local silently.
@@ -134,7 +139,8 @@ Threaded translators (feat) put threads in `procs_requested`/`procs_used` and le
 `tool_status()` (`<cli> status`) adds:
 
 ```json
-"executor": {"kind": "slurm", "sbatch": "/usr/bin/sbatch", "min_minutes": 0, "procs": 9, "time_limit_min": 190}
+"executor": {"kind": "slurm", "sbatch": "/usr/bin/sbatch", "min_minutes": 0, "procs": 9, "time_limit_min": 190,
+             "time": "timeout", "mem": "auto"}
 ```
 
 `llmt status` reads this key to show the executor and to tell that a translator supports this contract. If `P_EXECUTOR` is set but the key is missing, it warns that the installed version ignores the setting.

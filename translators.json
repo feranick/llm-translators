@@ -116,7 +116,11 @@
     "LMPT_MPIRUN": "MPI launcher (default mpirun)",
     "LMPT_EXECUTOR": "local | slurm: long studies as SLURM jobs (docs/EXECUTION.md)",
     "LMPT_SLURM_MIN_MINUTES": "studies estimated shorter than this run locally",
-    "LMPT_SLURM_ARGS": "extra sbatch arguments, e.g. --mem=64G"
+    "LMPT_SLURM_ARGS": "extra sbatch arguments, e.g. --nice=100 (a --mem here replaces LMPT_SLURM_MEM)",
+  "LMPT_SLURM_MEM": "job memory: auto (default: from ranks and atoms) | a size, e.g. 8G | none (SLURM's default)",
+  "LMPT_SLURM_TIME": "job time limit: timeout (default: LMPT_TIMEOUT + 10 min) | estimate (from the study's estimate, for backfill)",
+  "LMPT_SLURM_TIME_FACTOR": "with LMPT_SLURM_TIME=estimate: limit = factor x estimate + 10 min (default 3)",
+  "LMPT_SLURM_TIME_MIN": "with LMPT_SLURM_TIME=estimate: shortest limit, minutes (default 20)"
    }
   }
  }

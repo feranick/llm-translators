@@ -100,7 +100,8 @@ srun -n 2 hostname                      # a two-task job runs
 ./llmt status                           # SLURM: CPUs in use, translator jobs
 ```
 
-Memory: SLURM does not limit memory unless configured to. To give large studies a reservation, add `--mem=...` to `CFDT_SLURM_ARGS` (or `LMPT_`, `FEAT_`).
+- **Memory.** Check `scontrol show config | grep -E 'SelectTypeParameters|DefMem'`. With `CR_Core_Memory` and `DefMemPerNode = UNLIMITED` (no `DefMemPerCPU`), a job that does not ask for memory gets the whole node, and jobs run one at a time however many cores are free (mochi: every job `mem=60000M`). lmpt asks for memory itself (`LMPT_SLURM_MEM=auto`); for the others, put `--mem=...` in `CFDT_SLURM_ARGS` / `FEAT_SLURM_ARGS` (e.g. `--mem=16G`). Alternatively set `DefMemPerCPU` in `slurm.conf` (about RealMemory / CPUs, e.g. 1500 on a 64 GB, 40-CPU node), which changes the default for everyone's jobs.
+- **Time limits.** Long limits block backfill: a short study waits behind a large job even when cores are free. `LMPT_SLURM_TIME=estimate` sizes lmpt's limits from each study's estimate.
 
 ## Where things run
 
