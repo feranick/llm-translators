@@ -9,8 +9,9 @@
     llmt update [--latest]          pull, check out the pinned (or latest) commits, reinstall
     llmt test [KEY...]              each translator's pytest suite
     llmt bench KEY [NAMES...]       a translator's benchmarks
+    llmt alias [--name N] [--rc F]  shell alias that activates the venv (default llmt-venv; old ones commented out)
     llmt env [--edit]               the per-machine settings file (config/env)
-    llmt mcp setup                  choose local / remote (ssh) / none per translator
+    llmt mcp setup                  choose local / remote (ssh) / existing install / none per translator
     llmt mcp config [--print | --claude-code | --file F]   write or print the MCP client entries
     llmt mcp serve [KEY...] [--host H]   serve MCP over streamable HTTP on each translator's port
 
@@ -34,7 +35,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-__version__ = "2026.10.17.1"
+__version__ = "2026.10.18.1"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -303,7 +304,7 @@ def make_venv(python: str | None) -> None:
     if v < (3, 10):
         die(f"{py} is Python {'.'.join(map(str, v))}: 3.10 or later is needed (llmt install --python PATH)")
     say(f"  creating the venv with {py} (Python {'.'.join(map(str, v))})")
-    run([py, "-m", "venv", VENV])
+    run([py, "-m", "venv", "--prompt", "llm-translators", VENV])
     run([VPY, "-m", "pip", "install", "--quiet", "--upgrade", "pip"])
 
 
@@ -371,6 +372,93 @@ def do_install(keys: list[str], setup: dict, python: str | None, interactive: bo
     save_setup(setup)
     ensure_env_file()
     say("  done.")
+
+
+# ---------------------------------------------------------------- shell alias
+
+ALIAS_NAME = "llmt-venv"
+ALIAS_BEGIN = "# >>> llm-translators >>>"
+ALIAS_END = "# <<< llm-translators <<<"
+RC_FILES = [".bashrc", ".bash_aliases", ".bash_profile", ".profile", ".zshrc"]
+_OLD_ALIAS = re.compile(r"^\s*alias\s+([A-Za-z0-9_.-]+)=(['\"]?)\s*(?:source|\.)\s+(\S*(?:%s)/\.venv/bin/activate)\s*\2\s*$"
+                        % "|".join(re.escape(t["repo"]) for t in REGISTRY.values()))
+
+
+def default_rc() -> Path:
+    return Path.home() / (".zshrc" if os.path.basename(os.environ.get("SHELL", "")) == "zsh" else ".bashrc")
+
+
+def alias_line(name: str) -> str:
+    try:
+        p = "~/" + str(ROOT.relative_to(Path.home()))
+    except ValueError:
+        p = str(ROOT)
+    if re.search(r"[^\w@%+=:,./~-]", p):
+        return f"alias {name}='source \"{ROOT}/bin/activate\"'"
+    return f"alias {name}='source {p}/bin/activate'"
+
+
+def old_aliases() -> list[tuple[Path, int, str, str]]:
+    """Aliases in the shell startup files that activate a translator's own venv (the earlier layout,
+    e.g. alias cad='source ~/Software/build123d-translator/.venv/bin/activate')."""
+    out = []
+    for f in RC_FILES:
+        p = Path.home() / f
+        try:
+            lines = p.read_text().splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for i, line in enumerate(lines):
+            m = _OLD_ALIAS.match(line)
+            if m:
+                out.append((p, i, m.group(1), m.group(3)))
+    return out
+
+
+def install_alias(name: str, rc: Path, comment_old: bool) -> None:
+    """Writes 'alias NAME=source <root>/bin/activate' in a marked block of rc (replacing an earlier
+    block) and comments out the old translator-venv aliases. Each changed file is backed up first."""
+    stamp = f"{_dt.datetime.now():%Y%m%d-%H%M%S}"
+    old = old_aliases() if comment_old else []
+    files = sorted({p for p, *_ in old} | {rc})
+    for f in files:
+        text = f.read_text() if f.exists() else ""
+        lines = text.splitlines()
+        new = list(lines)
+        for p, i, oname, path in old:
+            if p == f:
+                new[i] = f"# {lines[i]}   # replaced by '{name}' (llm-translators)"
+                say(f"  {f}: commented out the old alias '{oname}' ({path})")
+        if f == rc:
+            if ALIAS_BEGIN in new and ALIAS_END in new:
+                a, b = new.index(ALIAS_BEGIN), new.index(ALIAS_END)
+                new = new[:a] + new[b + 1:]
+                while new and not new[-1].strip():
+                    new.pop()
+            block = [ALIAS_BEGIN, "# the llm-translators venv and its settings (config/env)", alias_line(name), ALIAS_END]
+            new += ([""] if new else []) + block
+            say(f"  {f}: {alias_line(name)}")
+        if new != lines:
+            if f.exists():
+                shutil.copy2(f, f.with_name(f.name + f".bak-llmt-{stamp}"))
+            f.write_text("\n".join(new) + "\n")
+    say(f"  Open a new shell (or 'source {rc}'), then '{name}' activates the environment; 'deactivate' leaves it.")
+
+
+def alias_interactive(setup: dict) -> None:
+    old = old_aliases()
+    prev = setup.get("alias", {})
+    say("\nShell alias")
+    for p, i, oname, path in old:
+        say(f"  {p} line {i + 1}: alias '{oname}' activates {path} (the earlier layout)")
+    if not yes(f"Add an alias that activates llm-translators' venv to your shell startup file?", bool(old) or not prev):
+        return
+    name = ask("alias name", prev.get("name", ALIAS_NAME))
+    rc = Path(ask("in", prev.get("rc", str(default_rc())))).expanduser()
+    comment = bool(old) and yes(f"Comment out the old alias{'es' if len(old) > 1 else ''} ({', '.join(o[2] for o in old)})?", True)
+    install_alias(name, rc, comment)
+    setup["alias"] = {"name": name, "rc": str(rc)}
+    save_setup(setup)
 
 
 # ---------------------------------------------------------------- status
@@ -471,85 +559,268 @@ def claude_desktop_config() -> Path:
     return home / ".config" / "Claude" / "claude_desktop_config.json"
 
 
+SSH_OPTS = ["-T", "-o", "BatchMode=yes"]
+
+
+def ssh_exe() -> str:
+    return shutil.which("ssh") or "/usr/bin/ssh"
+
+
+def entry_text(e: dict) -> str:
+    s = " ".join([str(e.get("command", ""))] + [str(x) for x in e.get("args", [])])
+    if e.get("env"):
+        s += "  (env: " + " ".join(f"{k}={v}" for k, v in e["env"].items()) + ")"
+    return s
+
+
+def is_managed(e: dict) -> bool:
+    """Entries llmt writes run llm-translators' bin/mcp."""
+    return "/bin/mcp" in entry_text(e)
+
+
 def mcp_entry(key: str, spec: dict) -> dict:
-    if spec.get("where") == "remote":
-        ssh = shutil.which("ssh") or "/usr/bin/ssh"
+    w = spec.get("where")
+    if w == "remote":
         root = spec.get("root", "~/Software/llm-translators").rstrip("/")
-        return {"command": ssh, "args": ["-T", "-o", "BatchMode=yes", spec["host"], f"{root}/bin/mcp", key]}
+        return {"command": ssh_exe(), "args": [*SSH_OPTS, spec["host"], f"{root}/bin/mcp", key]}
+    if w == "existing":
+        return dict(spec["entry"])
     return {"command": str(ROOT / "bin" / "mcp"), "args": [key]}
 
 
 def mcp_entries(setup: dict) -> dict:
-    return {k: mcp_entry(k, s) for k, s in setup.get("mcp", {}).items() if s.get("where") in ("local", "remote")}
+    return {k: mcp_entry(k, s) for k, s in setup.get("mcp", {}).items()
+            if s.get("where") in ("local", "remote", "existing")}
 
 
-def check_remote(host: str, root: str, keys: list[str]) -> None:
-    cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{root}/llmt", "status", "--json", *keys]
-    say("  $ " + " ".join(shlex.quote(c) for c in cmd))
+def existing_entry(path: str, host: str | None, env: dict[str, str]) -> dict:
+    """An MCP entry for a translator installed outside llm-translators (its own venv, no config/env)."""
+    if host:
+        pre = ["env", *[f"{k}={shlex.quote(v)}" for k, v in env.items()]] if env else []
+        return {"command": ssh_exe(), "args": [*SSH_OPTS, host, *pre, path]}
+    e = {"command": path, "args": []}
+    if env:
+        e["env"] = dict(env)
+    return e
+
+
+def desktop_servers() -> dict:
+    p = claude_desktop_config()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return json.loads(p.read_text() or "{}").get("mcpServers", {}) if p.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+_PROBE = r'''
+root={root}
+echo "ROOT $root"
+if [ -x "$root/llmt" ]; then echo "LLMT"; fi
+for k in {keys}; do
+  for p in "$(command -v $k-mcp 2>/dev/null)" "$HOME"/Software/*/.venv/bin/$k-mcp "$HOME"/Software/*/venv/bin/$k-mcp \
+           "$HOME"/*/.venv/bin/$k-mcp "$HOME"/Desktop/*/.venv/bin/$k-mcp "$HOME"/.local/bin/$k-mcp; do
+    if [ -n "$p" ] && [ -x "$p" ]; then echo "MCP $k $p"; fi
+  done
+done
+'''
+
+_PROBES: dict = {}
+
+
+def probe(host: str | None, root: str, keys: list[str] | None = None) -> dict | None:
+    """Looks on this machine (host None) or over ssh for llm-translators at root and for translators
+    installed elsewhere (<key>-mcp in other venvs: the layout before llm-translators).
+    -> {"root": expanded root, "llmt": bool, "found": {key: [paths outside root/.venv]}} or None."""
+    keys = keys or KEYS
+    cache = (host, root, tuple(keys))
+    if cache in _PROBES:
+        return _PROBES[cache]
+    r_ = root.rstrip("/")
+    r_ = '"$HOME' + r_[1:] + '"' if r_.startswith("~") else shlex.quote(r_)
+    script = _PROBE.replace("{root}", r_).replace("{keys}", " ".join(keys))
+    cmd = ["sh", "-s"] if host is None else [ssh_exe(), *SSH_OPTS, "-o", "ConnectTimeout=10", host, "sh -s"]
+    try:
+        r = subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as exc:
         warn(f"could not reach {host}: {exc}")
-        return
-    if r.returncode != 0:
-        warn(f"{host}: {(r.stderr or r.stdout).strip()[-400:] or 'failed'}")
-        warn(f"install llm-translators on {host} at {root} and run its 'llmt setup' there")
-        return
+        _PROBES[cache] = None
+        return None
+    if r.returncode != 0 and "ROOT " not in r.stdout:
+        warn(f"{host or 'this machine'}: {(r.stderr or r.stdout).strip()[-300:] or 'failed'}")
+        _PROBES[cache] = None
+        return None
+    out = {"root": root, "llmt": False, "found": {}}
+    for line in r.stdout.splitlines():
+        if line.startswith("ROOT "):
+            out["root"] = line[5:]
+        elif line == "LLMT":
+            out["llmt"] = True
+        elif line.startswith("MCP "):
+            _, k, p = line.split(" ", 2)
+            if not p.startswith(out["root"].rstrip("/") + "/.venv/"):
+                lst = out["found"].setdefault(k, [])
+                if p not in lst:
+                    lst.append(p)
+    _PROBES[cache] = out
+    return out
+
+
+_REMOTE_STATUS: dict = {}
+
+
+def remote_status(host: str, root: str) -> dict | None:
+    """llmt status --json on host (cached)."""
+    if (host, root) in _REMOTE_STATUS:
+        return _REMOTE_STATUS[(host, root)]
+    cmd = [ssh_exe(), *SSH_OPTS, "-o", "ConnectTimeout=10", host, f"{root}/llmt", "status", "--json"]
+    say(f"  checking llm-translators on {host} ...")
+    data = None
     try:
-        data = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        warn(f"{host}: unexpected answer: {r.stdout[:200]}")
-        return
-    for k in keys:
-        d = data["translators"].get(k, {})
-        if not d.get("version"):
-            warn(f"{k} is not installed on {host} (there: llmt install {k})")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode == 0:
+            data = json.loads(r.stdout)
+        else:
+            warn(f"{host}: {(r.stderr or r.stdout).strip()[-300:] or 'llmt status failed'}")
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        warn(f"{host}: {exc}")
+    _REMOTE_STATUS[(host, root)] = data
+    return data
+
+
+def ask_env(key: str, default: dict[str, str] | None = None) -> dict[str, str]:
+    """Settings for an install outside llm-translators: they go into the entry itself."""
+    names = ", ".join(REGISTRY[key]["env"]) or "none known"
+    cur = " ".join(f"{k}={v}" for k, v in (default or {}).items())
+    say(f"  An install outside llm-translators does not read config/env: settings go into the entry ({names}).")
+    while True:
+        text = ask("settings, VAR=value separated by spaces (empty: none)", cur)
+        try:
+            pairs = shlex.split(text)
+        except ValueError as exc:
+            warn(str(exc))
             continue
-        bes = d.get("backends", {})
-        miss = [n for n, v in bes.items() if not v["found"]]
-        say(f"  {host}: {k} {d['version']}" + (f"; missing: {', '.join(miss)}" if miss else "; backends ok"))
+        bad = [p for p in pairs if not re.match(r"[A-Za-z_][A-Za-z0-9_]*=", p)]
+        if bad:
+            warn(f"not VAR=value: {' '.join(bad)}")
+            continue
+        return dict(p.split("=", 1) for p in pairs)
+
+
+def pick_path(key: str, found: list[str], where: str) -> str:
+    if found:
+        for i, p in enumerate(found, 1):
+            say(f"    {i}. {p}")
+        a = ask(f"{key}-mcp to use (number or path)", "1")
+        if a.isdigit() and 1 <= int(a) <= len(found):
+            return found[int(a) - 1]
+        return a
+    p = ""
+    while not p:
+        p = ask(f"path of {key}-mcp on {where}", "")
+    return p
+
+
+def choose_existing(key: str, current: dict | None, last_host: str) -> dict | None:
+    """[e]xisting: keep the current entry, or point at a translator installed outside llm-translators."""
+    if current and not is_managed(current):
+        if yes(f"Keep the current entry ({entry_text(current)})?", True):
+            return {"where": "existing", "entry": current}
+    host = ask("where is it installed? user@host for ssh, empty for this machine", last_host) or None
+    found = []
+    if host is None or yes(f"Look for installs on {host} now (ssh)?", True):
+        info = probe(host, "~/Software/llm-translators")
+        found = (info or {}).get("found", {}).get(key, [])
+        if not found:
+            say(f"  no {key}-mcp found in the usual places on {host or 'this machine'}")
+    path = pick_path(key, found, host or "this machine")
+    env = ask_env(key)
+    return {"where": "existing", "host": host, "entry": existing_entry(path, host, env)}
+
+
+def report_remote(key: str, host: str, root: str, spec: dict) -> dict:
+    """After choosing [r]emote: checks host; if llm-translators or the translator is missing there but
+    an older install of it is found, offers to use that one meanwhile. Returns the spec to keep."""
+    info = probe(host, root)
+    if info is None:
+        warn(f"{host} not reachable now: the entry is written anyway; check later with 'llmt mcp setup'")
+        return spec
+    old = info["found"].get(key, [])
+    if info["llmt"]:
+        data = remote_status(host, root)
+        d = (data or {}).get("translators", {}).get(key, {})
+        if d.get("version"):
+            miss = [n for n, v in d.get("backends", {}).items() if not v["found"]]
+            say(f"  {host}: {key} {d['version']} in llm-translators" +
+                (f"; missing: {', '.join(miss)} (see BACKENDS.md)" if miss else "; backends ok"))
+            return spec
+        warn(f"{key} is not installed in llm-translators on {host} (there: {root}/llmt install {key})")
+    else:
+        warn(f"llm-translators is not at {root} on {host}")
+    if old:
+        say(f"  {host} has {key} installed outside llm-translators:")
+        if yes(f"Use that install for now (until llm-translators is set up there)?", True):
+            path = pick_path(key, old, host)
+            return {"where": "existing", "host": host, "entry": existing_entry(path, host, ask_env(key))}
+    say(f"  Set it up on {host} before restarting the Claude app: clone llm-translators to {root}, "
+        f"then '{root}/llmt install {key}'.")
+    return spec
 
 
 def mcp_setup_interactive(setup: dict) -> None:
     say("\nMCP servers for the Claude app on THIS machine. For each translator:")
-    say("  l = local (installed here), r = remote over ssh (installed on another machine), n = none")
+    say("  l = local (llm-translators here)    r = remote (llm-translators on another machine, over ssh)")
+    say("  e = existing (an install outside llm-translators, here or over ssh)    n = none")
     mcp = setup.setdefault("mcp", {})
     inst = set(installed_in_venv())
+    current = desktop_servers()
+    here = probe(None, str(ROOT)) or {"found": {}}
     last_host, last_root = "", "~/Software/llm-translators"
     for s in mcp.values():
         if s.get("where") == "remote":
             last_host, last_root = s.get("host", last_host), s.get("root", last_root)
+        elif s.get("where") == "existing" and s.get("host"):
+            last_host = s["host"]
     for k in KEYS:
         t = REGISTRY[k]
-        cur = mcp.get(k, {}).get("where")
-        default = {"local": "l", "remote": "r", "none": "n"}.get(cur or "", "l" if k in inst else "n")
-        say(f"\n  {k} ({t['repo']}): {t['cost']}" + ("" if k in inst else "  [not installed here]"))
+        cur_entry = current.get(k)
+        prev = mcp.get(k, {})
+        if prev.get("where"):
+            default = {"local": "l", "remote": "r", "existing": "e", "none": "n"}[prev["where"]]
+        elif cur_entry and not is_managed(cur_entry):
+            default = "e"
+        else:
+            default = "l" if k in inst else "n"
+        say(f"\n  {k} ({t['repo']}): {t['cost']}" + ("" if k in inst else "  [not in llm-translators here]"))
+        if cur_entry:
+            say(f"  current entry{'' if is_managed(cur_entry) else ' (not from llmt)'}: {entry_text(cur_entry)}")
         while True:
-            a = ask(f"{k}: [l]ocal, [r]emote, [n]one", default).lower()[:1]
-            if a in ("l", "r", "n"):
+            a = ask(f"{k}: [l]ocal, [r]emote, [e]xisting, [n]one", default).lower()[:1]
+            if a in ("l", "r", "e", "n"):
                 break
         if a == "l":
             if k not in inst:
-                warn(f"{k} is not installed here yet: llmt install {k}")
+                old = here["found"].get(k, [])
+                warn(f"{k} is not installed in llm-translators here yet: llmt install {k}" +
+                     (f" (or choose [e]xisting for {old[0]})" if old else ""))
             mcp[k] = {"where": "local"}
         elif a == "r":
-            prev = mcp.get(k, {})
             host = ask("ssh host (user@host, keys set up for BatchMode)", prev.get("host", last_host))
             while not host:
                 host = ask("ssh host (user@host)", "")
             root = ask(f"llm-translators folder on {host}", prev.get("root", last_root))
-            mcp[k] = {"where": "remote", "host": host, "root": root}
+            spec = {"where": "remote", "host": host, "root": root}
+            if yes(f"Check {host} now (ssh)?", True):
+                spec = report_remote(k, host, root, spec)
+            mcp[k] = spec
             last_host, last_root = host, root
+        elif a == "e":
+            spec = choose_existing(k, cur_entry, last_host)
+            if spec:
+                mcp[k] = spec
+                last_host = spec.get("host") or last_host
         else:
             mcp[k] = {"where": "none"}
     save_setup(setup)
-    remotes: dict[tuple[str, str], list[str]] = {}
-    for k, s in mcp.items():
-        if s.get("where") == "remote":
-            remotes.setdefault((s["host"], s["root"]), []).append(k)
-    for (host, root), ks in remotes.items():
-        if yes(f"Check {', '.join(ks)} on {host} now (ssh)?", True):
-            check_remote(host, root, ks)
     entries = mcp_entries(setup)
     if not entries:
         say("\n  No MCP servers chosen for this machine.")
@@ -561,6 +832,10 @@ def mcp_setup_interactive(setup: dict) -> None:
         write_desktop_config(entries, path, [k for k, s in mcp.items() if s.get("where") == "none"])
     else:
         say("  Later: llmt mcp config   (or --print, --claude-code)")
+    ext = [k for k, s in mcp.items() if s.get("where") == "existing"]
+    if ext:
+        say(f"\n  {', '.join(ext)}: using installs outside llm-translators. To move them over later, set up")
+        say("  llm-translators there and choose [l]ocal or [r]emote here ('llmt mcp setup').")
 
 
 def write_desktop_config(entries: dict, path: Path, drop: list[str]) -> None:
@@ -653,6 +928,16 @@ def cmd_setup(a) -> None:
     say("Available translators:")
     table()
 
+    elsewhere = (probe(None, str(ROOT)) or {}).get("found", {})
+    if elsewhere:
+        say("\nAlready installed on this machine outside llm-translators (the earlier layout):")
+        for k, paths in elsewhere.items():
+            for p in paths:
+                say(f"  {k}: {p}")
+        say("  They keep working and stay untouched. Installing a translator here makes a separate copy in")
+        say("  llm-translators' venv; in step 4 the Claude app can use either ([l]ocal or [e]xisting). After")
+        say("  switching to llm-translators, the old venvs can be deleted.")
+
     say("\nStep 1/4 — Which translators should be installed on THIS machine?")
     say("  Light ones belong next to the Claude app; heavy solvers can live on a workstation reached over ssh")
     say("  (step 4). Installing nothing here is fine if this machine only runs the Claude app.")
@@ -725,6 +1010,7 @@ def cmd_setup(a) -> None:
                 if REGISTRY[k]["backends"]:
                     for name, ok, what, _ in backend_report(k, tool_status(k)):
                         say(f"  {k}: {name}: " + ("ok" if ok else "still missing") + f" ({what})")
+        alias_interactive(setup)
     else:
         say("\n  Nothing to install here (steps 2 and 3 skipped).")
         save_setup(setup)
@@ -844,6 +1130,24 @@ def cmd_bench(a) -> None:
     os.execv(str(ROOT / "bin" / "run"), [str(ROOT / "bin" / "run"), t["cli"], "bench", *a.names])
 
 
+def cmd_alias(a) -> None:
+    if a.print:
+        print(alias_line(a.name))
+        return
+    old = old_aliases()
+    if a.list:
+        for p, i, oname, path in old:
+            say(f"  {p} line {i + 1}: alias '{oname}' -> {path}")
+        if not old:
+            say("  no aliases for translator venvs found")
+        return
+    setup = load_setup()
+    rc = Path(a.rc).expanduser() if a.rc else Path(setup.get("alias", {}).get("rc", default_rc()))
+    install_alias(a.name, rc, not a.keep_old)
+    setup["alias"] = {"name": a.name, "rc": str(rc)}
+    save_setup(setup)
+
+
 def cmd_env(a) -> None:
     ensure_env_file()
     if a.edit:
@@ -909,11 +1213,18 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("bench", help="a translator's benchmarks")
     p.add_argument("key")
     p.add_argument("names", nargs="*")
+    p = sub.add_parser("alias", help="shell alias that activates the venv (replaces the old 'cad' alias)")
+    p.add_argument("--name", default=ALIAS_NAME, help=f"alias name (default {ALIAS_NAME})")
+    p.add_argument("--rc", help="startup file (default ~/.zshrc for zsh, else ~/.bashrc)")
+    p.add_argument("--keep-old", action="store_true", help="leave old translator-venv aliases as they are")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--print", action="store_true", help="only print the alias line")
+    g.add_argument("--list", action="store_true", help="only list old translator-venv aliases")
     p = sub.add_parser("env", help="per-machine settings (config/env)")
     p.add_argument("--edit", action="store_true")
     p = sub.add_parser("mcp", help="MCP servers")
     msub = p.add_subparsers(dest="mcp_cmd", required=True)
-    msub.add_parser("setup", help="local / remote / none per translator")
+    msub.add_parser("setup", help="local / remote / existing / none per translator")
     q = msub.add_parser("config", help="write the Claude desktop config (or print)")
     g = q.add_mutually_exclusive_group()
     g.add_argument("--print", action="store_true", help="print the mcpServers JSON")
@@ -930,7 +1241,7 @@ def main(argv: list[str] | None = None) -> None:
         ap.print_help()
         return
     {"setup": cmd_setup, "list": cmd_list, "install": cmd_install, "remove": cmd_remove, "status": cmd_status,
-     "update": cmd_update, "test": cmd_test, "bench": cmd_bench, "env": cmd_env, "mcp": cmd_mcp}[a.cmd](a)
+     "update": cmd_update, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "env": cmd_env, "mcp": cmd_mcp}[a.cmd](a)
 
 
 if __name__ == "__main__":

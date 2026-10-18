@@ -1,7 +1,7 @@
 # Source this file (bash or zsh) to work in the llm-translators environment:
 #   source ~/Software/llm-translators/bin/activate
 # It activates the venv and exports the settings in config/env.
-# A handy alias:  alias llmt-env='source ~/Software/llm-translators/bin/activate'
+# A handy alias (llmt alias writes it):  alias llmt-venv='source ~/Software/llm-translators/bin/activate'
 if [ -n "${BASH_SOURCE:-}" ]; then _llmt_self="${BASH_SOURCE[0]}"; elif [ -n "${ZSH_VERSION:-}" ]; then _llmt_self="${(%):-%x}"; else _llmt_self="$0"; fi
 _llmt_root=$(CDPATH= cd -- "$(dirname -- "$_llmt_self")/.." && pwd -P)
 if [ -f "$_llmt_root/config/env" ]; then

@@ -11,7 +11,7 @@ One place to install and run the translators that connect LLMs to engineering an
 
 The translators work together: fea and cfd take b3dt goals as geometry, cfd passes wall loads to fea, and lammps produces fea materials. That only works when they are installed in the same venv, which is why there is a single venv here.
 
-Version: 2026.10.17.1.
+Version: 2026.10.18.1.
 
 ## Quick start
 
@@ -27,7 +27,7 @@ cd llm-translators
 1. **What to install on this machine.** It lists the translators with their backends and how heavy they are. Translators that others use are offered too (b3dt with feat, for example).
 2. **Python environment.** It creates `.venv`, checks out only the chosen submodules, and runs `pip install -e` on each with its extras (`mcp`, `mesh`, optionally `test`).
 3. **Backends.** It reports whether Gmsh, CalculiX, OpenFOAM and LAMMPS are found, using each translator's own `status` command. It does not install them: see [BACKENDS.md](BACKENDS.md). You can enter their paths in `config/env`.
-4. **MCP servers.** For the Claude app on this machine, choose for each translator whether it runs locally, on another machine over ssh, or not at all. It writes the entries into `claude_desktop_config.json`, keeping a backup.
+4. **MCP servers.** For the Claude app on this machine, choose for each translator where it runs: *local* (llm-translators here), *remote* (llm-translators on another machine, over ssh), *existing* (an install outside llm-translators, here or over ssh; see [below](#translators-already-installed-elsewhere)), or *none*. It writes the entries into `claude_desktop_config.json`, keeping a backup.
 
 `llmt` needs only git and Python 3.7+ (standard library). The venv needs Python 3.10+. On macOS, `/usr/bin/python3` is 3.9: `llmt` runs with it but builds the venv with the newest `python3.1x` it can find (or the one given with `--python`).
 
@@ -36,7 +36,17 @@ cd llm-translators
 - **The Mac with the Claude app.** Run `./llmt setup`, install `b3dt` and `feat`, and choose MCP *local* for those two and *remote* for `cfdt` and `lmpt` (`nicola@carbonio`, `~/Software/llm-translators`).
 - **The Linux workstation (carbonio).** Run `./llmt setup`, install `cfdt` and `lmpt` (plus `feat` and `b3dt`, which they use), and answer *no* to "Will a Claude app on this machine use the translators?".
 
-The client's remote entry runs `ssh -T -o BatchMode=yes HOST <root>/bin/mcp KEY`, so the remote host needs key-based ssh and the umbrella at that path. During setup `llmt` offers to check the remote host over ssh: it runs `llmt status --json` there.
+The client's remote entry runs `ssh -T -o BatchMode=yes HOST <root>/bin/mcp KEY`, so the remote host needs key-based ssh and the umbrella at that path. When you choose *remote*, `llmt` offers to check the host over ssh: it runs `llmt status --json` there and reports the translator's version and missing backends. If llm-translators or the translator is not there yet, it says so, and it offers any older install it finds on that host (next section).
+
+## Translators already installed elsewhere
+
+Before llm-translators, each translator was installed on its own, typically in `build123d-translator/.venv` (shared by the others through the `cad` alias) or in its repository's own `.venv`, locally or on a workstation. `llmt` finds these installs and keeps them working while you move over:
+
+- **On the machine you set up.** `llmt setup` first lists the `<key>-mcp` commands it finds outside llm-translators: on the PATH, in `~/Software/*/.venv`, `~/*/.venv`, `~/Desktop/*/.venv` and `~/.local/bin`. They are left untouched. Installing a translator here makes a separate copy in llm-translators' venv, and step 4 lets the Claude app use either one.
+- **Current Claude entries.** Step 4 shows each translator's current entry in `claude_desktop_config.json`. If it was not written by `llmt`, the default choice is *existing*, which keeps it as it is.
+- **On a remote machine.** If you choose *remote* and llm-translators is not at the given folder yet (or the translator is not installed in it), `llmt` looks for an older install on that host over ssh and offers to use it for now. Choosing *existing* and giving the host does the same search directly. The entry then runs `ssh HOST [env VAR=value ...] /path/to/<key>-mcp`. An install outside llm-translators does not read `config/env`, so `llmt` asks for any settings it needs (such as `CFDT_FOAM` or `LMPT_LMP`) and puts them into the entry.
+
+To move a translator into llm-translators later, install it there and rerun `llmt mcp setup`, choosing *local* or *remote*. The old entry is replaced, and a backup of the config is kept.
 
 ## Commands
 
@@ -49,8 +59,9 @@ llmt status [KEY...] [-v] [--json]   versions, submodule commits, backends found
 llmt update [KEY...] [--latest] [--no-pull]
 llmt test [KEY...]              pytest in each translator
 llmt bench KEY [NAMES...]       a translator's benchmarks
+llmt alias [--name N] [--rc F]  shell alias for the venv (default llmt-venv; replaces the old 'cad')
 llmt env [--edit]               per-machine settings (config/env)
-llmt mcp setup                  local / remote / none per translator
+llmt mcp setup                  local / remote / existing / none per translator
 llmt mcp config                 write the entries into the Claude desktop config (backup kept)
 llmt mcp config --print         the mcpServers JSON, for any MCP client
 llmt mcp config --claude-code   'claude mcp add-json' commands for Claude Code
@@ -79,11 +90,16 @@ llm-translators/
 
 **Settings.** `config/env` starts as a commented template listing every variable the translators read (`FEAT_CCX`, `CFDT_FOAM`, `LMPT_LMP`, output folders, workers, timeouts, MPI ranks). It also has room for `PATH` additions such as Homebrew's `/opt/homebrew/bin`.
 
-**An interactive shell.** Replace the old `cad` alias (which activated `build123d-translator/.venv`) with:
+**An interactive shell.** `llmt-venv` replaces the old `cad` alias, which activated `build123d-translator/.venv`. It activates llm-translators' venv and also loads `config/env`; `deactivate` leaves it. `llmt setup` offers to add it after installing, or run `llmt alias` at any time. Either way it writes this block to `~/.bashrc` (`~/.zshrc` for zsh; `--rc` for another file):
 
 ```bash
-alias llmt-env='source ~/Software/llm-translators/bin/activate'
+# >>> llm-translators >>>
+# the llm-translators venv and its settings (config/env)
+alias llmt-venv='source ~/Software/llm-translators/bin/activate'
+# <<< llm-translators <<<
 ```
+
+It also comments out old aliases that activate a translator's own venv, such as `alias cad='source ~/Software/build123d-translator/.venv/bin/activate'`, in `~/.bashrc`, `~/.bash_aliases`, `~/.bash_profile`, `~/.profile` and `~/.zshrc`, backing up each file first. Running it again replaces the block. `--name` picks another name, `--keep-old` leaves the old aliases, `--list` only shows them, and `--print` only prints the line.
 
 ## Submodules and versions
 
@@ -100,9 +116,10 @@ The umbrella pins one commit of each translator, so a given umbrella commit is a
 
 ## Moving from the old layout
 
-Before this, each machine had `build123d-translator/.venv`, shared by the others (the `cad` alias), and MCP entries pointing into it. To move:
+Before this, each machine had `build123d-translator/.venv`, shared by the others (the `cad` alias), and MCP entries pointing into it. You can move all at once or one machine at a time; until a machine is moved, its old install keeps serving through *existing* entries ([above](#translators-already-installed-elsewhere)).
 
-1. Clone llm-translators and run `./llmt setup` on each machine (the workstation first, so the client's remote check finds it).
+1. Clone llm-translators and run `./llmt setup` on each machine, the workstation first so the client's remote check finds it. If the workstation has to wait, run setup on the client only and choose *existing* for the translators that stay there for now.
 2. On the client, step 4 replaces the `b3dt`, `feat`, `cfdt` and `lmpt` entries in `claude_desktop_config.json` and keeps a backup. Restart the Claude app.
-3. Move any backend variables you had put in the ssh commands (`env LMPT_LMP=... lmpt-mcp`) into `config/env`.
-4. Once `llmt status` is all `ok`, delete the old `build123d-translator/.venv` and the separate translator clones that only served for installing. Keep the ones you develop in, or develop in the submodules.
+3. Move any backend variables you had put in the ssh commands (`env LMPT_LMP=... lmpt-mcp`) into `config/env` on the machine that runs the translator.
+4. Replace the `cad` alias with `llmt-venv` (`llmt alias`, or `llmt setup` offers it).
+5. Once `llmt status` shows everything as `ok` and no entry is *existing* any more, delete the old `build123d-translator/.venv` and the separate clones that were only used for installing. Keep the ones you develop in, or develop in the submodules.
