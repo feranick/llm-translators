@@ -82,7 +82,9 @@
     "CFDT_PROCS": "MPI ranks per study (default 1)",
     "CFDT_EXECUTOR": "local | slurm: long studies as SLURM jobs (docs/EXECUTION.md)",
     "CFDT_SLURM_MIN_MINUTES": "studies estimated shorter than this run locally",
-    "CFDT_SLURM_ARGS": "extra sbatch arguments, e.g. --mem=64G"
+    "CFDT_SLURM_ARGS": "extra sbatch arguments, e.g. --mem=64G",
+    "CFDT_MPIRUN": "MPI launcher (default mpirun; inside a SLURM job it uses the allocation)",
+    "CFDT_CELLS_PER_RANK": "at most cells/N MPI ranks, so small cases run serially (default 5000)"
    }
   },
   "lmpt": {

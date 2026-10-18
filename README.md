@@ -60,7 +60,7 @@ llmt list                       the translators, their backends, what is install
 llmt install KEY... [--python P] [--extra lmpt:lammps] [--no-test] [--no-uses] [--link-system-gmsh]
 llmt remove KEY...              pip uninstall (sources stay checked out)
 llmt status [KEY...] [-v] [--json]   versions, submodule commits, backends found
-llmt update [KEY...] [--latest] [--no-pull]   pull, check out the pins, reinstall
+llmt update [KEY...] [--latest] [--no-pull] [--no-tune]   pull, check out the pins, reinstall, fill config/env
 llmt pin [KEY...] [--to C] [--commit [--push]]   move the pins to the latest pushed commits
 llmt test [KEY...]              pytest in each translator
 llmt bench KEY [NAMES...]       a translator's benchmarks
@@ -101,7 +101,13 @@ llm-translators/
 
 Settings can be made at two levels:
 
-- **Per machine:** `config/env` on the machine that runs the translator. Use it for backend paths and for limits that belong to the hardware. `llmt setup` asks for backend paths and suggests run limits from the machine's CPU; `llmt tune` does the same at any time (`--print` to only see the suggestion, `--apply` to write it). `llmt env --edit` opens the file.
+- **Per machine:** `config/env` on the machine that runs the translator. Use it for backend paths and for limits that belong to the hardware. `llmt setup` asks for backend paths and suggests run limits from the machine's CPU; `llmt tune` does the same at any time (`--print` to only see the suggestion, `--apply` to write it). `llmt update` and `llmt install` also apply it, without asking, to the settings `config/env` does not have yet:
+  - the SLURM executor when `sbatch` works, MPI ranks per study, and timeouts;
+  - values already there (also `local`, or an empty `VAR=`) are kept, and differences from the suggestion are reported;
+  - the descriptions of settings added since the file was written are added, commented out, to their translator's block;
+  - `--no-tune` leaves the file alone.
+
+  `llmt env --edit` opens the file.
 
   The suggested MPI ranks per study are the physical cores, minus 1 or 2 kept free for the system, meshing and the servers, divided by the studies that can run at a time (`CFDT_WORKERS`, `LMPT_WORKERS`; default 2). For example, a 20-core workstation gets 9 ranks with two studies at a time, or 18 with one. Hyperthreads are not counted, because they do not speed up MPI solvers. With mixed core types (Apple performance and efficiency cores, ARM big.LITTLE), `llmt` says so: ranks on the slower cores hold the others back, so it is worth comparing with as many ranks as there are performance cores. cfdt also gets `CFDT_TIMEOUT=10800` (3 h per study). A `procs` set in a study still overrides these values.
 - **Per MCP server:** `VAR=value` arguments after the key, for example `bin/mcp cfdt CFDT_TIMEOUT=10800 CFDT_PROCS=18`. They apply after `config/env`, so they override it, and only for that entry. This lets two clients use the same workstation with different limits. In `llmt mcp setup`, answer yes to "Settings for this cfdt server", and the entry becomes:

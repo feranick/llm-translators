@@ -6,7 +6,8 @@
     llmt install KEY... [options]   install translators into the shared venv (and what they use)
     llmt remove KEY...              uninstall translators from the venv
     llmt status [-v] [--json]       versions, submodule commits, backends found
-    llmt update [--latest]          pull, check out the pinned (or latest) commits, reinstall
+    llmt update [--latest]          pull, check out the pinned (or latest) commits, reinstall; fill config/env
+                                    settings not set yet from llmt tune (--no-tune: leave it)
     llmt pin [KEY...] [--commit [--push]]   move the pins to each translator's latest pushed commit
     llmt test [KEY...]              each translator's pytest suite
     llmt bench KEY [NAMES...]       a translator's benchmarks
@@ -42,7 +43,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.10.18.1"
+__version__ = "2026.10.18.2"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -562,7 +563,79 @@ def suggest_tuning(keys: list[str], cur_env: dict[str, str]) -> tuple[dict, list
     return out, notes
 
 
+def tune_suggestions(keys: list[str]) -> tuple[dict, list[str]]:
+    """What llmt tune suggests for config/env (SLURM executor when sbatch works, MPI ranks, timeouts), and why."""
+    sug, lines = {}, []
+    si = slurm_info() if executor_keys(keys) else None
+    if si:
+        lines += [f"warning: {n}" for n in slurm_notes(si)]
+        if not si.get("error"):
+            sug.update({f"{REGISTRY[k]['executor']['prefix']}_EXECUTOR": "slurm" for k in executor_keys(keys)})
+            lines.append(f"SLURM: {si.get('cpus', '?')} CPUs on {si.get('nodes', '?')}: long studies go to its queue")
+    cpu = cpu_info()
+    lines.append(f"CPU: {cpu['physical']} physical cores, {cpu['logical']} logical")
+    s2, notes = suggest_tuning([k for k in keys if REGISTRY[k].get("tuning")], {**env_read(), **sug})
+    sug.update(s2)
+    lines += [f"  {n}" for n in notes]
+    return sug, lines
+
+
+def env_refresh() -> list[str]:
+    """Adds the commented description of every registry variable that config/env does not mention yet (new
+    since the file was written), in its translator's block. Values are never touched."""
+    ensure_env_file()
+    lines = ENV_FILE.read_text().splitlines()
+    present = {m.group(1) for l in lines for m in [re.match(r"\s*#?\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=", l)] if m}
+    added = []
+    for k, t in REGISTRY.items():
+        missing = [v for v in t.get("env", {}) if v not in present]
+        if not missing:
+            continue
+        new = [f"# {v + '=':17} # {t['env'][v]}" for v in missing]
+        head = next((i for i, l in enumerate(lines) if l.startswith(f"# --- {k} (")), None)
+        if head is None:
+            lines += ([""] if lines and lines[-1].strip() else []) + [f"# --- {k} ({t['repo']})"] + new
+        else:
+            j = head + 1
+            while j < len(lines) and lines[j].strip():
+                j += 1
+            lines[j:j] = new
+        added += missing
+    if added:
+        ENV_FILE.write_text("\n".join(lines) + "\n")
+    return added
+
+
+def auto_tune(keys: list[str]) -> None:
+    """After install/update: config/env gets llmt tune's suggestions for the settings it does not have yet.
+    Values already set (also 'local' or an empty value) are kept; differences are only reported."""
+    keys = [k for k in keys if REGISTRY[k].get("tuning") or REGISTRY[k].get("executor")]
+    added = env_refresh()
+    if not keys and not added:
+        return
+    say("\nSettings for this machine (config/env)")
+    if added:
+        say(f"  described the new settings {', '.join(added)} (commented out)")
+    if not keys:
+        return
+    sug, lines = tune_suggestions(keys)
+    cur = env_read()
+    fill = {v: x for v, x in sug.items() if v not in cur}
+    differ = {v: (cur[v], x) for v, x in sug.items() if v in cur and cur[v] != x}
+    if fill:
+        for line in lines:
+            say(f"  {line.strip()}" if not line.startswith("  ") else line)
+        env_set(fill)
+        for v, x in fill.items():
+            say(f"  set {v}={x}")
+    for v, (have, want) in differ.items():
+        say(f"  kept {v}={have or '(empty)'} (llmt tune suggests {want}: llmt tune --apply takes it)")
+    if not fill and not differ:
+        say("  as llmt tune suggests")
+
+
 def tune_interactive(keys: list[str]) -> None:
+    env_refresh()
     slurm_interactive(keys)
     keys = [k for k in keys if REGISTRY[k].get("tuning")]
     if not keys:
@@ -1514,6 +1587,8 @@ def cmd_install(a) -> None:
         if e not in lst:
             lst.append(e)
     do_install(keys, setup, a.python, interactive=False, link_gmsh=a.link_system_gmsh or None)
+    if not a.no_tune:
+        auto_tune(keys)
     for k in keys:
         st = tool_status(k)
         for name, ok, what, b in backend_report(k, st):
@@ -1569,6 +1644,8 @@ def cmd_update(a) -> None:
             say("Checking out the commits pinned by llm-translators")
             git("submodule", "update", "--init", "--", *paths, capture=False)
     pip_install(keys, setup)
+    if not a.no_tune:
+        auto_tune(keys)
     if a.latest:
         moved = [k for k, d in status_data(keys)["translators"].items() if d["submodule"] == "moved"]
         if moved:
@@ -1713,20 +1790,10 @@ def cmd_tune(a) -> None:
         return tune_interactive(keys)
     if not (executor_keys(keys) or any(REGISTRY[k].get("tuning") for k in keys)):
         die("nothing to tune for these translators (cfdt, lmpt, feat)")
-    sug = {}
-    si = slurm_info()
-    if si:
-        for n in slurm_notes(si):
-            warn(n)
-        if not si.get("error"):
-            sug.update({f"{REGISTRY[k]['executor']['prefix']}_EXECUTOR": "slurm" for k in executor_keys(keys)})
-            say(f"SLURM: {si.get('cpus', '?')} CPUs on {si.get('nodes', '?')}: long studies go to its queue")
-    cpu = cpu_info()
-    say(f"CPU: {cpu['physical']} physical cores, {cpu['logical']} logical")
-    s2, notes = suggest_tuning([k for k in keys if REGISTRY[k].get("tuning")], {**env_read(), **sug})
-    sug.update(s2)
+    env_refresh()
+    sug, notes = tune_suggestions(keys)
     for n in notes:
-        say(f"  {n}")
+        say(n)
     for var, val in sug.items():
         say(f"    {var}={val}")
     if a.apply:
@@ -1752,6 +1819,7 @@ def cmd_jobs(a) -> None:
 
 def cmd_env(a) -> None:
     ensure_env_file()
+    env_refresh()
     if a.edit:
         editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or ("nano" if shutil.which("nano") else "vi")
         os.execvp(editor, [*shlex.split(editor), str(ENV_FILE)])
@@ -1801,6 +1869,7 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--test", action="store_true", help="install pytest (default)")
     g.add_argument("--no-test", action="store_true", help="skip pytest")
     p.add_argument("--link-system-gmsh", action="store_true", help="Linux ARM: link apt's python3-gmsh into the venv")
+    p.add_argument("--no-tune", action="store_true", help="leave config/env as it is (no llmt tune suggestions)")
     p = sub.add_parser("remove", help="uninstall translators from the venv")
     p.add_argument("keys", nargs="+")
     p = sub.add_parser("status", help="versions, commits, backends")
@@ -1811,6 +1880,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("keys", nargs="*")
     p.add_argument("--latest", action="store_true", help="each translator's latest main, not the pinned commit")
     p.add_argument("--no-pull", action="store_true", help="do not git pull llm-translators itself")
+    p.add_argument("--no-tune", action="store_true", help="leave config/env as it is (no llmt tune suggestions)")
     p = sub.add_parser("pin", help="move the pins to each translator's latest pushed commit")
     p.add_argument("keys", nargs="*", help="default: all")
     p.add_argument("--to", metavar="COMMIT", help="pin one translator to this commit instead")
