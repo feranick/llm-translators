@@ -11,6 +11,7 @@ The translators call outside programs to mesh and solve. `llmt` never installs t
 | [OpenFOAM](#openfoam) | cfdt | meshing, case writing, 2D reference solver | `CFDT_FOAM` |
 | [LAMMPS](#lammps) | lmpt | inputs only, nothing runs | `LMPT_LMP`, `LMPT_POTENTIALS` |
 | [MPI](#mpi) | cfdt, lmpt (`procs` > 1) | one rank per study | `LMPT_MPIRUN` |
+| [SLURM](#slurm) (optional) | cfdt, lmpt, feat | each MCP server runs its studies itself, with no queue shared between chats | `CFDT_EXECUTOR`, `LMPT_EXECUTOR`, `FEAT_EXECUTOR` |
 
 build123d-translator needs nothing beyond pip (build123d and its OpenCascade wheels). Those wheels exist for the common platforms and recent Python versions; if `pip` cannot find one for yours, use another Python for the venv (`llmt install --python /path/to/python3.x`, on a fresh venv).
 
@@ -77,6 +78,29 @@ Check: `bin/run lmpt status` (version, packages, potential folders), then `llmt 
 ## MPI
 
 Only for studies with `procs` > 1 (or `CFDT_PROCS`, `LMPT_PROCS`). OpenFOAM's packages bring their own MPI. For LAMMPS, `mpirun` must match the MPI the executable was built with; set `LMPT_MPIRUN` (e.g. `mpirun.openmpi`) if the default `mpirun` is a different one.
+
+## SLURM
+
+Optional, for machines that run long studies: cfdt, lmpt, and feat for large studies. With `P_EXECUTOR=slurm` in `config/env`, a translator submits each long study as a SLURM job instead of running it in the MCP server's own processes. Studies from every chat then share the machine through one queue, and a job keeps running when the conversation or its ssh connection ends. `llmt setup` and `llmt tune` offer it when `sbatch` is found; `llmt jobs` lists the jobs. The contract each translator implements is in [docs/EXECUTION.md](docs/EXECUTION.md).
+
+A single-node install is enough: slurmctld and slurmd on the same machine. What matters for the translators:
+
+- **Jobs share the machine by cores.** In `slurm.conf`, use `SelectType=select/cons_tres` with `SelectTypeParameters=CR_Core` (or `CR_Core_Memory`). With `select/linear`, each job takes the whole node and studies run one at a time; `llmt` warns about it.
+- **The node's CPUs.** `CPUs`, `Sockets`, `CoresPerSocket` and `ThreadsPerCore` in the node line should match the hardware (`slurmd -C` prints them). `llmt tune` sizes the ranks per study from the physical cores, capped by what SLURM offers.
+- **Time limits.** The partition's `MaxTime` must allow the translators' timeouts. A cfdt job asks for `CFDT_TIMEOUT` plus 10 minutes (3 h 10 min with `CFDT_TIMEOUT=10800`). `sinfo` shows the limit, and `llmt tune` prints it.
+- **No accounting needed.** Without `sacct` (`AccountingStorageType=accounting_storage/none`, common on one machine), the translators read the end of each job's `job.log` to tell a time-out or a cancellation from a failure.
+- **MPI inside a job.** OpenMPI's `mpirun` uses the job's allocation (`--ntasks`). OpenFOAM's and LAMMPS's MPI runs need nothing else.
+
+Check:
+
+```bash
+sinfo                                   # the node is idle or mix, not down or drain
+scontrol show config | grep -i select   # select/cons_tres
+srun -n 2 hostname                      # a two-task job runs
+./llmt status                           # SLURM: CPUs in use, translator jobs
+```
+
+Memory: SLURM does not limit memory unless configured to. To give large studies a reservation, add `--mem=...` to `CFDT_SLURM_ARGS` (or `LMPT_`, `FEAT_`).
 
 ## Where things run
 

@@ -11,7 +11,8 @@
     llmt test [KEY...]              each translator's pytest suite
     llmt bench KEY [NAMES...]       a translator's benchmarks
     llmt alias [--name N] [--rc F]  shell alias that activates the venv (default llmt-venv; old ones commented out)
-    llmt tune [KEY...] [--print | --apply]   MPI ranks and timeouts for this machine, from its cores
+    llmt tune [KEY...] [--print | --apply]   SLURM use, MPI ranks and timeouts for this machine, from its cores
+    llmt jobs [KEY...]              the translators' SLURM jobs on this machine (queued, running)
     llmt env [--edit]               the per-machine settings file (config/env)
     llmt mcp setup                  choose local / remote (ssh) / existing install / none per translator
     llmt mcp config [--print | --claude-code | --file F]   write or print the MCP client entries
@@ -434,12 +435,113 @@ def cpu_info() -> dict:
     return {"physical": physical, "logical": logical, "kinds": kinds}
 
 
+def slurm_info() -> dict | None:
+    """SLURM on this machine (single node expected): None without sbatch, else what sinfo/scontrol say."""
+    sb = shutil.which("sbatch")
+    if not sb:
+        return None
+    info = {"sbatch": sb}
+    try:
+        r = subprocess.run(["sinfo", "-h", "-o", "%C|%m|%l|%N|%t"], capture_output=True, text=True, timeout=20)
+        line = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else ""
+        if line:
+            c, mem, lim, nodes, st = (line.split("|") + [""] * 5)[:5]
+            a, i, o, t = (c.split("/") + ["0"] * 4)[:4]
+            info.update(cpus=int(t), cpus_allocated=int(a), mem_mb=mem, time_limit=lim, nodes=nodes, state=st)
+        else:
+            info["error"] = (r.stderr or "sinfo printed nothing").strip()[-200:]
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        info["error"] = str(exc)
+    try:
+        r = subprocess.run(["scontrol", "show", "config"], capture_output=True, text=True, timeout=20)
+        for line in r.stdout.splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() in ("SelectType", "SelectTypeParameters", "AccountingStorageType"):
+                info[k.strip()] = v.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return info
+
+
+def slurm_jobs() -> list[dict]:
+    """The user's queued and running translator jobs (job names '<cli>:<request>:<study>', docs/EXECUTION.md)."""
+    clis = {t["cli"]: k for k, t in REGISTRY.items()}
+    try:
+        r = subprocess.run(["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i|%j|%T|%M|%l|%C|%R|%S"],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        f = (line.split("|") + [""] * 8)[:8]
+        cli, _, rest = f[1].partition(":")
+        if cli not in clis:
+            continue
+        req, _, study = rest.partition(":")
+        out.append({"id": f[0], "key": clis[cli], "request": req, "study": study, "state": f[2], "elapsed": f[3],
+                    "limit": f[4], "cpus": f[5], "reason": f[6], "start": f[7]})
+    return out
+
+
+def slurm_notes(info: dict) -> list[str]:
+    out = []
+    if info.get("error"):
+        out.append(f"sbatch is here but sinfo failed ({info['error']}): is slurmctld running?")
+    if info.get("state", "").rstrip("*") in ("down", "drain", "drng", "fail"):
+        out.append(f"the node is '{info['state']}': jobs will wait until it is back (scontrol update ... state=resume)")
+    if info.get("SelectType", "").endswith("linear"):
+        out.append("SelectType=select/linear gives each job the whole machine: studies run one at a time "
+                   "(select/cons_tres lets them share it by cores; see BACKENDS.md)")
+    return out
+
+
+def executor_keys(keys: list[str]) -> list[str]:
+    return [k for k in keys if REGISTRY[k].get("executor")]
+
+
+def slurm_interactive(keys: list[str]) -> dict | None:
+    """Offers to run long studies of these translators as SLURM jobs (P_EXECUTOR=slurm in config/env)."""
+    keys = executor_keys(keys)
+    if not keys:
+        return None
+    info = slurm_info()
+    if info is None:
+        return None
+    say("\nSLURM")
+    cpus = f"{info['cpus']} CPUs ({info.get('cpus_allocated', 0)} in use)" if "cpus" in info else "?"
+    say(f"  {info['sbatch']}; node {info.get('nodes', '?')}: {cpus}, time limit {info.get('time_limit', '?')}, "
+        f"{info.get('SelectType', '?')}")
+    for n in slurm_notes(info):
+        warn(n)
+    if info.get("AccountingStorageType", "").endswith("none"):
+        say("  No accounting (sacct): the translators judge finished jobs from their job.log, which is enough.")
+    say("  As SLURM jobs, long studies from every chat share this machine through one queue, and they keep")
+    say("  running when a conversation or its ssh connection ends (docs/EXECUTION.md).")
+    cur = env_read()
+    pre = [REGISTRY[k]["executor"]["prefix"] for k in keys]
+    now = all(cur.get(f"{p}_EXECUTOR") == "slurm" for p in pre)
+    if yes(f"Run long studies of {', '.join(keys)} as SLURM jobs?", True if not any(f"{p}_EXECUTOR" in cur for p in pre) else now):
+        env_set({f"{p}_EXECUTOR": "slurm" for p in pre})
+        for k in keys:
+            st = tool_status(k) if REGISTRY[k]["status"] else None
+            if st is not None and "_error" not in st and "executor" not in st:
+                say(f"  note: {k} {st.get('translator', '')} does not implement it yet; the setting takes effect "
+                    f"once it does (llmt update)")
+    else:
+        env_set({f"{p}_EXECUTOR": "local" for p in pre})
+    return info
+
+
 def suggest_tuning(keys: list[str], cur_env: dict[str, str]) -> tuple[dict, list[str]]:
     """Suggested config/env values: MPI ranks per study = (physical cores - a few kept free for the
     system, meshing and the servers) / concurrent studies (workers); plus the registry's fixed values."""
     cpu = cpu_info()
     reserve = 0 if cpu["physical"] <= 4 else (1 if cpu["physical"] <= 8 else 2)
     usable = max(1, cpu["physical"] - reserve)
+    si = slurm_info() if any(cur_env.get(f"{REGISTRY[k]['executor']['prefix']}_EXECUTOR") == "slurm"
+                             for k in executor_keys(keys)) else None
+    if si and si.get("cpus") and si["cpus"] < usable:
+        usable = si["cpus"]
     out, notes = {}, []
     for k in keys:
         t = REGISTRY[k].get("tuning")
@@ -452,7 +554,7 @@ def suggest_tuning(keys: list[str], cur_env: dict[str, str]) -> tuple[dict, list
             w = t["workers_default"]
         out[t["procs"]] = str(max(1, usable // w))
         notes.append(f"{t['procs']}={out[t['procs']]}: {usable} cores ({cpu['physical']} - {reserve} kept free) "
-                     f"/ {t['workers']}={w} (studies at a time)")
+                     f"/ {t['workers']}={w} (studies at a time" + (", the rest wait in SLURM's queue)" if si else ")"))
         for var, val in t.get("set", {}).items():
             out[var] = val
             if t.get("why"):
@@ -461,6 +563,7 @@ def suggest_tuning(keys: list[str], cur_env: dict[str, str]) -> tuple[dict, list
 
 
 def tune_interactive(keys: list[str]) -> None:
+    slurm_interactive(keys)
     keys = [k for k in keys if REGISTRY[k].get("tuning")]
     if not keys:
         return
@@ -637,6 +740,9 @@ def status_data(keys: list[str] | None = None) -> dict:
     keys = keys or KEYS
     data = {"llmt": __version__, "root": str(ROOT), "venv": str(VENV) if VPY.exists() else None,
             "python": venv_python_version(), "translators": {}}
+    si = slurm_info()
+    if si:
+        data["slurm"] = {**si, "jobs": slurm_jobs()}
     for k in keys:
         t = REGISTRY[k]
         state, commit = subs.get(t["repo"], ("absent", ""))
@@ -646,6 +752,11 @@ def status_data(keys: list[str] | None = None) -> dict:
             st = tool_status(k)
             d["backends"] = {name: {"found": ok, "detail": what} for name, ok, what, _ in backend_report(k, st)}
             d["status"] = st
+            ex = REGISTRY[k].get("executor")
+            if ex:
+                want = env_read().get(f"{ex['prefix']}_EXECUTOR", "local")
+                d["executor"] = {"setting": want, "supported": isinstance(st, dict) and "executor" in st,
+                                 "reported": (st or {}).get("executor") if isinstance(st, dict) else None}
         data["translators"][k] = d
     return data
 
@@ -666,8 +777,22 @@ def print_status(data: dict, verbose: bool) -> None:
         for n, v in bes.items():
             if verbose or (not v["found"] and v["detail"] != "not found"):
                 say(f"{'':43}{n}: {v['detail']}")
+        ex = d.get("executor")
+        if ex and (ex["setting"] != "local" or ex["supported"]):
+            if ex["setting"] == "slurm" and not ex["supported"]:
+                say(f"{'':43}runs: {k.upper()} executor 'slurm' set, but this version ignores it (docs/EXECUTION.md)")
+            else:
+                say(f"{'':43}runs: {ex['setting']}" + (" (SLURM jobs)" if ex["setting"] == "slurm" else ""))
         if verbose and d.get("status"):
             say("  " + json.dumps(d["status"], indent=1).replace("\n", "\n  "))
+    sl = data.get("slurm")
+    if sl:
+        jobs = sl.get("jobs", [])
+        run_ = sum(1 for j in jobs if j["state"] == "RUNNING")
+        say(f"\nSLURM: {sl.get('cpus', '?')} CPUs, {sl.get('cpus_allocated', '?')} in use; translator jobs: "
+            f"{run_} running, {len(jobs) - run_} waiting (llmt jobs)")
+        for n in slurm_notes(sl):
+            say(f"  ! {n}")
     missing = [(k, n) for k, d in data["translators"].items() for n, v in d.get("backends", {}).items() if not v["found"]]
     if missing:
         say(f"\nMissing backends are installed separately: see {BACKENDS_MD}. Paths go in config/env (llmt env --edit).")
@@ -978,6 +1103,8 @@ def mcp_setup_interactive(setup: dict, hint: dict | None = None) -> None:
     if not entries:
         say("\n  No MCP servers chosen for this machine.")
         return
+    if any(s_.get("where") == "local" for s_ in mcp.values()):
+        show_macos_warnings()
     say("\nEntries:")
     say(json.dumps({"mcpServers": entries}, indent=1))
     path = claude_desktop_config()
@@ -1023,6 +1150,39 @@ def write_desktop_config(entries: dict, path: Path, drop: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cfg, indent=2) + "\n")
     say(f"  wrote {path}. Restart the Claude app to load the servers.")
+
+
+def is_ssh(entry: dict) -> bool:
+    return os.path.basename(str(entry.get("command", ""))) == "ssh"
+
+
+def macos_launch_warnings() -> list[str]:
+    """Things that let llmt start the servers from Terminal but make macOS refuse them to the Claude app
+    ('/bin/sh: .../bin/mcp: Operation not permitted' in ~/Library/Logs/Claude/mcp-server-KEY.log)."""
+    if sys.platform != "darwin":
+        return []
+    out = []
+    home = Path.home()
+    for d in ("Desktop", "Documents", "Downloads", "Library/Mobile Documents"):
+        if str(ROOT).startswith(str(home / d) + "/"):
+            out.append(f"llm-translators is in ~/{d}, a folder macOS protects: the Claude app can be refused when it "
+                       f"starts bin/mcp ('Operation not permitted'), although Terminal can run it. Move it, e.g. to "
+                       f"~/Software/llm-translators (README: 'Moving llm-translators').")
+    marked = []
+    for f in (ROOT / "bin" / "mcp", ROOT / "bin" / "run", ROOT / "llmt"):
+        try:
+            if subprocess.run(["xattr", "-p", "com.apple.quarantine", str(f)], capture_output=True).returncode == 0:
+                marked.append(f.name)
+        except OSError:
+            pass
+    if marked:
+        out.append(f"{', '.join(marked)} carry macOS's quarantine flag; clear it with: xattr -dr com.apple.quarantine {ROOT}")
+    return out
+
+
+def show_macos_warnings() -> None:
+    for w in macos_launch_warnings():
+        warn(w)
 
 
 def mcp_test_one(key: str, entry: dict, timeout: float = 180) -> bool:
@@ -1124,6 +1284,11 @@ def mcp_test(keys: list[str] | None, setup: dict, timeout: float) -> bool:
     keys = keys or [k for k in KEYS if k in entries or k in desk]
     if not keys:
         die("no MCP entries to test (llmt mcp setup)")
+    if any(not is_ssh(entries.get(k) or desk.get(k) or {}) for k in keys):
+        show_macos_warnings()
+        if sys.platform == "darwin":
+            say("  (This test runs from Terminal, which macOS treats differently from the Claude app: if it")
+            say("  passes but the app fails, check ~/Library/Logs/Claude/mcp-server-KEY.log.)")
     results = {}
     for k in keys:
         e = entries.get(k) or desk.get(k)
@@ -1199,6 +1364,7 @@ def cmd_setup(a) -> None:
         die("setup is interactive; use 'llmt install KEY...' and 'llmt mcp config' in scripts")
     setup = load_setup()
     say(f"llm-translators {__version__} — setup ({ROOT})\n")
+    show_macos_warnings()
     say("Available translators:")
     table()
 
@@ -1541,22 +1707,47 @@ def cmd_alias(a) -> None:
 def cmd_tune(a) -> None:
     setup = load_setup()
     keys = parse_keys(a.keys) if a.keys else [k for k in setup.get("installed", [])]
-    keys = [k for k in keys if REGISTRY[k].get("tuning")]
-    if not keys:
-        die("no installed translator has run limits to tune (cfdt, lmpt)")
-    if a.apply or a.print:
-        sug, notes = suggest_tuning(keys, env_read())
-        cpu = cpu_info()
-        say(f"CPU: {cpu['physical']} physical cores, {cpu['logical']} logical")
-        for n in notes:
-            say(f"  {n}")
-        if a.apply:
-            env_set(sug)
-            say(f"  written to {ENV_FILE}")
+    if not (a.apply or a.print):
+        if not sys.stdin.isatty():
+            die("tune is interactive; use --print or --apply")
+        return tune_interactive(keys)
+    if not (executor_keys(keys) or any(REGISTRY[k].get("tuning") for k in keys)):
+        die("nothing to tune for these translators (cfdt, lmpt, feat)")
+    sug = {}
+    si = slurm_info()
+    if si:
+        for n in slurm_notes(si):
+            warn(n)
+        if not si.get("error"):
+            sug.update({f"{REGISTRY[k]['executor']['prefix']}_EXECUTOR": "slurm" for k in executor_keys(keys)})
+            say(f"SLURM: {si.get('cpus', '?')} CPUs on {si.get('nodes', '?')}: long studies go to its queue")
+    cpu = cpu_info()
+    say(f"CPU: {cpu['physical']} physical cores, {cpu['logical']} logical")
+    s2, notes = suggest_tuning([k for k in keys if REGISTRY[k].get("tuning")], {**env_read(), **sug})
+    sug.update(s2)
+    for n in notes:
+        say(f"  {n}")
+    for var, val in sug.items():
+        say(f"    {var}={val}")
+    if a.apply:
+        env_set(sug)
+        say(f"  written to {ENV_FILE}")
+
+
+def cmd_jobs(a) -> None:
+    if not shutil.which("squeue"):
+        die("no SLURM on this machine (squeue not found)")
+    keys = set(parse_keys(a.keys)) if a.keys else set(KEYS)
+    jobs = [j for j in slurm_jobs() if j["key"] in keys]
+    if not jobs:
+        say("  no translator jobs queued or running")
         return
-    if not sys.stdin.isatty():
-        die("tune is interactive; use --print or --apply")
-    tune_interactive(keys)
+    say(f"  {'id':8} {'key':5} {'state':9} {'elapsed':>10} {'limit':>10} {'cpus':>4}  study  (request; reason)")
+    for j in jobs:
+        why = "" if j["state"] == "RUNNING" else f"; {j['reason']}" + (f", start {j['start']}" if j["start"] not in ("", "N/A") else "")
+        say(f"  {j['id']:8} {j['key']:5} {j['state']:9} {j['elapsed']:>10} {j['limit']:>10} {j['cpus']:>4}  "
+            f"{j['study']}  ({j['request']}{why})")
+    say("  Cancel one: scancel ID (or ask the model: cancel(request))")
 
 
 def cmd_env(a) -> None:
@@ -1643,6 +1834,8 @@ def main(argv: list[str] | None = None) -> None:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--print", action="store_true", help="only show the suggestion")
     g.add_argument("--apply", action="store_true", help="write the suggestion without asking")
+    p = sub.add_parser("jobs", help="the translators' SLURM jobs on this machine")
+    p.add_argument("keys", nargs="*")
     p = sub.add_parser("env", help="per-machine settings (config/env)")
     p.add_argument("--edit", action="store_true")
     p = sub.add_parser("mcp", help="MCP servers")
@@ -1667,7 +1860,7 @@ def main(argv: list[str] | None = None) -> None:
         ap.print_help()
         return
     {"setup": cmd_setup, "list": cmd_list, "install": cmd_install, "remove": cmd_remove, "status": cmd_status,
-     "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "tune": cmd_tune, "env": cmd_env, "mcp": cmd_mcp}[a.cmd](a)
+     "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "tune": cmd_tune, "jobs": cmd_jobs, "env": cmd_env, "mcp": cmd_mcp}[a.cmd](a)
 
 
 if __name__ == "__main__":

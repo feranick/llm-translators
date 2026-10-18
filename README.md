@@ -31,6 +31,8 @@ cd llm-translators
 3. **Backends.** It reports whether Gmsh, CalculiX, OpenFOAM and LAMMPS are found, using each translator's own `status` command. It does not install them: see [BACKENDS.md](BACKENDS.md). You can enter their paths in `config/env`.
 4. **MCP servers.** For the Claude app on this machine, choose for each translator where it runs: *local* (llm-translators here), *remote* (llm-translators on another machine, over ssh), *existing* (an install outside llm-translators, here or over ssh; see [below](#translators-already-installed-elsewhere)), or *none*. It writes the entries into `claude_desktop_config.json`, keeping a backup.
 
+**macOS:** keep llm-translators out of `~/Desktop`, `~/Documents`, `~/Downloads` and iCloud Drive, for example in `~/Software`. macOS protects those folders. Terminal may be allowed to run `bin/mcp` there while the Claude app is refused: its log `~/Library/Logs/Claude/mcp-server-KEY.log` then shows `/bin/sh: .../bin/mcp: Operation not permitted`. `llmt` warns when it finds itself in one of them.
+
 `llmt` needs only git and Python 3.7+ (standard library). The venv needs Python 3.10+. On macOS, `/usr/bin/python3` is 3.9: `llmt` runs with it but builds the venv with the newest `python3.1x` it can find (or the one given with `--python`).
 
 ## A typical layout
@@ -63,7 +65,8 @@ llmt pin [KEY...] [--to C] [--commit [--push]]   move the pins to the latest pus
 llmt test [KEY...]              pytest in each translator
 llmt bench KEY [NAMES...]       a translator's benchmarks
 llmt alias [--name N] [--rc F]  shell alias for the venv (default llmt-venv; replaces the old 'cad')
-llmt tune [KEY...] [--print | --apply]   MPI ranks and timeouts for this machine, from its cores
+llmt tune [KEY...] [--print | --apply]   SLURM use, MPI ranks and timeouts for this machine, from its cores
+llmt jobs [KEY...]              the translators' SLURM jobs on this machine
 llmt env [--edit]               per-machine settings (config/env)
 llmt mcp setup                  local / remote / existing / none per translator
 llmt mcp config                 write the entries into the Claude desktop config (backup kept)
@@ -122,6 +125,17 @@ alias llmt-venv='source ~/Software/llm-translators/bin/activate'
 
 It also comments out old aliases that activate a translator's own venv, such as `alias cad='source ~/Software/build123d-translator/.venv/bin/activate'`, in `~/.bashrc`, `~/.bash_aliases`, `~/.bash_profile`, `~/.profile` and `~/.zshrc`, backing up each file first. Running it again replaces the block. `--name` picks another name, `--keep-old` leaves the old aliases, `--list` only shows them, and `--print` only prints the line.
 
+## Long runs: SLURM
+
+On a workstation with SLURM (single node is enough), long studies can run as SLURM jobs instead of inside the MCP server, with `CFDT_EXECUTOR=slurm` (and `LMPT_`, `FEAT_`) in `config/env`. `llmt setup` and `llmt tune` offer it when they find `sbatch`.
+
+- **One queue for every chat.** Several projects running cfdt at once no longer overload the machine: their studies wait in SLURM's queue.
+- **Runs outlive the conversation.** A job keeps running when the chat closes or ssh drops.
+- **Less polling.** The model submits, reports when to come back and stops. Later, or from another chat, it collects results with `study_status` or finds runs with `jobs`.
+- **For you:** `llmt jobs` lists the translators' jobs, and `llmt status` shows how busy the machine is.
+
+The translators implement this following [docs/EXECUTION.md](docs/EXECUTION.md): job files, states, the `jobs` and `cancel` tools, and the server instructions. Until a translator does, `llmt status` says the setting is ignored. Setting up SLURM itself is in [BACKENDS.md](BACKENDS.md#slurm).
+
 ## Submodules and versions
 
 The umbrella pins one commit of each translator, so a given umbrella commit is a combination that was installed and tested together. The submodules track `main` (`branch = main` in `.gitmodules`), and their URLs are relative (`../fea-translator.git`): cloning the umbrella over ssh fetches them over ssh, and cloning over https fetches them over https.
@@ -131,6 +145,22 @@ The umbrella pins one commit of each translator, so a given umbrella commit is a
 - `llmt update --latest`: tries each translator's latest `main` on one machine without moving the pins. After testing (`llmt test`, `llmt bench`), record it with `llmt pin KEY --commit`.
 - Submodules with uncommitted changes are left as they are. To work on a translator inside the umbrella, run `git checkout main` in its folder (submodules are checked out on a detached HEAD). It installs in editable mode, so your changes take effect at once.
 - `llmt status` shows each submodule as `pinned`, `moved` (checked out at a commit other than the pin) or `absent`.
+
+## Moving llm-translators to another folder
+
+The venv records its own path, so it is recreated in the new place:
+
+```bash
+mv ~/Desktop/llm-translators ~/Software/llm-translators
+cd ~/Software/llm-translators
+rm -rf .venv
+./llmt install          # reinstalls what this machine had (config/setup.json is kept)
+./llmt mcp config       # rewrites the local entries in the Claude config (backup kept)
+./llmt alias            # points llmt-venv to the new place
+./llmt mcp test         # checks every entry
+```
+
+Then restart the Claude app. `config/env` moves with the folder.
 
 ## Moving from the old layout
 

@@ -33,6 +33,7 @@
    "uses": {"b3dt": "parts as build123d-translator goals"},
    "status": true,
    "bench": true,
+   "executor": {"prefix": "FEAT", "kind": "threads", "min_minutes": 5},
    "backends": [
     {"key": "ccx", "name": "CalculiX (ccx)", "doc": "calculix",
      "without": "the reference solver runs static, modal and thermal on small meshes; no buckling"},
@@ -43,7 +44,11 @@
     "FEAT_OUT": "output folder (default ~/feat_runs)",
     "FEAT_WORKERS": "worker processes (default 2)",
     "FEAT_TIMEOUT": "seconds per study (default 900)",
-    "FEAT_SOLVER": "auto | ccx | ref"
+    "FEAT_SOLVER": "auto | ccx | ref",
+    "FEAT_PROCS": "CalculiX threads per study (with SLURM: --cpus-per-task)",
+    "FEAT_EXECUTOR": "local | slurm: long studies as SLURM jobs (docs/EXECUTION.md)",
+    "FEAT_SLURM_MIN_MINUTES": "studies estimated shorter than this run locally",
+    "FEAT_SLURM_ARGS": "extra sbatch arguments, e.g. --mem=64G"
    }
   },
   "cfdt": {
@@ -60,6 +65,7 @@
    "uses": {"b3dt": "geometries as build123d-translator goals", "feat": "external-flow loads into FEA, chain benchmarks"},
    "status": true,
    "bench": true,
+   "executor": {"prefix": "CFDT", "kind": "mpi", "min_minutes": 0},
    "tuning": {"procs": "CFDT_PROCS", "workers": "CFDT_WORKERS", "workers_default": 2,
               "set": {"CFDT_TIMEOUT": "10800"}, "why": "3 h per study: OpenFOAM runs on a workstation are long"},
    "backends": [
@@ -73,7 +79,10 @@
     "CFDT_WORKERS": "worker processes (default 2)",
     "CFDT_TIMEOUT": "seconds per study (default 3600)",
     "CFDT_SOLVER": "auto | foam | ref",
-    "CFDT_PROCS": "MPI ranks per study (default 1)"
+    "CFDT_PROCS": "MPI ranks per study (default 1)",
+    "CFDT_EXECUTOR": "local | slurm: long studies as SLURM jobs (docs/EXECUTION.md)",
+    "CFDT_SLURM_MIN_MINUTES": "studies estimated shorter than this run locally",
+    "CFDT_SLURM_ARGS": "extra sbatch arguments, e.g. --mem=64G"
    }
   },
   "lmpt": {
@@ -90,6 +99,7 @@
    "uses": {"feat": "feat_material into FEA, chain benchmark"},
    "status": true,
    "bench": true,
+   "executor": {"prefix": "LMPT", "kind": "mpi", "min_minutes": 1},
    "tuning": {"procs": "LMPT_PROCS", "workers": "LMPT_WORKERS", "workers_default": 2, "set": {}},
    "backends": [
     {"key": "lammps", "name": "LAMMPS", "doc": "lammps", "without": "nothing runs (inputs can still be written)"}
@@ -101,7 +111,10 @@
     "LMPT_WORKERS": "worker processes (default 2)",
     "LMPT_TIMEOUT": "seconds per study (default 21600)",
     "LMPT_PROCS": "MPI ranks per study (default 1)",
-    "LMPT_MPIRUN": "MPI launcher (default mpirun)"
+    "LMPT_MPIRUN": "MPI launcher (default mpirun)",
+    "LMPT_EXECUTOR": "local | slurm: long studies as SLURM jobs (docs/EXECUTION.md)",
+    "LMPT_SLURM_MIN_MINUTES": "studies estimated shorter than this run locally",
+    "LMPT_SLURM_ARGS": "extra sbatch arguments, e.g. --mem=64G"
    }
   }
  }
