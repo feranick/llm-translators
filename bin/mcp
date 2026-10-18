@@ -1,10 +1,12 @@
 #!/bin/sh
-# Starts one translator's MCP server: bin/mcp KEY [--http PORT [--host H]]
+# Starts one translator's MCP server: bin/mcp KEY [VAR=value ...] [--http PORT [--host H]]
 #   KEY: b3dt | feat | cfdt | lmpt (see translators.json)
-# This is the command the Claude app runs, locally or over ssh.
+#   VAR=value: settings for this server only, applied after config/env (so they override it), e.g.
+#     bin/mcp cfdt CFDT_TIMEOUT=10800 CFDT_PROCS=18
+# This is the command the Claude app runs, locally or over ssh. It prints nothing of its own on stdout.
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 if [ $# -lt 1 ]; then
-    echo "usage: bin/mcp KEY [--http PORT [--host HOST]]" >&2
+    echo "usage: bin/mcp KEY [VAR=value ...] [--http PORT [--host HOST]]" >&2
     exit 2
 fi
 KEY=$1
@@ -12,8 +14,27 @@ shift
 case "$KEY" in
     *[!a-z0-9_-]*|"") echo "llm-translators: bad translator key '$KEY'" >&2; exit 2 ;;
 esac
-if [ ! -x "$ROOT/.venv/bin/$KEY-mcp" ]; then
-    echo "llm-translators: $KEY is not installed here ($ROOT/.venv/bin/$KEY-mcp missing; run $ROOT/llmt install $KEY)" >&2
+EXE="$ROOT/.venv/bin/$KEY-mcp"
+if [ ! -x "$EXE" ]; then
+    echo "llm-translators: $KEY is not installed here ($EXE missing; run $ROOT/llmt install $KEY)" >&2
     exit 127
 fi
-exec "$ROOT/bin/run" "$ROOT/.venv/bin/$KEY-mcp" "$@"
+# Leading VAR=value arguments stay first; the server goes after them: env VAR=value ... EXE options...
+n=0
+for a in "$@"; do
+    case "$a" in
+        *=*) case "${a%%=*}" in ""|[0-9]*|*[!A-Za-z0-9_]*) break ;; esac ;;
+        *) break ;;
+    esac
+    n=$((n + 1))
+done
+total=$#
+i=0
+for a in "$@"; do
+    [ "$i" -eq "$n" ] && set -- "$@" "$EXE"
+    set -- "$@" "$a"
+    i=$((i + 1))
+done
+[ "$n" -eq "$total" ] && set -- "$@" "$EXE"
+shift "$total"
+exec "$ROOT/bin/run" env "$@"

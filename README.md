@@ -24,7 +24,7 @@ cd llm-translators
 
 `llmt setup` walks through four steps:
 
-1. **What to install on this machine.** It lists the translators with their backends and how heavy they are. Translators that others use are offered too (b3dt with feat, for example).
+1. **Where each translator runs, seen from this machine.** For each one: *here* (installed on this machine), *remote* (installed on another machine and reached over ssh; nothing is installed here for it), or *not used*. The defaults follow how heavy each one is: b3dt and feat *here*, cfdt and lmpt *remote*. On a machine without the Claude app, such as a workstation, the default is *here* for the heavy ones. If you choose a translator here, the ones it uses are offered too (b3dt with feat, for example).
 2. **Python environment.** It creates `.venv`, checks out only the chosen submodules, and runs `pip install -e` on each with its extras (`mcp`, `mesh`, optionally `test`).
 3. **Backends.** It reports whether Gmsh, CalculiX, OpenFOAM and LAMMPS are found, using each translator's own `status` command. It does not install them: see [BACKENDS.md](BACKENDS.md). You can enter their paths in `config/env`.
 4. **MCP servers.** For the Claude app on this machine, choose for each translator where it runs: *local* (llm-translators here), *remote* (llm-translators on another machine, over ssh), *existing* (an install outside llm-translators, here or over ssh; see [below](#translators-already-installed-elsewhere)), or *none*. It writes the entries into `claude_desktop_config.json`, keeping a backup.
@@ -33,8 +33,8 @@ cd llm-translators
 
 ## A typical layout
 
-- **The Mac with the Claude app.** Run `./llmt setup`, install `b3dt` and `feat`, and choose MCP *local* for those two and *remote* for `cfdt` and `lmpt` (`nicola@carbonio`, `~/Software/llm-translators`).
-- **The Linux workstation (carbonio).** Run `./llmt setup`, install `cfdt` and `lmpt` (plus `feat` and `b3dt`, which they use), and answer *no* to "Will a Claude app on this machine use the translators?".
+- **The Mac with the Claude app.** Run `./llmt setup`. In step 1, answer *here* for `b3dt` and `feat` and *remote* for `cfdt` and `lmpt` (these are the defaults). Only b3dt and feat are installed. In step 4, b3dt and feat are local, and cfdt and lmpt ask for the host (`nicola@carbonio`) and the folder (`~/Software/llm-translators`).
+- **The Linux workstation (carbonio).** Run `./llmt setup` and answer *here* for `cfdt` and `lmpt`. Also accept `feat` and `b3dt`, which they use. Answer *no* to "Will a Claude app on this machine use the translators?".
 
 The client's remote entry runs `ssh -T -o BatchMode=yes HOST <root>/bin/mcp KEY`, so the remote host needs key-based ssh and the umbrella at that path. When you choose *remote*, `llmt` offers to check the host over ssh: it runs `llmt status --json` there and reports the translator's version and missing backends. If llm-translators or the translator is not there yet, it says so, and it offers any older install it finds on that host (next section).
 
@@ -89,6 +89,19 @@ llm-translators/
 **MCP servers.** Each translator keeps its own MCP server, with its own name (`b3dt`, `feat`, `cfdt`, `lmpt`), tools and instructions, so each client can pick the ones it needs and where they run. Every entry runs `bin/mcp KEY`, which loads `config/env` before starting the server. Backend paths set there therefore reach servers started by the Claude app or over a non-interactive ssh shell, neither of which reads `~/.bashrc`. Entries with other names in the Claude config, such as Taiga, are left alone.
 
 **Settings.** `config/env` starts as a commented template listing every variable the translators read (`FEAT_CCX`, `CFDT_FOAM`, `LMPT_LMP`, output folders, workers, timeouts, MPI ranks). It also has room for `PATH` additions such as Homebrew's `/opt/homebrew/bin`.
+
+Settings can be made at two levels:
+
+- **Per machine:** `config/env` on the machine that runs the translator. Use it for backend paths and limits that belong to the hardware, such as `CFDT_PROCS=18` on an 18-core workstation. `llmt setup` asks for backend paths, and optionally for run limits (timeouts, MPI ranks, workers). `llmt env --edit` opens the file.
+- **Per MCP server:** `VAR=value` arguments after the key, for example `bin/mcp cfdt CFDT_TIMEOUT=10800 CFDT_PROCS=18`. They apply after `config/env`, so they override it, and only for that entry. This lets two clients use the same workstation with different limits. In `llmt mcp setup`, answer yes to "Settings for this cfdt server", and the entry becomes:
+
+  ```json
+  "cfdt": {"command": "/usr/bin/ssh",
+           "args": ["-T", "-o", "BatchMode=yes", "nicola@carbonio",
+                    "~/Software/llm-translators/bin/mcp", "cfdt", "CFDT_TIMEOUT=10800", "CFDT_PROCS=18"]}
+  ```
+
+  Prefixing the command with `env CFDT_TIMEOUT=... bin/mcp cfdt` does not work if `config/env` also sets that variable, because `config/env` is loaded afterwards. Put the settings after the key instead.
 
 **An interactive shell.** `llmt-venv` replaces the old `cad` alias, which activated `build123d-translator/.venv`. It activates llm-translators' venv and also loads `config/env`; `deactivate` leaves it. `llmt setup` offers to add it after installing, or run `llmt alias` at any time. Either way it writes this block to `~/.bashrc` (`~/.zshrc` for zsh; `--rc` for another file):
 

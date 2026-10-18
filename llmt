@@ -580,12 +580,14 @@ def is_managed(e: dict) -> bool:
 
 def mcp_entry(key: str, spec: dict) -> dict:
     w = spec.get("where")
-    if w == "remote":
+    sets = spec.get("env", {})
+    if w == "remote":  # ssh joins the arguments into one remote shell command: quote the values
         root = spec.get("root", "~/Software/llm-translators").rstrip("/")
-        return {"command": ssh_exe(), "args": [*SSH_OPTS, spec["host"], f"{root}/bin/mcp", key]}
+        return {"command": ssh_exe(), "args": [*SSH_OPTS, spec["host"], f"{root}/bin/mcp", key,
+                                               *[f"{k}={shlex.quote(v)}" for k, v in sets.items()]]}
     if w == "existing":
         return dict(spec["entry"])
-    return {"command": str(ROOT / "bin" / "mcp"), "args": [key]}
+    return {"command": str(ROOT / "bin" / "mcp"), "args": [key, *[f"{k}={v}" for k, v in sets.items()]]}
 
 
 def mcp_entries(setup: dict) -> dict:
@@ -687,11 +689,11 @@ def remote_status(host: str, root: str) -> dict | None:
     return data
 
 
-def ask_env(key: str, default: dict[str, str] | None = None) -> dict[str, str]:
-    """Settings for an install outside llm-translators: they go into the entry itself."""
+def ask_env(key: str, default: dict[str, str] | None = None, note: str | None = None) -> dict[str, str]:
+    """Settings that go into the MCP entry itself (VAR=value ...)."""
     names = ", ".join(REGISTRY[key]["env"]) or "none known"
-    cur = " ".join(f"{k}={v}" for k, v in (default or {}).items())
-    say(f"  An install outside llm-translators does not read config/env: settings go into the entry ({names}).")
+    cur = " ".join(f"{k}={shlex.quote(v)}" for k, v in (default or {}).items())
+    say(note or f"  An install outside llm-translators does not read config/env: settings go into the entry ({names}).")
     while True:
         text = ask("settings, VAR=value separated by spaces (empty: none)", cur)
         try:
@@ -766,7 +768,21 @@ def report_remote(key: str, host: str, root: str, spec: dict) -> dict:
     return spec
 
 
-def mcp_setup_interactive(setup: dict) -> None:
+def entry_settings(key: str, prev: dict, where: str) -> dict:
+    """Optional settings for one MCP server (e.g. CFDT_TIMEOUT=10800 CFDT_PROCS=18), passed as
+    bin/mcp KEY VAR=value ...: they apply to this entry only and override config/env on that machine."""
+    cur = prev.get("env", {}) if prev.get("where") in ("local", "remote") else {}
+    names = ", ".join(REGISTRY[key]["env"])
+    if not names:
+        return {}
+    if not cur and not yes(f"Settings for this {key} server (override {where}'s config/env: {names})?", False):
+        return {}
+    env = ask_env(key, cur, note=f"  VAR=value pairs for this {key} server only; config/env on {where} has the defaults.")
+    return {"env": env} if env else {}
+
+
+def mcp_setup_interactive(setup: dict, hint: dict | None = None) -> None:
+    """hint: the placement chosen in setup's step 1 (here / remote / none), used for the defaults."""
     say("\nMCP servers for the Claude app on THIS machine. For each translator:")
     say("  l = local (llm-translators here)    r = remote (llm-translators on another machine, over ssh)")
     say("  e = existing (an install outside llm-translators, here or over ssh)    n = none")
@@ -784,7 +800,14 @@ def mcp_setup_interactive(setup: dict) -> None:
         t = REGISTRY[k]
         cur_entry = current.get(k)
         prev = mcp.get(k, {})
-        if prev.get("where"):
+        h = (hint or {}).get(k)
+        if h == "here":
+            default = "e" if prev.get("where") == "existing" and k not in inst else "l"
+        elif h == "remote":
+            default = "e" if prev.get("where") == "existing" and prev.get("host") else "r"
+        elif h == "none":
+            default = "n"
+        elif prev.get("where"):
             default = {"local": "l", "remote": "r", "existing": "e", "none": "n"}[prev["where"]]
         elif cur_entry and not is_managed(cur_entry):
             default = "e"
@@ -802,13 +825,13 @@ def mcp_setup_interactive(setup: dict) -> None:
                 old = here["found"].get(k, [])
                 warn(f"{k} is not installed in llm-translators here yet: llmt install {k}" +
                      (f" (or choose [e]xisting for {old[0]})" if old else ""))
-            mcp[k] = {"where": "local"}
+            mcp[k] = {"where": "local", **entry_settings(k, prev, "this machine")}
         elif a == "r":
             host = ask("ssh host (user@host, keys set up for BatchMode)", prev.get("host", last_host))
             while not host:
                 host = ask("ssh host (user@host)", "")
             root = ask(f"llm-translators folder on {host}", prev.get("root", last_root))
-            spec = {"where": "remote", "host": host, "root": root}
+            spec = {"where": "remote", "host": host, "root": root, **entry_settings(k, prev, host)}
             if yes(f"Check {host} now (ssh)?", True):
                 spec = report_remote(k, host, root, spec)
             mcp[k] = spec
@@ -938,18 +961,45 @@ def cmd_setup(a) -> None:
         say("  llm-translators' venv; in step 4 the Claude app can use either ([l]ocal or [e]xisting). After")
         say("  switching to llm-translators, the old venvs can be deleted.")
 
-    say("\nStep 1/4 — Which translators should be installed on THIS machine?")
-    say("  Light ones belong next to the Claude app; heavy solvers can live on a workstation reached over ssh")
-    say("  (step 4). Installing nothing here is fine if this machine only runs the Claude app.")
-    cur = " ".join(setup.get("installed", [])) or "none"
-    while True:
-        a_ = ask("numbers or keys, space-separated ('all', 'none')", cur)
-        try:
-            keys = [] if a_ == "none" else parse_keys(a_)
-            break
-        except SystemExit:
-            continue
+    say("\nStep 1/4 — Where does each translator run, seen from this machine?")
+    say("  h = here: installed on this machine (its MCP server runs here)")
+    say("  r = remote: installed on another machine (e.g. a Linux workstation with the solvers); the Claude")
+    say("      app here reaches it over ssh. Nothing is installed here for it; step 4 asks for the host.")
+    say("  n = not used from this machine")
+    say("  On a workstation that only serves translators to other machines, answer h for what it runs.")
+    has_app = sys.platform == "darwin" or os.name == "nt" or claude_desktop_config().exists()
+    prev_mcp = setup.get("mcp", {})
+    inst = set(installed_in_venv())
+    place = {}
+    for k in KEYS:
+        t = REGISTRY[k]
+        prev = setup.get("placement", {}).get(k)
+        if prev:
+            d = prev[0]
+        elif k in inst or k in setup.get("installed", []):
+            d = "h"
+        elif prev_mcp.get(k, {}).get("where") in ("remote", "existing"):
+            d = "r"
+        elif not has_app:
+            d = "h" if t.get("suggest") == "remote" else "n"
+        else:
+            d = t.get("suggest", "here")[0]
+        say(f"\n  {k} ({t['repo']}): {t['cost']}")
+        while True:
+            a_ = ask(f"{k}: [h]ere, [r]emote, [n]ot used", d).lower()[:1]
+            if a_ in ("h", "r", "n"):
+                break
+        place[k] = {"h": "here", "r": "remote", "n": "none"}[a_]
+    keys = [k for k in KEYS if place[k] == "here"]
     keys = with_uses(keys, interactive=True, assume_yes=True)
+    for k in keys:
+        place[k] = "here"
+    setup["placement"] = place
+    save_setup(setup)
+    here_ = [k for k in KEYS if place[k] == "here"]
+    remote_ = [k for k in KEYS if place[k] == "remote"]
+    say(f"\n  Install here: {', '.join(here_) or 'nothing'}." +
+        (f"  Reached on another machine: {', '.join(remote_)} (step 4)." if remote_ else ""))
 
     if keys:
         say("\nStep 2/4 — Python environment")
@@ -1010,14 +1060,23 @@ def cmd_setup(a) -> None:
                 if REGISTRY[k]["backends"]:
                     for name, ok, what, _ in backend_report(k, tool_status(k)):
                         say(f"  {k}: {name}: " + ("ok" if ok else "still missing") + f" ({what})")
+        tunable = [(k, v, w) for k in keys for v, w in REGISTRY[k]["env"].items()
+                   if v.endswith(("_TIMEOUT", "_PROCS", "_WORKERS"))]
+        if tunable and yes("Set run limits for this machine in config/env (timeouts, MPI ranks, workers)?", False):
+            cur_env = env_read()
+            for k, var, what in tunable:
+                val = ask(f"{var} ({what}; '-' clears)", cur_env.get(var, ""))
+                if val != cur_env.get(var, ""):
+                    env_set({var: "" if val == "-" else val})
+            say(f"  {ENV_FILE} updated")
         alias_interactive(setup)
     else:
         say("\n  Nothing to install here (steps 2 and 3 skipped).")
         save_setup(setup)
 
     say("\nStep 4/4 — MCP servers")
-    if yes("Will a Claude app on this machine use the translators?", sys.platform == "darwin" or os.name == "nt"):
-        mcp_setup_interactive(setup)
+    if remote_ or yes("Will a Claude app on this machine use the translators?", has_app):
+        mcp_setup_interactive(setup, hint=place)
     else:
         say(f"  On the machine with the Claude app, run 'llmt mcp setup' and choose 'remote' with this host and {ROOT}.")
     say("\nDone. Check any time with: llmt status")
