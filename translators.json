@@ -3,7 +3,7 @@
   "b3dt": {
    "repo": "build123d-translator",
    "package": "build123d_translator",
-   "summary": "CAD: goals (ordered features) -> build123d solids, STEP files, scripts",
+   "summary": "CAD: goals (ordered features: bosses, holes, pockets, revolves, patterns, fillets, lofts, sweeps, threads, text) -> build123d solids, STEP files, scripts",
    "cost": "light (milliseconds to ~1 s per part): run it next to the Claude app",
    "suggest": "here",
    "cli": "b3dt",
@@ -22,7 +22,7 @@
   "feat": {
    "repo": "fea-translator",
    "package": "fea_translator",
-   "summary": "FEA: static, modal, buckling, steady thermal (Gmsh + CalculiX)",
+   "summary": "FEA: static, modal, buckling, steady heat (with thermal stress), DC conduction, electrostatics, Joule heating (Gmsh + CalculiX)",
    "cost": "light to moderate (seconds to minutes per study)",
    "suggest": "here",
    "cli": "feat",
@@ -49,7 +49,7 @@
   "cfdt": {
    "repo": "cfd-translator",
    "package": "cfd_translator",
-   "summary": "CFD: steady incompressible flow, laminar or k-omega SST (OpenFOAM)",
+   "summary": "CFD: steady flow, laminar or k-omega SST, internal or external; incompressible, or with energy: compressible air to transonic, heated walls, buoyancy (OpenFOAM)",
    "cost": "heavy (minutes to hours per study): a good candidate for a remote workstation",
    "suggest": "remote",
    "cli": "cfdt",
@@ -60,6 +60,8 @@
    "uses": {"b3dt": "geometries as build123d-translator goals", "feat": "external-flow loads into FEA, chain benchmarks"},
    "status": true,
    "bench": true,
+   "tuning": {"procs": "CFDT_PROCS", "workers": "CFDT_WORKERS", "workers_default": 2,
+              "set": {"CFDT_TIMEOUT": "10800"}, "why": "3 h per study: OpenFOAM runs on a workstation are long"},
    "backends": [
     {"key": "openfoam", "name": "OpenFOAM", "doc": "openfoam",
      "without": "meshing, case writing and the 2D reference solver only"},
@@ -77,7 +79,7 @@
   "lmpt": {
    "repo": "lammps-translator",
    "package": "lammps_translator",
-   "summary": "Atomistic simulations: crystals and molecular liquids (LAMMPS)",
+   "summary": "Atomistic: crystals and molecular liquids; MD, elastic constants, EOS, vacancies, surfaces, thermal expansion (LAMMPS)",
    "cost": "moderate to heavy (seconds to hours per study): local or remote",
    "suggest": "remote",
    "cli": "lmpt",
@@ -88,6 +90,7 @@
    "uses": {"feat": "feat_material into FEA, chain benchmark"},
    "status": true,
    "bench": true,
+   "tuning": {"procs": "LMPT_PROCS", "workers": "LMPT_WORKERS", "workers_default": 2, "set": {}},
    "backends": [
     {"key": "lammps", "name": "LAMMPS", "doc": "lammps", "without": "nothing runs (inputs can still be written)"}
    ],

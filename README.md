@@ -4,10 +4,12 @@ One place to install and run the translators that connect LLMs to engineering an
 
 | Key | Translator | What | Backends |
 |---|---|---|---|
-| `b3dt` | [build123d-translator](https://github.com/feranick/build123d-translator) | CAD parts from goals: build123d solids, STEP files, scripts | none (pip only) |
-| `feat` | [fea-translator](https://github.com/feranick/fea-translator) | FEA: static, modal, buckling, steady thermal | Gmsh, CalculiX |
-| `cfdt` | [cfd-translator](https://github.com/feranick/cfd-translator) | CFD: steady incompressible flow | Gmsh, OpenFOAM |
-| `lmpt` | [lammps-translator](https://github.com/feranick/lammps-translator) | Atomistic simulations | LAMMPS |
+| `b3dt` | [build123d-translator](https://github.com/feranick/build123d-translator) | CAD parts from goals, i.e. ordered features (bosses, holes, pockets, revolves, patterns, fillets, lofts, sweeps, threads, text), turned into build123d solids, STEP files and scripts | none (pip only) |
+| `feat` | [fea-translator](https://github.com/feranick/fea-translator) | FEA: linear static, modal, linear buckling, steady heat transfer (with thermal stress), DC electric conduction, electrostatics, Joule heating | Gmsh, CalculiX |
+| `cfdt` | [cfd-translator](https://github.com/feranick/cfd-translator) | CFD: steady flow, laminar or k-ω SST, internal or external, 2D or 3D. Incompressible, or with `energy`: compressible air from low speed to transonic, heated or cooled walls, buoyancy. Rotating zones (pumps, fans) | Gmsh, OpenFOAM |
+| `lmpt` | [lammps-translator](https://github.com/feranick/lammps-translator) | Atomistic: crystals and molecular liquids. Minimization, NVE/NVT/NPT MD, elastic constants, EOS, vacancies, surfaces, thermal expansion. Results include an FEA material for feat | LAMMPS |
+
+Each translator's README has the details. This table describes the commits pinned here (`llmt status` shows them).
 
 The translators work together: fea and cfd take b3dt goals as geometry, cfd passes wall loads to fea, and lammps produces fea materials. That only works when they are installed in the same venv, which is why there is a single venv here.
 
@@ -61,6 +63,7 @@ llmt pin [KEY...] [--to C] [--commit [--push]]   move the pins to the latest pus
 llmt test [KEY...]              pytest in each translator
 llmt bench KEY [NAMES...]       a translator's benchmarks
 llmt alias [--name N] [--rc F]  shell alias for the venv (default llmt-venv; replaces the old 'cad')
+llmt tune [KEY...] [--print | --apply]   MPI ranks and timeouts for this machine, from its cores
 llmt env [--edit]               per-machine settings (config/env)
 llmt mcp setup                  local / remote / existing / none per translator
 llmt mcp config                 write the entries into the Claude desktop config (backup kept)
@@ -93,7 +96,9 @@ llm-translators/
 
 Settings can be made at two levels:
 
-- **Per machine:** `config/env` on the machine that runs the translator. Use it for backend paths and limits that belong to the hardware, such as `CFDT_PROCS=18` on an 18-core workstation. `llmt setup` asks for backend paths, and optionally for run limits (timeouts, MPI ranks, workers). `llmt env --edit` opens the file.
+- **Per machine:** `config/env` on the machine that runs the translator. Use it for backend paths and for limits that belong to the hardware. `llmt setup` asks for backend paths and suggests run limits from the machine's CPU; `llmt tune` does the same at any time (`--print` to only see the suggestion, `--apply` to write it). `llmt env --edit` opens the file.
+
+  The suggested MPI ranks per study are the physical cores, minus 1 or 2 kept free for the system, meshing and the servers, divided by the studies that can run at a time (`CFDT_WORKERS`, `LMPT_WORKERS`; default 2). For example, a 20-core workstation gets 9 ranks with two studies at a time, or 18 with one. Hyperthreads are not counted, because they do not speed up MPI solvers. With mixed core types (Apple performance and efficiency cores, ARM big.LITTLE), `llmt` says so: ranks on the slower cores hold the others back, so it is worth comparing with as many ranks as there are performance cores. cfdt also gets `CFDT_TIMEOUT=10800` (3 h per study). A `procs` set in a study still overrides these values.
 - **Per MCP server:** `VAR=value` arguments after the key, for example `bin/mcp cfdt CFDT_TIMEOUT=10800 CFDT_PROCS=18`. They apply after `config/env`, so they override it, and only for that entry. This lets two clients use the same workstation with different limits. In `llmt mcp setup`, answer yes to "Settings for this cfdt server", and the entry becomes:
 
   ```json

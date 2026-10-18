@@ -11,6 +11,7 @@
     llmt test [KEY...]              each translator's pytest suite
     llmt bench KEY [NAMES...]       a translator's benchmarks
     llmt alias [--name N] [--rc F]  shell alias that activates the venv (default llmt-venv; old ones commented out)
+    llmt tune [KEY...] [--print | --apply]   MPI ranks and timeouts for this machine, from its cores
     llmt env [--edit]               the per-machine settings file (config/env)
     llmt mcp setup                  choose local / remote (ssh) / existing install / none per translator
     llmt mcp config [--print | --claude-code | --file F]   write or print the MCP client entries
@@ -31,6 +32,7 @@ import platform
 import re
 import shlex
 import shutil
+import textwrap
 import signal
 import subprocess
 import sys
@@ -373,6 +375,128 @@ def do_install(keys: list[str], setup: dict, python: str | None, interactive: bo
     save_setup(setup)
     ensure_env_file()
     say("  done.")
+
+
+# ---------------------------------------------------------------- run limits (MPI ranks, timeouts)
+
+def _sysctl(name: str) -> int | None:
+    try:
+        r = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=10)
+        return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def cpu_info() -> dict:
+    """Physical cores usable here (hyperthreads do not help MPI solvers), logical CPUs, and core kinds
+    when they differ (Apple P/E cores, ARM big.LITTLE)."""
+    logical = os.cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            logical = len(os.sched_getaffinity(0))   # what this process may use (containers, taskset)
+        except OSError:
+            pass
+    physical, kinds = None, []
+    if sys.platform == "darwin":
+        physical = _sysctl("hw.physicalcpu")
+        for lvl, name in ((0, "performance"), (1, "efficiency")):
+            n = _sysctl(f"hw.perflevel{lvl}.physicalcpu")
+            if n:
+                kinds.append((n, name))
+    elif sys.platform.startswith("linux"):
+        try:
+            r = subprocess.run(["lscpu", "-p=CPU,CORE,SOCKET"], capture_output=True, text=True, timeout=10)
+            allowed = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else None
+            cores = set()
+            for line in r.stdout.splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                cpu, core, sock = (line.split(",") + ["", "", ""])[:3]
+                if allowed is None or (cpu.isdigit() and int(cpu) in allowed):
+                    cores.add((sock, core))
+            physical = len(cores) or None
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        caps: dict[int, int] = {}
+        for f in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpu_capacity"):
+            try:
+                c = int(f.read_text().strip())
+                caps[c] = caps.get(c, 0) + 1
+            except (OSError, ValueError):
+                pass
+        if len(caps) > 1:
+            top = max(caps)
+            kinds = [(caps[top], "performance"), (sum(n for c, n in caps.items() if c != top), "efficiency")]
+    physical = min(physical or logical, logical)
+    return {"physical": physical, "logical": logical, "kinds": kinds}
+
+
+def suggest_tuning(keys: list[str], cur_env: dict[str, str]) -> tuple[dict, list[str]]:
+    """Suggested config/env values: MPI ranks per study = (physical cores - a few kept free for the
+    system, meshing and the servers) / concurrent studies (workers); plus the registry's fixed values."""
+    cpu = cpu_info()
+    reserve = 0 if cpu["physical"] <= 4 else (1 if cpu["physical"] <= 8 else 2)
+    usable = max(1, cpu["physical"] - reserve)
+    out, notes = {}, []
+    for k in keys:
+        t = REGISTRY[k].get("tuning")
+        if not t:
+            continue
+        workers = cur_env.get(t["workers"]) or str(t["workers_default"])
+        try:
+            w = max(1, int(workers))
+        except ValueError:
+            w = t["workers_default"]
+        out[t["procs"]] = str(max(1, usable // w))
+        notes.append(f"{t['procs']}={out[t['procs']]}: {usable} cores ({cpu['physical']} - {reserve} kept free) "
+                     f"/ {t['workers']}={w} (studies at a time)")
+        for var, val in t.get("set", {}).items():
+            out[var] = val
+            if t.get("why"):
+                notes.append(f"{var}={val}: {t['why']}")
+    return out, notes
+
+
+def tune_interactive(keys: list[str]) -> None:
+    keys = [k for k in keys if REGISTRY[k].get("tuning")]
+    if not keys:
+        return
+    cur = env_read()
+    cpu = cpu_info()
+    sug, notes = suggest_tuning(keys, cur)
+    say("\nRun limits for this machine (config/env)")
+    kinds = " (" + " + ".join(f"{n} {name}" for n, name in cpu["kinds"]) + ")" if cpu["kinds"] else ""
+    say(f"  CPU: {cpu['physical']} physical cores{kinds}, {cpu['logical']} logical")
+    if cpu["kinds"]:
+        say("  Mixed core types: MPI ranks on efficiency cores run slower and the others wait for them;")
+        say("  if a benchmark runs as fast with fewer ranks, use the number of performance cores.")
+    for n in notes:
+        say(f"  {n}")
+    rows = []
+    for var, val in sug.items():
+        have = cur.get(var)
+        rows.append((var, val, have))
+        say(f"    {var:14} suggested {val:7}" + (f" current {have}" if have else ""))
+    if all(have == val for _, val, have in rows):
+        say("  config/env already has these.")
+        return
+    if yes("Write the suggested values to config/env (values you set before are replaced)?", True):
+        env_set({var: val for var, val, _ in rows})
+    elif yes("Set them one by one?", True):
+        for k in keys:
+            t = REGISTRY[k]["tuning"]
+            w = ask(f"{t['workers']} (studies at a time)", cur.get(t["workers"]) or str(t["workers_default"]))
+            env_set({t["workers"]: w})
+            sug2, _ = suggest_tuning([k], {**cur, t["workers"]: w})
+            v = ask(f"{t['procs']} (MPI ranks per study; '-' clears)", sug2[t["procs"]])
+            env_set({t["procs"]: "" if v == "-" else v})
+            for var, val in t.get("set", {}).items():
+                v = ask(f"{var} ('-' clears)", cur.get(var) or val)
+                env_set({var: "" if v == "-" else v})
+    else:
+        return
+    say(f"  {ENV_FILE} updated. Per study, a 'procs' in the study itself still overrides it; so do")
+    say("  VAR=value settings in an MCP entry (llmt mcp setup).")
 
 
 # ---------------------------------------------------------------- shell alias
@@ -753,8 +877,10 @@ def report_remote(key: str, host: str, root: str, spec: dict) -> dict:
         d = (data or {}).get("translators", {}).get(key, {})
         if d.get("version"):
             miss = [n for n, v in d.get("backends", {}).items() if not v["found"]]
+            procs = (d.get("status") or {}).get("procs")
             say(f"  {host}: {key} {d['version']} in llm-translators" +
-                (f"; missing: {', '.join(miss)} (see BACKENDS.md)" if miss else "; backends ok"))
+                (f"; missing: {', '.join(miss)} (see BACKENDS.md)" if miss else "; backends ok") +
+                (f"; {procs} MPI ranks per study (its config/env)" if procs else ""))
             return spec
         warn(f"{key} is not installed in llm-translators on {host} (there: {root}/llmt install {key})")
     else:
@@ -938,7 +1064,10 @@ def table() -> None:
     say(f"  {'#':2} {'key':5} {'repo':21} {'here':10} what")
     for i, (k, t) in enumerate(REGISTRY.items(), 1):
         here = f"v{inst[k]}" if k in inst else ("source" if subs.get(t["repo"], ("absent",))[0] != "absent" else "-")
-        say(f"  {i:<2} {k:5} {t['repo']:21} {here[:10]:10} {t['summary']}")
+        lines = textwrap.wrap(t["summary"], 76) or [""]
+        say(f"  {i:<2} {k:5} {t['repo']:21} {here[:10]:10} {lines[0]}")
+        for line in lines[1:]:
+            say(f"{'':44}{line}")
         bes = ", ".join(b["name"] for b in t["backends"]) or "none (pip only)"
         say(f"{'':44}backends: {bes}")
         say(f"{'':44}{t['cost']}")
@@ -1061,15 +1190,7 @@ def cmd_setup(a) -> None:
                 if REGISTRY[k]["backends"]:
                     for name, ok, what, _ in backend_report(k, tool_status(k)):
                         say(f"  {k}: {name}: " + ("ok" if ok else "still missing") + f" ({what})")
-        tunable = [(k, v, w) for k in keys for v, w in REGISTRY[k]["env"].items()
-                   if v.endswith(("_TIMEOUT", "_PROCS", "_WORKERS"))]
-        if tunable and yes("Set run limits for this machine in config/env (timeouts, MPI ranks, workers)?", False):
-            cur_env = env_read()
-            for k, var, what in tunable:
-                val = ask(f"{var} ({what}; '-' clears)", cur_env.get(var, ""))
-                if val != cur_env.get(var, ""):
-                    env_set({var: "" if val == "-" else val})
-            say(f"  {ENV_FILE} updated")
+        tune_interactive(keys)
         alias_interactive(setup)
     else:
         say("\n  Nothing to install here (steps 2 and 3 skipped).")
@@ -1296,6 +1417,27 @@ def cmd_alias(a) -> None:
     save_setup(setup)
 
 
+def cmd_tune(a) -> None:
+    setup = load_setup()
+    keys = parse_keys(a.keys) if a.keys else [k for k in setup.get("installed", [])]
+    keys = [k for k in keys if REGISTRY[k].get("tuning")]
+    if not keys:
+        die("no installed translator has run limits to tune (cfdt, lmpt)")
+    if a.apply or a.print:
+        sug, notes = suggest_tuning(keys, env_read())
+        cpu = cpu_info()
+        say(f"CPU: {cpu['physical']} physical cores, {cpu['logical']} logical")
+        for n in notes:
+            say(f"  {n}")
+        if a.apply:
+            env_set(sug)
+            say(f"  written to {ENV_FILE}")
+        return
+    if not sys.stdin.isatty():
+        die("tune is interactive; use --print or --apply")
+    tune_interactive(keys)
+
+
 def cmd_env(a) -> None:
     ensure_env_file()
     if a.edit:
@@ -1373,6 +1515,11 @@ def main(argv: list[str] | None = None) -> None:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--print", action="store_true", help="only print the alias line")
     g.add_argument("--list", action="store_true", help="only list old translator-venv aliases")
+    p = sub.add_parser("tune", help="suggest MPI ranks and timeouts for this machine (config/env)")
+    p.add_argument("keys", nargs="*")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--print", action="store_true", help="only show the suggestion")
+    g.add_argument("--apply", action="store_true", help="write the suggestion without asking")
     p = sub.add_parser("env", help="per-machine settings (config/env)")
     p.add_argument("--edit", action="store_true")
     p = sub.add_parser("mcp", help="MCP servers")
@@ -1394,7 +1541,7 @@ def main(argv: list[str] | None = None) -> None:
         ap.print_help()
         return
     {"setup": cmd_setup, "list": cmd_list, "install": cmd_install, "remove": cmd_remove, "status": cmd_status,
-     "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "env": cmd_env, "mcp": cmd_mcp}[a.cmd](a)
+     "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "tune": cmd_tune, "env": cmd_env, "mcp": cmd_mcp}[a.cmd](a)
 
 
 if __name__ == "__main__":
@@ -1403,3 +1550,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nllmt: interrupted", file=sys.stderr)
         sys.exit(130)
+    except BrokenPipeError:   # e.g. llmt list | head
+        sys.stderr.close()
+        sys.exit(0)
