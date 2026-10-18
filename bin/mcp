@@ -1,0 +1,19 @@
+#!/bin/sh
+# Starts one translator's MCP server: bin/mcp KEY [--http PORT [--host H]]
+#   KEY: b3dt | feat | cfdt | lmpt (see translators.json)
+# This is the command the Claude app runs, locally or over ssh.
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+if [ $# -lt 1 ]; then
+    echo "usage: bin/mcp KEY [--http PORT [--host HOST]]" >&2
+    exit 2
+fi
+KEY=$1
+shift
+case "$KEY" in
+    *[!a-z0-9_-]*|"") echo "llm-translators: bad translator key '$KEY'" >&2; exit 2 ;;
+esac
+if [ ! -x "$ROOT/.venv/bin/$KEY-mcp" ]; then
+    echo "llm-translators: $KEY is not installed here ($ROOT/.venv/bin/$KEY-mcp missing; run $ROOT/llmt install $KEY)" >&2
+    exit 127
+fi
+exec "$ROOT/bin/run" "$ROOT/.venv/bin/$KEY-mcp" "$@"

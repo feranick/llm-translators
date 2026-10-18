@@ -1,0 +1,941 @@
+#!/usr/bin/env python3
+"""llmt — set up and manage the llm-translators (one venv, one MCP server per translator).
+
+    llmt setup                      guided setup: what to install here, venv, backends, MCP servers
+    llmt list                       the translators, what they need, what is installed here
+    llmt install KEY... [options]   install translators into the shared venv (and what they use)
+    llmt remove KEY...              uninstall translators from the venv
+    llmt status [-v] [--json]       versions, submodule commits, backends found
+    llmt update [--latest]          pull, check out the pinned (or latest) commits, reinstall
+    llmt test [KEY...]              each translator's pytest suite
+    llmt bench KEY [NAMES...]       a translator's benchmarks
+    llmt env [--edit]               the per-machine settings file (config/env)
+    llmt mcp setup                  choose local / remote (ssh) / none per translator
+    llmt mcp config [--print | --claude-code | --file F]   write or print the MCP client entries
+    llmt mcp serve [KEY...] [--host H]   serve MCP over streamable HTTP on each translator's port
+
+Backends (OpenFOAM, CalculiX, LAMMPS, Gmsh) are never installed by this tool: it reports what
+is missing and points to BACKENDS.md.
+
+Needs git and Python 3.7+ (standard library only); the venv needs Python 3.10+.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+__version__ = "2026.10.17.1"
+
+ROOT = Path(__file__).resolve().parent
+VENV = ROOT / ".venv"
+VPY = VENV / "bin" / "python"
+CONFIG_DIR = ROOT / "config"
+SETUP_FILE = CONFIG_DIR / "setup.json"
+ENV_FILE = CONFIG_DIR / "env"
+REGISTRY = json.loads((ROOT / "translators.json").read_text())["translators"]
+KEYS = list(REGISTRY)
+BACKENDS_MD = "BACKENDS.md"
+
+
+# ---------------------------------------------------------------- small helpers
+
+def say(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+def warn(msg: str) -> None:
+    print(f"  ! {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"llmt: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd: list[str], check: bool = True, capture: bool = False, cwd: Path | None = None,
+        timeout: float | None = None) -> subprocess.CompletedProcess:
+    if not capture:
+        say("  $ " + " ".join(shlex.quote(str(c)) for c in cmd))
+    r = subprocess.run([str(c) for c in cmd], cwd=cwd, text=True, timeout=timeout,
+                       capture_output=capture)
+    if check and r.returncode != 0:
+        err = (r.stderr or "").strip() if capture else ""
+        die(f"command failed ({r.returncode}): {' '.join(map(str, cmd))}" + (f"\n{err}" if err else ""))
+    return r
+
+
+def git(*args: str, capture: bool = True, check: bool = True) -> subprocess.CompletedProcess:
+    return run(["git", "-C", ROOT, *args], capture=capture, check=check)
+
+
+def ask(prompt: str, default: str = "") -> str:
+    d = f" [{default}]" if default else ""
+    try:
+        a = input(f"  {prompt}{d}: ").strip()
+    except EOFError:
+        a = ""
+    return a or default
+
+
+def yes(prompt: str, default: bool = True) -> bool:
+    d = "Y/n" if default else "y/N"
+    while True:
+        try:
+            a = input(f"  {prompt} [{d}]: ").strip().lower()
+        except EOFError:
+            a = ""
+        if not a:
+            return default
+        if a in ("y", "yes"):
+            return True
+        if a in ("n", "no"):
+            return False
+
+
+def load_setup() -> dict:
+    if SETUP_FILE.exists():
+        try:
+            return json.loads(SETUP_FILE.read_text())
+        except json.JSONDecodeError:
+            warn(f"{SETUP_FILE} is not valid JSON: starting from defaults")
+    return {"installed": [], "extras": {}, "test": True, "mcp": {}}
+
+
+def save_setup(s: dict) -> None:
+    CONFIG_DIR.mkdir(exist_ok=True)
+    s["llmt"] = __version__
+    s["updated"] = _dt.datetime.now().isoformat(timespec="seconds")
+    SETUP_FILE.write_text(json.dumps(s, indent=1) + "\n")
+
+
+def parse_keys(text: str | list[str]) -> list[str]:
+    """'1 2 cfdt' or ['b3dt', 'feat'] -> keys in registry order; 'all' for every one."""
+    items = text.replace(",", " ").split() if isinstance(text, str) else list(text)
+    out = set()
+    for it in items:
+        if it == "all":
+            out.update(KEYS)
+        elif it.isdigit() and 1 <= int(it) <= len(KEYS):
+            out.add(KEYS[int(it) - 1])
+        elif it in REGISTRY:
+            out.add(it)
+        else:
+            by_repo = [k for k, t in REGISTRY.items() if t["repo"] == it]
+            if not by_repo:
+                die(f"unknown translator '{it}' (known: {', '.join(KEYS)})")
+            out.update(by_repo)
+    return [k for k in KEYS if k in out]
+
+
+def venv_python_version() -> str | None:
+    if not VPY.exists():
+        return None
+    r = run([VPY, "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"], capture=True, check=False)
+    return r.stdout.strip() or None
+
+
+def python_version(py: str) -> tuple[int, ...] | None:
+    try:
+        r = subprocess.run([py, "-c", "import sys; print(*sys.version_info[:3])"], capture_output=True, text=True, timeout=30)
+        return tuple(int(x) for x in r.stdout.split()) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def default_python() -> str:
+    """The interpreter running llmt if it is 3.10+, else the newest python3.1x found (macOS's
+    /usr/bin/python3 is 3.9)."""
+    if sys.version_info >= (3, 10):
+        return sys.executable
+    for minor in range(20, 9, -1):
+        p = shutil.which(f"python3.{minor}")
+        if p:
+            return p
+    for p in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
+        v = python_version(p) if os.path.exists(p) else None
+        if v and v >= (3, 10):
+            return p
+    return sys.executable
+
+
+def installed_in_venv() -> dict[str, str]:
+    """key -> version for the translators importable from the venv."""
+    if not VPY.exists():
+        return {}
+    code = ("import importlib, json\nout = {}\n"
+            f"for k, p in {json.dumps({k: t['package'] for k, t in REGISTRY.items()})}.items():\n"
+            "    try:\n        m = importlib.import_module(p); out[k] = getattr(m, '__version__', '?')\n"
+            "    except Exception:\n        pass\nprint(json.dumps(out))")
+    r = run([VPY, "-c", code], capture=True, check=False)
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+
+def submodule_states() -> dict[str, tuple[str, str]]:
+    """repo path -> (state, commit); state: pinned | moved | absent | conflict."""
+    r = git("submodule", "status", check=False)
+    out = {}
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        flag, rest = line[0], line[1:].split()
+        state = {" ": "pinned", "+": "moved", "-": "absent", "U": "conflict"}.get(flag, "?")
+        out[rest[1]] = (state, rest[0][:7])
+    return out
+
+
+def with_uses(keys: list[str], interactive: bool, assume_yes: bool) -> list[str]:
+    """Adds the translators the chosen ones use (b3dt for feat, ...), asking when interactive."""
+    chosen, declined = set(keys), set()
+    changed = True
+    while changed:
+        changed = False
+        for k in [k for k in KEYS if k in chosen]:
+            for u, why in REGISTRY[k]["uses"].items():
+                if u in chosen or u in declined:
+                    continue
+                if interactive:
+                    add = yes(f"{k} uses {u} ({why}). Install {u} too?", True)
+                else:
+                    add = assume_yes
+                    if not add:
+                        say(f"  note: {k} can use {u} ({why}); add it with: llmt install {u}")
+                if add:
+                    chosen.add(u)
+                    changed = True
+                else:
+                    declined.add(u)
+    return [k for k in KEYS if k in chosen]
+
+
+# ---------------------------------------------------------------- the env file
+
+def env_read() -> dict[str, str]:
+    vals = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+            if m:
+                v = m.group(2).strip()
+                try:
+                    v = " ".join(shlex.split(v)) if v else ""
+                except ValueError:
+                    pass
+                vals[m.group(1)] = v
+    return vals
+
+
+def env_template() -> str:
+    lines = [
+        "# llm-translators: settings for this machine (sourced by bin/run, bin/mcp and bin/activate).",
+        "# Shell syntax, KEY=value. Not tracked by git. The MCP servers do not read ~/.bashrc",
+        "# (ssh runs them in a non-interactive shell), so put backend paths here.",
+        "",
+        "# Extra folders for executables, e.g. Homebrew on macOS:",
+        "# PATH=/opt/homebrew/bin:$PATH",
+        "",
+    ]
+    for k, t in REGISTRY.items():
+        if not t["env"]:
+            continue
+        lines.append(f"# --- {k} ({t['repo']})")
+        for var, what in t["env"].items():
+            lines.append(f"# {var + '=':17} # {what}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def env_set(updates: dict[str, str]) -> None:
+    """Sets (or comments out, for '') variables in config/env, keeping the rest of the file."""
+    CONFIG_DIR.mkdir(exist_ok=True)
+    text = ENV_FILE.read_text() if ENV_FILE.exists() else env_template()
+    lines = text.splitlines()
+    for var, val in updates.items():
+        new = f"{var}={shlex.quote(val)}" if val else None
+        hit = None
+        for i, line in enumerate(lines):
+            if re.match(rf"\s*(?:export\s+)?{var}=", line):
+                hit = i
+                break
+        if hit is None:
+            for i, line in enumerate(lines):
+                if re.match(rf"\s*#\s*{var}=", line):
+                    hit = i
+                    break
+        if new is None:
+            if hit is not None and not lines[hit].lstrip().startswith("#"):
+                lines[hit] = "# " + lines[hit]
+        elif hit is not None:
+            lines[hit] = new
+        else:
+            lines.append(new)
+    ENV_FILE.write_text("\n".join(lines) + "\n")
+
+
+def ensure_env_file() -> None:
+    if not ENV_FILE.exists():
+        CONFIG_DIR.mkdir(exist_ok=True)
+        ENV_FILE.write_text(env_template() + "\n")
+
+
+# ---------------------------------------------------------------- install
+
+def make_venv(python: str | None) -> None:
+    if VPY.exists():
+        say(f"  venv: {VENV} (Python {venv_python_version()})")
+        return
+    py = python or default_python()
+    v = python_version(py)
+    if v is None:
+        die(f"cannot run {py}")
+    if v < (3, 10):
+        die(f"{py} is Python {'.'.join(map(str, v))}: 3.10 or later is needed (llmt install --python PATH)")
+    say(f"  creating the venv with {py} (Python {'.'.join(map(str, v))})")
+    run([py, "-m", "venv", VENV])
+    run([VPY, "-m", "pip", "install", "--quiet", "--upgrade", "pip"])
+
+
+def checkout(keys: list[str]) -> None:
+    paths = [REGISTRY[k]["repo"] for k in keys]
+    states = submodule_states()
+    todo = [p for p in paths if states.get(p, ("absent",))[0] == "absent"]
+    if todo:
+        git("submodule", "update", "--init", "--", *todo, capture=False)
+    for p in paths:
+        if not (ROOT / p / "pyproject.toml").exists():
+            die(f"{p} is not checked out (git submodule update --init {p})")
+
+
+def pip_install(keys: list[str], setup: dict, upgrade: bool = False) -> None:
+    specs = []
+    for k in keys:
+        t = REGISTRY[k]
+        extras = list(t["extras"]) + ([t["test_extra"]] if setup.get("test", True) and t.get("test_extra") else [])
+        extras += [e for e in setup.get("extras", {}).get(k, []) if e in t["optional_extras"]]
+        specs += ["-e", f"{ROOT / t['repo']}[{','.join(extras)}]"]
+    cmd = [VPY, "-m", "pip", "install"] + (["--upgrade"] if upgrade else []) + specs
+    run(cmd)
+
+
+def gmsh_fixup(keys: list[str], interactive: bool, link: bool | None) -> None:
+    """Linux on ARM: PyPI has no Gmsh wheels; the system's python3-gmsh can be linked into the venv."""
+    needs = [k for k in keys if any(b["key"] == "gmsh" for b in REGISTRY[k]["backends"])]
+    if not needs:
+        return
+    r = run([VPY, "-c", "import gmsh"], capture=True, check=False)
+    if r.returncode == 0:
+        return
+    sysmod = Path("/usr/lib/python3/dist-packages/gmsh.py")
+    vv = venv_python_version() or ""
+    site = VENV / "lib" / f"python{'.'.join(vv.split('.')[:2])}" / "site-packages"
+    sys_py = python_version("/usr/bin/python3") if Path("/usr/bin/python3").exists() else None
+    same = sys_py is not None and ".".join(map(str, sys_py[:2])) == ".".join(vv.split(".")[:2])
+    if sysmod.exists() and same and site.is_dir():
+        do = link if link is not None else (yes(f"Gmsh is not in the venv; link the system's {sysmod} into it?", True)
+                                            if interactive else False)
+        if do:
+            dst = site / "gmsh.py"
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            dst.symlink_to(sysmod)
+            ok = run([VPY, "-c", "import gmsh; print(gmsh.__version__)"], capture=True, check=False)
+            say(f"  linked {dst} -> {sysmod}: " + (f"Gmsh {ok.stdout.strip()}" if ok.returncode == 0 else "import still fails"))
+            return
+        say(f"  Gmsh: link it with: llmt install --link-system-gmsh {' '.join(keys)}")
+        return
+    why = ("the venv's Python differs from the system's" if sysmod.exists() and not same
+           else "no Gmsh wheel for this platform and no system python3-gmsh")
+    warn(f"Gmsh is not importable in the venv ({why}): see {BACKENDS_MD}#gmsh")
+
+
+def do_install(keys: list[str], setup: dict, python: str | None, interactive: bool, link_gmsh: bool | None,
+               upgrade: bool = False) -> None:
+    say(f"\nInstalling {', '.join(keys)} into {VENV}")
+    make_venv(python)
+    checkout(keys)
+    pip_install(keys, setup, upgrade)
+    gmsh_fixup(keys, interactive, link_gmsh)
+    setup["installed"] = [k for k in KEYS if k in set(setup.get("installed", [])) | set(keys)]
+    save_setup(setup)
+    ensure_env_file()
+    say("  done.")
+
+
+# ---------------------------------------------------------------- status
+
+def tool_status(key: str, timeout: float = 120) -> dict | None:
+    t = REGISTRY[key]
+    if not t["status"]:
+        return None
+    try:
+        r = subprocess.run([str(ROOT / "bin" / "run"), t["cli"], "status"], capture_output=True, text=True, timeout=timeout)
+        return json.loads(r.stdout) if r.returncode == 0 else {"_error": (r.stderr or r.stdout).strip()[-300:]}
+    except subprocess.TimeoutExpired:
+        return {"_error": f"'{t['cli']} status' timed out"}
+    except json.JSONDecodeError:
+        return {"_error": f"'{t['cli']} status' did not print JSON"}
+
+
+def backend_found(val) -> tuple[bool, str]:
+    if val is None or val is False:
+        return False, "not found"
+    if isinstance(val, dict):
+        if val.get("error"):
+            return False, str(val["error"])
+        for k in ("version", "exe", "foamRun", "bashrc"):
+            if val.get(k):
+                return True, str(val[k])
+        return True, "found"
+    if isinstance(val, str) and val.startswith("/") and not os.path.exists(val):
+        return False, f"{val} does not exist"
+    return True, str(val)
+
+
+def backend_report(key: str, st: dict | None) -> list[tuple[str, bool, str, dict]]:
+    out = []
+    for b in REGISTRY[key]["backends"]:
+        if st is None or "_error" in st:
+            out.append((b["name"], False, (st or {}).get("_error", "no status"), b))
+        else:
+            ok, what = backend_found(st.get(b["key"]))
+            out.append((b["name"], ok, what, b))
+    return out
+
+
+def status_data(keys: list[str] | None = None) -> dict:
+    setup = load_setup()
+    inst = installed_in_venv()
+    subs = submodule_states()
+    keys = keys or KEYS
+    data = {"llmt": __version__, "root": str(ROOT), "venv": str(VENV) if VPY.exists() else None,
+            "python": venv_python_version(), "translators": {}}
+    for k in keys:
+        t = REGISTRY[k]
+        state, commit = subs.get(t["repo"], ("absent", ""))
+        d = {"repo": t["repo"], "submodule": state, "commit": commit, "version": inst.get(k),
+             "selected": k in setup.get("installed", [])}
+        if k in inst:
+            st = tool_status(k)
+            d["backends"] = {name: {"found": ok, "detail": what} for name, ok, what, _ in backend_report(k, st)}
+            d["status"] = st
+        data["translators"][k] = d
+    return data
+
+
+def print_status(data: dict, verbose: bool) -> None:
+    say(f"llm-translators {data['llmt']}  ({data['root']})")
+    say(f"venv: {data['venv'] or 'none (llmt setup)'}" + (f"  Python {data['python']}" if data["python"] else ""))
+    say("")
+    say(f"  {'key':5} {'version':14} {'commit':8} {'submodule':10} backends")
+    for k, d in data["translators"].items():
+        if not d["version"]:
+            note = "not installed" if d["submodule"] == "absent" else "checked out, not installed"
+            say(f"  {k:5} {'-':14} {d['commit'] or '-':8} {d['submodule']:10} {note}")
+            continue
+        bes = d.get("backends", {})
+        parts = [f"{n}: {'ok' if v['found'] else 'MISSING'}" for n, v in bes.items()] or ["none needed"]
+        say(f"  {k:5} {d['version']:14} {d['commit']:8} {d['submodule']:10} " + "; ".join(parts))
+        for n, v in bes.items():
+            if verbose or (not v["found"] and v["detail"] != "not found"):
+                say(f"{'':43}{n}: {v['detail']}")
+        if verbose and d.get("status"):
+            say("  " + json.dumps(d["status"], indent=1).replace("\n", "\n  "))
+    missing = [(k, n) for k, d in data["translators"].items() for n, v in d.get("backends", {}).items() if not v["found"]]
+    if missing:
+        say(f"\nMissing backends are installed separately: see {BACKENDS_MD}. Paths go in config/env (llmt env --edit).")
+    moved = [k for k, d in data["translators"].items() if d["submodule"] == "moved"]
+    if moved:
+        say(f"\nNot at the commit the umbrella pins: {', '.join(moved)} (llmt update to go back, or commit the new pins).")
+
+
+# ---------------------------------------------------------------- MCP
+
+def claude_desktop_config() -> Path:
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+    if os.name == "nt":
+        return Path(os.environ.get("APPDATA", home)) / "Claude" / "claude_desktop_config.json"
+    return home / ".config" / "Claude" / "claude_desktop_config.json"
+
+
+def mcp_entry(key: str, spec: dict) -> dict:
+    if spec.get("where") == "remote":
+        ssh = shutil.which("ssh") or "/usr/bin/ssh"
+        root = spec.get("root", "~/Software/llm-translators").rstrip("/")
+        return {"command": ssh, "args": ["-T", "-o", "BatchMode=yes", spec["host"], f"{root}/bin/mcp", key]}
+    return {"command": str(ROOT / "bin" / "mcp"), "args": [key]}
+
+
+def mcp_entries(setup: dict) -> dict:
+    return {k: mcp_entry(k, s) for k, s in setup.get("mcp", {}).items() if s.get("where") in ("local", "remote")}
+
+
+def check_remote(host: str, root: str, keys: list[str]) -> None:
+    cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{root}/llmt", "status", "--json", *keys]
+    say("  $ " + " ".join(shlex.quote(c) for c in cmd))
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        warn(f"could not reach {host}: {exc}")
+        return
+    if r.returncode != 0:
+        warn(f"{host}: {(r.stderr or r.stdout).strip()[-400:] or 'failed'}")
+        warn(f"install llm-translators on {host} at {root} and run its 'llmt setup' there")
+        return
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        warn(f"{host}: unexpected answer: {r.stdout[:200]}")
+        return
+    for k in keys:
+        d = data["translators"].get(k, {})
+        if not d.get("version"):
+            warn(f"{k} is not installed on {host} (there: llmt install {k})")
+            continue
+        bes = d.get("backends", {})
+        miss = [n for n, v in bes.items() if not v["found"]]
+        say(f"  {host}: {k} {d['version']}" + (f"; missing: {', '.join(miss)}" if miss else "; backends ok"))
+
+
+def mcp_setup_interactive(setup: dict) -> None:
+    say("\nMCP servers for the Claude app on THIS machine. For each translator:")
+    say("  l = local (installed here), r = remote over ssh (installed on another machine), n = none")
+    mcp = setup.setdefault("mcp", {})
+    inst = set(installed_in_venv())
+    last_host, last_root = "", "~/Software/llm-translators"
+    for s in mcp.values():
+        if s.get("where") == "remote":
+            last_host, last_root = s.get("host", last_host), s.get("root", last_root)
+    for k in KEYS:
+        t = REGISTRY[k]
+        cur = mcp.get(k, {}).get("where")
+        default = {"local": "l", "remote": "r", "none": "n"}.get(cur or "", "l" if k in inst else "n")
+        say(f"\n  {k} ({t['repo']}): {t['cost']}" + ("" if k in inst else "  [not installed here]"))
+        while True:
+            a = ask(f"{k}: [l]ocal, [r]emote, [n]one", default).lower()[:1]
+            if a in ("l", "r", "n"):
+                break
+        if a == "l":
+            if k not in inst:
+                warn(f"{k} is not installed here yet: llmt install {k}")
+            mcp[k] = {"where": "local"}
+        elif a == "r":
+            prev = mcp.get(k, {})
+            host = ask("ssh host (user@host, keys set up for BatchMode)", prev.get("host", last_host))
+            while not host:
+                host = ask("ssh host (user@host)", "")
+            root = ask(f"llm-translators folder on {host}", prev.get("root", last_root))
+            mcp[k] = {"where": "remote", "host": host, "root": root}
+            last_host, last_root = host, root
+        else:
+            mcp[k] = {"where": "none"}
+    save_setup(setup)
+    remotes: dict[tuple[str, str], list[str]] = {}
+    for k, s in mcp.items():
+        if s.get("where") == "remote":
+            remotes.setdefault((s["host"], s["root"]), []).append(k)
+    for (host, root), ks in remotes.items():
+        if yes(f"Check {', '.join(ks)} on {host} now (ssh)?", True):
+            check_remote(host, root, ks)
+    entries = mcp_entries(setup)
+    if not entries:
+        say("\n  No MCP servers chosen for this machine.")
+        return
+    say("\nEntries:")
+    say(json.dumps({"mcpServers": entries}, indent=1))
+    path = claude_desktop_config()
+    if yes(f"Write them into the Claude desktop config ({path})? A backup is kept.", True):
+        write_desktop_config(entries, path, [k for k, s in mcp.items() if s.get("where") == "none"])
+    else:
+        say("  Later: llmt mcp config   (or --print, --claude-code)")
+
+
+def write_desktop_config(entries: dict, path: Path, drop: list[str]) -> None:
+    cfg = {}
+    if path.exists():
+        try:
+            cfg = json.loads(path.read_text() or "{}")
+        except json.JSONDecodeError:
+            die(f"{path} is not valid JSON; fix it or use llmt mcp config --print")
+        bak = path.with_name(path.name + f".bak-{_dt.datetime.now():%Y%m%d-%H%M%S}")
+        shutil.copy2(path, bak)
+        say(f"  backup: {bak}")
+    servers = cfg.setdefault("mcpServers", {})
+    for k, e in entries.items():
+        old = servers.get(k)
+        if old == e:
+            say(f"  {k}: unchanged")
+            continue
+        if old:
+            say(f"  {k}: {' '.join([old.get('command', '')] + old.get('args', []))}")
+            say(f"  {'':{len(k)}}  -> {' '.join([e['command']] + e['args'])}")
+        else:
+            say(f"  {k}: added")
+        servers[k] = e
+    for k in drop:  # only entries llmt wrote (they run bin/mcp); others with the same name are left alone
+        e = servers.get(k)
+        if e and "/bin/mcp" in " ".join([e.get("command", "")] + list(e.get("args", []))):
+            say(f"  {k}: removed (set to none)")
+            servers.pop(k)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, indent=2) + "\n")
+    say(f"  wrote {path}. Restart the Claude app to load the servers.")
+
+
+def mcp_serve(keys: list[str], host: str) -> None:
+    if host not in ("127.0.0.1", "localhost"):
+        warn("streamable HTTP has no authentication: serve on trusted networks or through a tunnel only")
+    procs = []
+    for k in keys:
+        port = REGISTRY[k]["port"]
+        say(f"  {k}: http://{host}:{port}/mcp")
+        procs.append((k, subprocess.Popen([str(ROOT / "bin" / "mcp"), k, "--http", str(port), "--host", host])))
+    say("  Ctrl-C stops them.")
+
+    def stop(*_):
+        for _, p in procs:
+            if p.poll() is None:
+                p.terminate()
+    signal.signal(signal.SIGTERM, lambda *a: (stop(), sys.exit(0)))
+    try:
+        while procs:
+            for k, p in list(procs):
+                rc = p.poll()
+                if rc is not None:
+                    warn(f"{k} exited ({rc})")
+                    procs.remove((k, p))
+            if procs:
+                try:
+                    procs[0][1].wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+    except KeyboardInterrupt:
+        stop()
+        for _, p in procs:
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+
+# ---------------------------------------------------------------- commands
+
+def table() -> None:
+    inst = installed_in_venv()
+    subs = submodule_states()
+    say(f"  {'#':2} {'key':5} {'repo':21} {'here':10} what")
+    for i, (k, t) in enumerate(REGISTRY.items(), 1):
+        here = f"v{inst[k]}" if k in inst else ("source" if subs.get(t["repo"], ("absent",))[0] != "absent" else "-")
+        say(f"  {i:<2} {k:5} {t['repo']:21} {here[:10]:10} {t['summary']}")
+        bes = ", ".join(b["name"] for b in t["backends"]) or "none (pip only)"
+        say(f"{'':44}backends: {bes}")
+        say(f"{'':44}{t['cost']}")
+
+
+def cmd_setup(a) -> None:
+    if not sys.stdin.isatty():
+        die("setup is interactive; use 'llmt install KEY...' and 'llmt mcp config' in scripts")
+    setup = load_setup()
+    say(f"llm-translators {__version__} — setup ({ROOT})\n")
+    say("Available translators:")
+    table()
+
+    say("\nStep 1/4 — Which translators should be installed on THIS machine?")
+    say("  Light ones belong next to the Claude app; heavy solvers can live on a workstation reached over ssh")
+    say("  (step 4). Installing nothing here is fine if this machine only runs the Claude app.")
+    cur = " ".join(setup.get("installed", [])) or "none"
+    while True:
+        a_ = ask("numbers or keys, space-separated ('all', 'none')", cur)
+        try:
+            keys = [] if a_ == "none" else parse_keys(a_)
+            break
+        except SystemExit:
+            continue
+    keys = with_uses(keys, interactive=True, assume_yes=True)
+
+    if keys:
+        say("\nStep 2/4 — Python environment")
+        if VPY.exists():
+            say(f"  venv: {VENV} (Python {venv_python_version()})")
+            python = None
+        else:
+            default = default_python()
+            arm_linux = sys.platform.startswith("linux") and platform.machine() in ("aarch64", "arm64")
+            if arm_linux and any(b["key"] == "gmsh" for k in keys for b in REGISTRY[k]["backends"]):
+                say("  Linux on ARM: Gmsh comes from apt (python3-gmsh), so the venv must use the system's Python.")
+                default = "/usr/bin/python3"
+            while True:
+                python = ask("Python for the venv (3.10+)", default)
+                v = python_version(python)
+                if v and v >= (3, 10):
+                    break
+                warn(f"{python}: not a Python 3.10+ interpreter")
+        setup["test"] = yes("Install the test tools (pytest)?", setup.get("test", True))
+        for k in keys:
+            for e, what in REGISTRY[k]["optional_extras"].items():
+                have = e in setup.get("extras", {}).get(k, [])
+                if yes(f"{k}: {what}?", have):
+                    setup.setdefault("extras", {}).setdefault(k, [])
+                    if e not in setup["extras"][k]:
+                        setup["extras"][k].append(e)
+                elif have:
+                    setup["extras"][k].remove(e)
+        do_install(keys, setup, python, interactive=True, link_gmsh=None)
+        dropped = [k for k in setup.get("installed", []) if k not in keys]
+        if dropped:
+            say(f"  Still installed from before: {', '.join(dropped)} (llmt remove {' '.join(dropped)} to uninstall)")
+
+        say(f"\nStep 3/4 — Backends (installed separately: {BACKENDS_MD})")
+        missing_any = False
+        for k in keys:
+            if not REGISTRY[k]["backends"]:
+                say(f"  {k}: no backend needed")
+                continue
+            for name, ok, what, b in backend_report(k, tool_status(k)):
+                say(f"  {k}: {name}: " + (f"ok ({what})" if ok else f"MISSING — {what}"))
+                if not ok:
+                    missing_any = True
+                    say(f"  {'':{len(k)}}  without it: {b['without']}. See {BACKENDS_MD}#{b['doc']}")
+        q = ("Set backend paths in config/env now (if a backend is installed somewhere unusual)?" if missing_any
+             else "Review the backend paths in config/env?")
+        if any(REGISTRY[k]["backends"] for k in keys) and yes(q, missing_any):
+            cur_env = env_read()
+            for k in keys:
+                for var, what in REGISTRY[k]["env"].items():
+                    if var.endswith(("_OUT", "_WORKERS", "_TIMEOUT", "_SOLVER", "_PROCS", "_MPIRUN")) and var not in cur_env:
+                        continue
+                    val = ask(f"{var} ({what}; '-' clears)", cur_env.get(var, ""))
+                    if val != cur_env.get(var, ""):
+                        env_set({var: "" if val == "-" else val})
+            say(f"  {ENV_FILE} updated (other settings: llmt env --edit)")
+            for k in keys:
+                if REGISTRY[k]["backends"]:
+                    for name, ok, what, _ in backend_report(k, tool_status(k)):
+                        say(f"  {k}: {name}: " + ("ok" if ok else "still missing") + f" ({what})")
+    else:
+        say("\n  Nothing to install here (steps 2 and 3 skipped).")
+        save_setup(setup)
+
+    say("\nStep 4/4 — MCP servers")
+    if yes("Will a Claude app on this machine use the translators?", sys.platform == "darwin" or os.name == "nt"):
+        mcp_setup_interactive(setup)
+    else:
+        say(f"  On the machine with the Claude app, run 'llmt mcp setup' and choose 'remote' with this host and {ROOT}.")
+    say("\nDone. Check any time with: llmt status")
+
+
+def cmd_list(a) -> None:
+    table()
+
+
+def cmd_install(a) -> None:
+    setup = load_setup()
+    keys = parse_keys(a.keys) if a.keys else setup.get("installed", [])
+    if not keys:
+        die("which translators? llmt install KEY... (or llmt setup)")
+    keys = with_uses(keys, interactive=False, assume_yes=not a.no_uses)
+    if a.no_test:
+        setup["test"] = False
+    elif a.test:
+        setup["test"] = True
+    for spec in a.extra or []:
+        k, _, e = spec.partition(":")
+        if k not in REGISTRY or e not in REGISTRY[k]["optional_extras"]:
+            die(f"--extra {spec}: expected KEY:EXTRA, one of " +
+                ", ".join(f"{k}:{e}" for k, t in REGISTRY.items() for e in t["optional_extras"]))
+        lst = setup.setdefault("extras", {}).setdefault(k, [])
+        if e not in lst:
+            lst.append(e)
+    do_install(keys, setup, a.python, interactive=False, link_gmsh=a.link_system_gmsh or None)
+    for k in keys:
+        st = tool_status(k)
+        for name, ok, what, b in backend_report(k, st):
+            if not ok:
+                warn(f"{k}: {name} missing ({what}); without it: {b['without']}. See {BACKENDS_MD}#{b['doc']}")
+
+
+def cmd_remove(a) -> None:
+    keys = parse_keys(a.keys)
+    setup = load_setup()
+    if VPY.exists():
+        run([VPY, "-m", "pip", "uninstall", "-y", *[REGISTRY[k]["repo"] for k in keys]], check=False)
+    setup["installed"] = [k for k in setup.get("installed", []) if k not in keys]
+    save_setup(setup)
+    local = [k for k in keys if setup.get("mcp", {}).get(k, {}).get("where") == "local"]
+    if local:
+        say(f"  {', '.join(local)} still configured as local MCP servers: llmt mcp setup")
+    say("  The sources stay checked out (git submodule deinit to remove them).")
+
+
+def cmd_status(a) -> None:
+    keys = parse_keys(a.keys) if a.keys else None
+    data = status_data(keys)
+    if a.json:
+        print(json.dumps(data, indent=1))
+    else:
+        print_status(data, a.verbose)
+
+
+def cmd_update(a) -> None:
+    setup = load_setup()
+    keys = parse_keys(a.keys) if a.keys else setup.get("installed", [])
+    if not keys:
+        die("nothing installed here (llmt setup)")
+    if not a.no_pull:
+        say("Pulling llm-translators")
+        r = git("pull", "--ff-only", capture=False, check=False)
+        if r.returncode != 0:
+            warn("git pull failed: continuing with the local checkout")
+    paths = []
+    for k in keys:
+        p = REGISTRY[k]["repo"]
+        dirty = git("-C", p, "status", "--porcelain", check=False).stdout.strip() if (ROOT / p / ".git").exists() else ""
+        if dirty:
+            warn(f"{p} has uncommitted changes: left as it is")
+        else:
+            paths.append(p)
+    if paths:
+        if a.latest:
+            say("Checking out the latest commits of each translator's branch (main)")
+            git("submodule", "update", "--init", "--remote", "--", *paths, capture=False)
+        else:
+            say("Checking out the commits pinned by llm-translators")
+            git("submodule", "update", "--init", "--", *paths, capture=False)
+    pip_install(keys, setup)
+    if a.latest:
+        moved = [k for k, d in status_data(keys)["translators"].items() if d["submodule"] == "moved"]
+        if moved:
+            say(f"\n  {', '.join(moved)} moved past the pins. After testing, record them:")
+            say(f"    git add {' '.join(REGISTRY[k]['repo'] for k in moved)} && git commit -m 'Update pins'")
+    print_status(status_data(keys), False)
+
+
+def cmd_test(a) -> None:
+    setup = load_setup()
+    keys = parse_keys(a.keys) if a.keys else setup.get("installed", [])
+    results = {}
+    for k in keys:
+        say(f"\n=== {k}: pytest")
+        r = subprocess.run([str(ROOT / "bin" / "run"), "python", "-m", "pytest", "-q", *a.pytest_args],
+                           cwd=ROOT / REGISTRY[k]["repo"])
+        results[k] = r.returncode
+    say("\n" + "  ".join(f"{k}: {'pass' if rc == 0 else 'FAIL'}" for k, rc in results.items()))
+    sys.exit(0 if all(rc == 0 for rc in results.values()) else 1)
+
+
+def cmd_bench(a) -> None:
+    k = parse_keys([a.key])[0]
+    t = REGISTRY[k]
+    if not t["bench"]:
+        die(f"{k} has no bench command")
+    os.execv(str(ROOT / "bin" / "run"), [str(ROOT / "bin" / "run"), t["cli"], "bench", *a.names])
+
+
+def cmd_env(a) -> None:
+    ensure_env_file()
+    if a.edit:
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or ("nano" if shutil.which("nano") else "vi")
+        os.execvp(editor, [*shlex.split(editor), str(ENV_FILE)])
+    say(f"# {ENV_FILE}")
+    print(ENV_FILE.read_text(), end="")
+
+
+def cmd_mcp(a) -> None:
+    setup = load_setup()
+    if a.mcp_cmd == "setup":
+        if not sys.stdin.isatty():
+            die("mcp setup is interactive")
+        mcp_setup_interactive(setup)
+    elif a.mcp_cmd == "config":
+        entries = mcp_entries(setup)
+        if not entries:
+            die("no MCP servers chosen yet: llmt mcp setup")
+        if a.print:
+            print(json.dumps({"mcpServers": entries}, indent=1))
+        elif a.claude_code:
+            for k, e in entries.items():
+                print(f"claude mcp add-json --scope user {k} {shlex.quote(json.dumps({'type': 'stdio', **e}))}")
+        else:
+            path = Path(a.file).expanduser() if a.file else claude_desktop_config()
+            write_desktop_config(entries, path, [k for k, s in setup.get("mcp", {}).items() if s.get("where") == "none"])
+    elif a.mcp_cmd == "serve":
+        keys = parse_keys(a.keys) if a.keys else [k for k in setup.get("installed", []) if k in installed_in_venv()]
+        if not keys:
+            die("nothing installed here to serve")
+        mcp_serve(keys, a.host)
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(prog="llmt", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"llm-translators {__version__}")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("setup", help="guided setup")
+    sub.add_parser("list", help="the translators")
+    p = sub.add_parser("install", help="install translators into the shared venv")
+    p.add_argument("keys", nargs="*", help=f"{' | '.join(KEYS)} | all (default: those installed before)")
+    p.add_argument("--python", help="interpreter for a new venv (default: the one running llmt)")
+    p.add_argument("--no-uses", action="store_true", help="do not add the translators these use")
+    p.add_argument("--extra", action="append", metavar="KEY:EXTRA", help="optional extra, e.g. lmpt:lammps")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--test", action="store_true", help="install pytest (default)")
+    g.add_argument("--no-test", action="store_true", help="skip pytest")
+    p.add_argument("--link-system-gmsh", action="store_true", help="Linux ARM: link apt's python3-gmsh into the venv")
+    p = sub.add_parser("remove", help="uninstall translators from the venv")
+    p.add_argument("keys", nargs="+")
+    p = sub.add_parser("status", help="versions, commits, backends")
+    p.add_argument("keys", nargs="*")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("update", help="pull and reinstall")
+    p.add_argument("keys", nargs="*")
+    p.add_argument("--latest", action="store_true", help="each translator's latest main, not the pinned commit")
+    p.add_argument("--no-pull", action="store_true", help="do not git pull llm-translators itself")
+    p = sub.add_parser("test", help="pytest in each translator")
+    p.add_argument("keys", nargs="*")
+    p.add_argument("--pytest-args", nargs=argparse.REMAINDER, default=[], help="passed to pytest")
+    p = sub.add_parser("bench", help="a translator's benchmarks")
+    p.add_argument("key")
+    p.add_argument("names", nargs="*")
+    p = sub.add_parser("env", help="per-machine settings (config/env)")
+    p.add_argument("--edit", action="store_true")
+    p = sub.add_parser("mcp", help="MCP servers")
+    msub = p.add_subparsers(dest="mcp_cmd", required=True)
+    msub.add_parser("setup", help="local / remote / none per translator")
+    q = msub.add_parser("config", help="write the Claude desktop config (or print)")
+    g = q.add_mutually_exclusive_group()
+    g.add_argument("--print", action="store_true", help="print the mcpServers JSON")
+    g.add_argument("--claude-code", action="store_true", help="print 'claude mcp add-json' commands")
+    g.add_argument("--file", help="merge into this JSON file instead of the Claude desktop config")
+    q = msub.add_parser("serve", help="streamable HTTP servers on each translator's port")
+    q.add_argument("keys", nargs="*")
+    q.add_argument("--host", default="127.0.0.1")
+
+    a = ap.parse_args(argv)
+    if a.cmd is None:
+        if sys.stdin.isatty() and not SETUP_FILE.exists():
+            return cmd_setup(a)
+        ap.print_help()
+        return
+    {"setup": cmd_setup, "list": cmd_list, "install": cmd_install, "remove": cmd_remove, "status": cmd_status,
+     "update": cmd_update, "test": cmd_test, "bench": cmd_bench, "env": cmd_env, "mcp": cmd_mcp}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nllmt: interrupted", file=sys.stderr)
+        sys.exit(130)

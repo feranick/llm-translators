@@ -1,0 +1,101 @@
+{
+ "translators": {
+  "b3dt": {
+   "repo": "build123d-translator",
+   "package": "build123d_translator",
+   "summary": "CAD: goals (ordered features) -> build123d solids, STEP files, scripts",
+   "cost": "light (milliseconds to ~1 s per part): run it next to the Claude app",
+   "cli": "b3dt",
+   "port": 8766,
+   "extras": ["mcp"],
+   "test_extra": "test",
+   "optional_extras": {},
+   "uses": {},
+   "status": false,
+   "bench": false,
+   "backends": [],
+   "env": {
+    "B3DT_OUT": "output folder (default ~/b3d_parts)"
+   }
+  },
+  "feat": {
+   "repo": "fea-translator",
+   "package": "fea_translator",
+   "summary": "FEA: static, modal, buckling, steady thermal (Gmsh + CalculiX)",
+   "cost": "light to moderate (seconds to minutes per study)",
+   "cli": "feat",
+   "port": 8767,
+   "extras": ["mesh", "mcp"],
+   "test_extra": "test",
+   "optional_extras": {},
+   "uses": {"b3dt": "parts as build123d-translator goals"},
+   "status": true,
+   "bench": true,
+   "backends": [
+    {"key": "ccx", "name": "CalculiX (ccx)", "doc": "calculix",
+     "without": "the reference solver runs static, modal and thermal on small meshes; no buckling"},
+    {"key": "gmsh", "name": "Gmsh", "doc": "gmsh", "without": "only box parts can be meshed"}
+   ],
+   "env": {
+    "FEAT_CCX": "path to the CalculiX executable (default: ccx on PATH, /opt/homebrew/bin, ...)",
+    "FEAT_OUT": "output folder (default ~/feat_runs)",
+    "FEAT_WORKERS": "worker processes (default 2)",
+    "FEAT_TIMEOUT": "seconds per study (default 900)",
+    "FEAT_SOLVER": "auto | ccx | ref"
+   }
+  },
+  "cfdt": {
+   "repo": "cfd-translator",
+   "package": "cfd_translator",
+   "summary": "CFD: steady incompressible flow, laminar or k-omega SST (OpenFOAM)",
+   "cost": "heavy (minutes to hours per study): a good candidate for a remote workstation",
+   "cli": "cfdt",
+   "port": 8768,
+   "extras": ["mesh", "mcp"],
+   "test_extra": "test",
+   "optional_extras": {},
+   "uses": {"b3dt": "geometries as build123d-translator goals", "feat": "external-flow loads into FEA, chain benchmarks"},
+   "status": true,
+   "bench": true,
+   "backends": [
+    {"key": "openfoam", "name": "OpenFOAM", "doc": "openfoam",
+     "without": "meshing, case writing and the 2D reference solver only"},
+    {"key": "gmsh", "name": "Gmsh", "doc": "gmsh", "without": "only box domains can be meshed"}
+   ],
+   "env": {
+    "CFDT_FOAM": "OpenFOAM's etc/bashrc (or PATH if the shell already has OpenFOAM)",
+    "CFDT_OUT": "output folder (default ~/cfdt_runs)",
+    "CFDT_WORKERS": "worker processes (default 2)",
+    "CFDT_TIMEOUT": "seconds per study (default 3600)",
+    "CFDT_SOLVER": "auto | foam | ref",
+    "CFDT_PROCS": "MPI ranks per study (default 1)"
+   }
+  },
+  "lmpt": {
+   "repo": "lammps-translator",
+   "package": "lammps_translator",
+   "summary": "Atomistic simulations: crystals and molecular liquids (LAMMPS)",
+   "cost": "moderate to heavy (seconds to hours per study): local or remote",
+   "cli": "lmpt",
+   "port": 8769,
+   "extras": ["mcp"],
+   "test_extra": "test",
+   "optional_extras": {"lammps": "LAMMPS from PyPI (wheel) instead of a system LAMMPS; needs MPI libraries, see BACKENDS.md"},
+   "uses": {"feat": "feat_material into FEA, chain benchmark"},
+   "status": true,
+   "bench": true,
+   "backends": [
+    {"key": "lammps", "name": "LAMMPS", "doc": "lammps", "without": "nothing runs (inputs can still be written)"}
+   ],
+   "env": {
+    "LMPT_LMP": "LAMMPS command, e.g. /usr/bin/lmp or lmp_mpi",
+    "LMPT_POTENTIALS": "extra potential folders (:-separated)",
+    "LMPT_OUT": "output folder (default ~/lmpt_runs)",
+    "LMPT_WORKERS": "worker processes (default 2)",
+    "LMPT_TIMEOUT": "seconds per study (default 21600)",
+    "LMPT_PROCS": "MPI ranks per study (default 1)",
+    "LMPT_MPIRUN": "MPI launcher (default mpirun)"
+   }
+  }
+ }
+}

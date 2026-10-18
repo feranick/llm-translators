@@ -1,0 +1,16 @@
+[submodule "build123d-translator"]
+	path = build123d-translator
+	url = ../build123d-translator.git
+	branch = main
+[submodule "fea-translator"]
+	path = fea-translator
+	url = ../fea-translator.git
+	branch = main
+[submodule "cfd-translator"]
+	path = cfd-translator
+	url = ../cfd-translator.git
+	branch = main
+[submodule "lammps-translator"]
+	path = lammps-translator
+	url = ../lammps-translator.git
+	branch = main

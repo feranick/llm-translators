@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 debug/
 dist/
+# llm-translators: per-machine settings
+config/env
+config/setup.json

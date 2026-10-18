@@ -1,0 +1,24 @@
+#!/bin/sh
+# Runs a command with the llm-translators venv first on PATH and config/env loaded.
+#   bin/run feat status
+#   bin/run python -m pytest -q
+# Prints nothing of its own, so it is safe in front of an MCP server on stdio.
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+if [ -f "$ROOT/config/env" ]; then
+    set -a
+    . "$ROOT/config/env"
+    set +a
+fi
+if [ ! -x "$ROOT/.venv/bin/python" ]; then
+    echo "llm-translators: no venv at $ROOT/.venv (run $ROOT/llmt setup)" >&2
+    exit 127
+fi
+VIRTUAL_ENV="$ROOT/.venv"
+PATH="$VIRTUAL_ENV/bin:$PATH"
+export VIRTUAL_ENV PATH
+unset PYTHONHOME
+if [ $# -eq 0 ]; then
+    echo "usage: bin/run COMMAND [ARGS...]" >&2
+    exit 2
+fi
+exec "$@"
