@@ -7,6 +7,7 @@
     llmt remove KEY...              uninstall translators from the venv
     llmt status [-v] [--json]       versions, submodule commits, backends found
     llmt update [--latest]          pull, check out the pinned (or latest) commits, reinstall
+    llmt pin [KEY...] [--commit [--push]]   move the pins to each translator's latest pushed commit
     llmt test [KEY...]              each translator's pytest suite
     llmt bench KEY [NAMES...]       a translator's benchmarks
     llmt alias [--name N] [--rc F]  shell alias that activates the venv (default llmt-venv; old ones commented out)
@@ -1164,8 +1165,96 @@ def cmd_update(a) -> None:
         moved = [k for k, d in status_data(keys)["translators"].items() if d["submodule"] == "moved"]
         if moved:
             say(f"\n  {', '.join(moved)} moved past the pins. After testing, record them:")
-            say(f"    git add {' '.join(REGISTRY[k]['repo'] for k in moved)} && git commit -m 'Update pins'")
+            say(f"    llmt pin {' '.join(moved)} --commit")
     print_status(status_data(keys), False)
+    restart_note(keys)
+
+
+def restart_note(keys: list[str]) -> None:
+    say("\n  MCP servers load the code when they start: restart the Claude app (or reconnect the servers)")
+    say(f"  on the machines that use {', '.join(keys)}, here or over ssh, to get the new code.")
+
+
+def submodule_url(path: str) -> str:
+    """The submodule's URL, resolved against the umbrella's origin (relative URLs in .gitmodules)."""
+    r = git("config", "--get", f"submodule.{path}.url", check=False)
+    if not r.stdout.strip():
+        git("submodule", "init", "--", path)
+        r = git("config", "--get", f"submodule.{path}.url", check=False)
+    return r.stdout.strip()
+
+
+def submodule_branch(path: str) -> str:
+    r = git("config", "-f", ".gitmodules", "--get", f"submodule.{path}.branch", check=False)
+    return r.stdout.strip() or "main"
+
+
+def cmd_pin(a) -> None:
+    """Moves the umbrella's pins to each translator's latest pushed commit (or --to COMMIT)."""
+    keys = parse_keys(a.keys) if a.keys else KEYS
+    if a.to and len(keys) != 1:
+        die("--to needs exactly one translator")
+    staged_before = set(git("diff", "--cached", "--name-only").stdout.split())
+    subs = submodule_states()
+    changed = []
+    for k in keys:
+        path = REGISTRY[k]["repo"]
+        pinned = git("ls-files", "-s", "--", path).stdout.split()[1]   # the index: includes pins not yet committed
+        branch = submodule_branch(path)
+        url = submodule_url(path)
+        if a.to:
+            target = a.to
+        else:
+            r = run(["git", "ls-remote", url, f"refs/heads/{branch}"], capture=True, check=False, timeout=60)
+            if r.returncode != 0 or not r.stdout.strip():
+                warn(f"{k}: cannot read {branch} of {url}: {(r.stderr or '').strip()[-200:]}")
+                continue
+            target = r.stdout.split()[0]
+        state = subs.get(path, ("absent", ""))[0]
+        checked_out = state != "absent" and (ROOT / path / ".git").exists()
+        if checked_out:
+            if git("-C", path, "status", "--porcelain", check=False).stdout.strip():
+                warn(f"{k}: {path} has uncommitted changes: not moved")
+                continue
+            git("-C", path, "fetch", "--quiet", "origin", branch if not a.to else a.to, check=False)
+            r = git("-C", path, "rev-parse", "--verify", f"{target}^{{commit}}", check=False)
+            if r.returncode != 0:
+                warn(f"{k}: commit {target} not found in {url}")
+                continue
+            target = r.stdout.strip()
+        elif len(target) != 40:
+            die(f"--to: give the full 40-character commit for {k} (it is not checked out here)")
+        if target == pinned:
+            say(f"  {k}: up to date ({pinned[:7]})")
+            continue
+        log = ""
+        if checked_out:
+            git("-C", path, "checkout", "--quiet", "--detach", target)
+            log = git("-C", path, "log", "--oneline", "--no-decorate", f"{pinned}..{target}", check=False).stdout.strip()
+            git("add", "--", path)
+        else:
+            git("update-index", "--cacheinfo", f"160000,{target},{path}")
+        say(f"  {k}: {pinned[:7]} -> {target[:7]}" + ("" if checked_out else "  (not checked out here)"))
+        for line in log.splitlines()[:15]:
+            say(f"        {line}")
+        changed.append((k, path, pinned, target))
+    if not changed:
+        say("  Nothing to pin.")
+        return
+    paths = [p for _, p, _, _ in changed]
+    msg = "Pin " + ", ".join(f"{k} {t[:7]}" for k, _, _, t in changed)
+    if a.commit:
+        others = staged_before - set(paths)
+        if others:
+            warn(f"other changes are staged ({', '.join(sorted(others))}): not committing; commit by hand")
+            return
+        git("commit", "--quiet", "-m", msg, capture=False)
+        say(f"  committed: {msg}")
+        if a.push:
+            git("push", capture=False)
+    else:
+        say(f"\n  Staged. Record them with: git commit -m '{msg}'   (or rerun with --commit [--push])")
+    say("  Then on each machine: llmt update   (pulls, checks out the new pins, reinstalls)")
 
 
 def cmd_test(a) -> None:
@@ -1266,6 +1355,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("keys", nargs="*")
     p.add_argument("--latest", action="store_true", help="each translator's latest main, not the pinned commit")
     p.add_argument("--no-pull", action="store_true", help="do not git pull llm-translators itself")
+    p = sub.add_parser("pin", help="move the pins to each translator's latest pushed commit")
+    p.add_argument("keys", nargs="*", help="default: all")
+    p.add_argument("--to", metavar="COMMIT", help="pin one translator to this commit instead")
+    p.add_argument("--commit", action="store_true", help="commit the new pins")
+    p.add_argument("--push", action="store_true", help="with --commit: push")
     p = sub.add_parser("test", help="pytest in each translator")
     p.add_argument("keys", nargs="*")
     p.add_argument("--pytest-args", nargs=argparse.REMAINDER, default=[], help="passed to pytest")
@@ -1300,7 +1394,7 @@ def main(argv: list[str] | None = None) -> None:
         ap.print_help()
         return
     {"setup": cmd_setup, "list": cmd_list, "install": cmd_install, "remove": cmd_remove, "status": cmd_status,
-     "update": cmd_update, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "env": cmd_env, "mcp": cmd_mcp}[a.cmd](a)
+     "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "env": cmd_env, "mcp": cmd_mcp}[a.cmd](a)
 
 
 if __name__ == "__main__":

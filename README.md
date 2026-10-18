@@ -56,7 +56,8 @@ llmt list                       the translators, their backends, what is install
 llmt install KEY... [--python P] [--extra lmpt:lammps] [--no-test] [--no-uses] [--link-system-gmsh]
 llmt remove KEY...              pip uninstall (sources stay checked out)
 llmt status [KEY...] [-v] [--json]   versions, submodule commits, backends found
-llmt update [KEY...] [--latest] [--no-pull]
+llmt update [KEY...] [--latest] [--no-pull]   pull, check out the pins, reinstall
+llmt pin [KEY...] [--to C] [--commit [--push]]   move the pins to the latest pushed commits
 llmt test [KEY...]              pytest in each translator
 llmt bench KEY [NAMES...]       a translator's benchmarks
 llmt alias [--name N] [--rc F]  shell alias for the venv (default llmt-venv; replaces the old 'cad')
@@ -118,12 +119,9 @@ It also comments out old aliases that activate a translator's own venv, such as 
 
 The umbrella pins one commit of each translator, so a given umbrella commit is a combination that was installed and tested together. The submodules track `main` (`branch = main` in `.gitmodules`), and their URLs are relative (`../fea-translator.git`): cloning the umbrella over ssh fetches them over ssh, and cloning over https fetches them over https.
 
-- `llmt update`: runs `git pull` on the umbrella, checks out the pinned commits, then reinstalls.
-- `llmt update --latest`: checks out the latest `main` of each translator. After testing (`llmt test`, `llmt bench`), record the new combination:
-
-  ```bash
-  git add build123d-translator fea-translator ... && git commit -m "Update pins"
-  ```
+- **Moving the pins** (after pushing new commits to a translator's repository): `llmt pin feat cfdt --commit --push`. It reads each translator's latest pushed `main`, moves the pin, lists the new commits (when the submodule is checked out here) and commits `Pin feat 02d34a8, cfdt c2f5668`. It works whether or not the submodules are checked out on this machine. Without `--commit`, the new pins are only staged. With no keys, every translator is checked. `--to COMMIT` pins one translator to a specific commit.
+- **On each machine afterwards:** `llmt update`. It runs `git pull` on the umbrella, checks out the new pins of the translators installed there, and reinstalls them. Then restart the Claude app (or reconnect the servers): an MCP server loads the code when it starts. For a remote translator, this means on the machine that runs it, e.g. `llmt update` on carbonio, then reconnecting on the Mac.
+- `llmt update --latest`: tries each translator's latest `main` on one machine without moving the pins. After testing (`llmt test`, `llmt bench`), record it with `llmt pin KEY --commit`.
 - Submodules with uncommitted changes are left as they are. To work on a translator inside the umbrella, run `git checkout main` in its folder (submodules are checked out on a detached HEAD). It installs in editable mode, so your changes take effect at once.
 - `llmt status` shows each submodule as `pinned`, `moved` (checked out at a commit other than the pin) or `absent`.
 
