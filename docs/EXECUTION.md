@@ -1,6 +1,6 @@
 # Running studies through SLURM: the contract for the translators
 
-Status: specification, 2026-10-18. llm-translators configures it (`llmt setup`, `llmt tune`, `config/env`) and shows it (`llmt status`, `llmt jobs`); each translator implements it. It applies to cfd-translator (cfdt), lammps-translator (lmpt) and fea-translator (feat). build123d-translator builds in milliseconds and does not need it.
+Status: specification, 2026-10-18 (run record added the same day). llm-translators configures it (`llmt setup`, `llmt tune`, `config/env`) and shows it (`llmt status`, `llmt jobs`); each translator implements it. It applies to cfd-translator (cfdt), lammps-translator (lmpt) and fea-translator (feat). build123d-translator builds in milliseconds and does not need it.
 
 ## Why
 
@@ -62,8 +62,32 @@ If `sbatch` fails (not installed, controller down), the study's result is `{"ok"
 - **What it does.** It reads `request.json` and the study's `studies[name]`, then runs `run_study` exactly as a pool worker does today: meshing, case, solve, results, pictures.
 - **Ranks and threads.** It takes them from `SLURM_NTASKS` (MPI) or `SLURM_CPUS_PER_TASK` (threads; set `OMP_NUM_THREADS` from it), and falls back to `P_PROCS` when run by hand.
 - **MPI.** It runs inside the allocation (`mpirun -np $SLURM_NTASKS`, or `P_MPIRUN`). On a single node, OpenMPI's mpirun uses the allocation as it is.
+- **Whole cores.** MPI jobs ask for `--ntasks-per-core=1`. OpenMPI 5 places ranks by core and refuses more ranks than physical cores in the job's CPU set ("allocation-overload"). On a node with two hardware threads per core, `--ntasks=N` alone can give fewer than N cores. Found on mochi with cfdt.
 - **The result file.** It writes `<name>.json` atomically (a temporary file, then rename), so `study_status` never reads half a file.
 - **Exit code.** It exits 0 when it wrote a result, even if the study failed, because the result says why. It exits non-zero only on a crash; then `job.log` has the traceback.
+
+## The run record (in every study result)
+
+Every study result, local or SLURM, carries `execution` with the same keys in every translator. It says where the study ran and on what, so a model or `llmt` can read it without knowing the translator:
+
+```json
+"execution": {"executor": "slurm", "slurm_job": "5516", "procs_requested": 9, "procs_used": 4,
+              "mpi": {"launch": "mpirun -np 4", "binding": "default", "cores": 9, "hwthreads": 18}}
+```
+
+| key | meaning |
+|---|---|
+| `executor` | `slurm` (a job), `local` (the server's worker pool), or `by hand` (`<cli> run-study` outside SLURM) |
+| `slurm_job` | the job id, or null |
+| `procs_requested` | ranks (or threads) asked for: `SLURM_NTASKS` / `SLURM_CPUS_PER_TASK`, the study's `procs`, or `P_PROCS` |
+| `procs_used` | what actually ran. It can be fewer: cfdt caps ranks at cells / `CFDT_CELLS_PER_RANK`. A difference also goes in `warnings`. |
+| `mpi.launch` | the launcher command as run (e.g. `mpirun --map-by hwthread -np 9`); `mpi` is null for a serial run |
+| `mpi.binding` | `default` (mpirun's own placement), or what the translator asked for (`core`, `hwthread`, `none`) |
+| `mpi.cores`, `mpi.hwthreads` | physical cores and hardware threads in the CPU set the study ran in (a job's allocation, or the machine) |
+
+Results that end without running, such as `could not submit` and the finished states below, carry what is known: `{"executor": "slurm", "slurm_job": ...}`.
+
+Threaded translators (feat) put threads in `procs_requested`/`procs_used` and leave `mpi` null.
 
 ## States
 
