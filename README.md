@@ -69,6 +69,8 @@ llmt mcp setup                  local / remote / existing / none per translator
 llmt mcp config                 write the entries into the Claude desktop config (backup kept)
 llmt mcp config --print         the mcpServers JSON, for any MCP client
 llmt mcp config --claude-code   'claude mcp add-json' commands for Claude Code
+llmt mcp test [KEY...]          start each server as the Claude app does (bare environment), handshake, list tools;
+                                on failure, the server's error output
 llmt mcp serve [KEY...] [--host H]   streamable HTTP, each on its own port (b3dt 8766, feat 8767, cfdt 8768, lmpt 8769)
 ```
 

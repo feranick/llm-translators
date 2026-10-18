@@ -15,6 +15,7 @@
     llmt env [--edit]               the per-machine settings file (config/env)
     llmt mcp setup                  choose local / remote (ssh) / existing install / none per translator
     llmt mcp config [--print | --claude-code | --file F]   write or print the MCP client entries
+    llmt mcp test [KEY...]          start each server as the Claude app does; handshake, list tools
     llmt mcp serve [KEY...] [--host H]   serve MCP over streamable HTTP on each translator's port
 
 Backends (OpenFOAM, CalculiX, LAMMPS, Gmsh) are never installed by this tool: it reports what
@@ -36,6 +37,8 @@ import textwrap
 import signal
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 __version__ = "2026.10.18.1"
@@ -982,6 +985,8 @@ def mcp_setup_interactive(setup: dict, hint: dict | None = None) -> None:
         write_desktop_config(entries, path, [k for k, s in mcp.items() if s.get("where") == "none"])
     else:
         say("  Later: llmt mcp config   (or --print, --claude-code)")
+    if yes("Test each server now, the way the Claude app starts it?", True):
+        mcp_test(list(entries), setup, 180)
     ext = [k for k, s in mcp.items() if s.get("where") == "existing"]
     if ext:
         say(f"\n  {', '.join(ext)}: using installs outside llm-translators. To move them over later, set up")
@@ -1018,6 +1023,122 @@ def write_desktop_config(entries: dict, path: Path, drop: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cfg, indent=2) + "\n")
     say(f"  wrote {path}. Restart the Claude app to load the servers.")
+
+
+def mcp_test_one(key: str, entry: dict, timeout: float = 180) -> bool:
+    """Starts the server the way the Claude app does (its command and args, a bare environment: the app
+    does not read your shell's startup files), does the MCP handshake and lists the tools."""
+    env = {k: os.environ[k] for k in ("HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "SSH_AUTH_SOCK") if k in os.environ}
+    env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+    env.update(entry.get("env") or {})
+    cmd = [entry["command"], *[str(x) for x in entry.get("args", [])]]
+    say(f"\n  {key}: {entry_text(entry)}")
+    t0 = time.monotonic()
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    except OSError as exc:
+        say(f"    FAILED to start: {exc}")
+        return False
+    err: list[str] = []
+    out: list[bytes] = []
+    got = threading.Event()
+
+    def pump_err():
+        for line in p.stderr:
+            err.append(line.decode(errors="replace").rstrip())
+
+    def pump_out():
+        for line in p.stdout:
+            out.append(line)
+            got.set()
+        got.set()
+    threading.Thread(target=pump_err, daemon=True).start()
+    threading.Thread(target=pump_out, daemon=True).start()
+
+    def send(obj):
+        p.stdin.write((json.dumps(obj) + "\n").encode())
+        p.stdin.flush()
+
+    def wait_for(id_, until):
+        while time.monotonic() < until:
+            while out:
+                raw = out.pop(0)
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    return {"_bad": raw.decode(errors="replace").strip()[:200]}
+                if msg.get("id") == id_:
+                    return msg
+            if p.poll() is not None and not out:
+                return None
+            got.wait(0.2)
+            got.clear()
+        return {"_timeout": True}
+
+    ok = False
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                         "clientInfo": {"name": "llmt", "version": __version__}}})
+        r = wait_for(1, t0 + timeout)
+        if r and "result" in r:
+            t_init = time.monotonic() - t0
+            info = r["result"].get("serverInfo", {})
+            send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            r2 = wait_for(2, time.monotonic() + 60)
+            tools = (r2 or {}).get("result", {}).get("tools", [])
+            ok = bool(tools)
+            say(f"    {'ok' if ok else 'NO TOOLS'}: {info.get('name', '?')} {info.get('version', '')}, "
+                f"{len(tools)} tools, started in {t_init:.1f} s")
+            if t_init > 30:
+                say("    slow start: the Claude app may give up waiting; start it once by hand to compile the caches")
+        elif r and "_bad" in r:
+            say(f"    FAILED: the server printed something that is not MCP on stdout: {r['_bad']}")
+        elif r and "_timeout" in r:
+            say(f"    FAILED: no answer within {timeout:.0f} s")
+        else:
+            say(f"    FAILED: the server exited (code {p.poll()}) before answering")
+    except BrokenPipeError:
+        say(f"    FAILED: the server exited (code {p.poll()}) before reading its input")
+    finally:
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        time.sleep(0.2)
+    if not ok and err:
+        say("    its stderr (last lines):")
+        for line in err[-25:]:
+            say(f"      {line}")
+    return ok
+
+
+def mcp_test(keys: list[str] | None, setup: dict, timeout: float) -> bool:
+    entries = mcp_entries(setup)
+    desk = desktop_servers()
+    keys = keys or [k for k in KEYS if k in entries or k in desk]
+    if not keys:
+        die("no MCP entries to test (llmt mcp setup)")
+    results = {}
+    for k in keys:
+        e = entries.get(k) or desk.get(k)
+        if not e:
+            say(f"\n  {k}: no entry (llmt mcp setup)")
+            results[k] = False
+            continue
+        if desk.get(k) and entries.get(k) and desk[k] != entries[k]:
+            say(f"\n  {k}: the Claude config differs from llmt's choice (llmt mcp config to write it); testing the Claude config")
+            e = desk[k]
+        results[k] = mcp_test_one(k, e, timeout)
+    say("\n  " + "  ".join(f"{k}: {'ok' if v else 'FAILED'}" for k, v in results.items()))
+    if not all(results.values()):
+        say(f"  The Claude app's own log: {Path.home() / 'Library/Logs/Claude'}/mcp-server-KEY.log (macOS)")
+    return all(results.values())
 
 
 def mcp_serve(keys: list[str], host: str) -> None:
@@ -1465,6 +1586,8 @@ def cmd_mcp(a) -> None:
         else:
             path = Path(a.file).expanduser() if a.file else claude_desktop_config()
             write_desktop_config(entries, path, [k for k, s in setup.get("mcp", {}).items() if s.get("where") == "none"])
+    elif a.mcp_cmd == "test":
+        sys.exit(0 if mcp_test(parse_keys(a.keys) if a.keys else None, setup, a.timeout) else 1)
     elif a.mcp_cmd == "serve":
         keys = parse_keys(a.keys) if a.keys else [k for k in setup.get("installed", []) if k in installed_in_venv()]
         if not keys:
@@ -1530,6 +1653,9 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--print", action="store_true", help="print the mcpServers JSON")
     g.add_argument("--claude-code", action="store_true", help="print 'claude mcp add-json' commands")
     g.add_argument("--file", help="merge into this JSON file instead of the Claude desktop config")
+    q = msub.add_parser("test", help="start each server as the Claude app does, handshake, list tools")
+    q.add_argument("keys", nargs="*")
+    q.add_argument("--timeout", type=float, default=180, help="seconds to wait for each server (default 180)")
     q = msub.add_parser("serve", help="streamable HTTP servers on each translator's port")
     q.add_argument("keys", nargs="*")
     q.add_argument("--host", default="127.0.0.1")
