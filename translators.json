@@ -49,7 +49,7 @@
     "FEAT_EXECUTOR": "local | slurm: long studies as SLURM jobs (docs/EXECUTION.md)",
     "FEAT_SLURM_MIN_MINUTES": "studies estimated shorter than this run locally",
     "FEAT_SLURM_ARGS": "extra sbatch arguments, e.g. --nice=100 (a --mem here replaces FEAT_SLURM_MEM)",
-    "FEAT_SLURM_MEM": "job memory: auto (default: from the mesh size when known, else 8G) | a size, e.g. 16G | none (SLURM's default)"
+    "FEAT_SLURM_MEM": "job memory: auto (default: from the estimated mesh size and solver, else 8G) | a size, e.g. 16G | none (SLURM's default)"
    }
   },
   "cfdt": {
