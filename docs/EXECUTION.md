@@ -156,7 +156,7 @@ Threaded translators (feat) put threads in `procs_requested`/`procs_used` and le
 - **Keys.** `timeout_s` sets `P_TIMEOUT` for this study, and so the job's `--time` (+10 min). `mem` is the job's `--mem`; it replaces any `--mem`/`--mem-per-cpu` in `P_SLURM_ARGS`, and other sbatch arguments are kept. `procs` is the ranks (or threads); the size cap of "Sizing jobs" still applies. `queue` is as before. No free-form sbatch arguments come from a study.
 - **Caps.** `P_MAX_TIMEOUT` (s), `P_MAX_MEM` and `P_MAX_PROCS` in `config/env` bound what a study may ask. Validation refuses more, naming the variable. Unset means no cap. `tool_status().executor` reports `caps` and the defaults, so a model can see the limits before it writes a study.
 - **Record.** `execution.limits = {timeout_s, mem, from_study: [keys the study set]}` in every result. `job.json` keeps the study's `run`.
-- **Status.** Implemented in cfdt 2026.10.20.1. Same keys and variables for lmpt and feat (feat: `procs` is threads, `--cpus-per-task`).
+- **Status.** Implemented in cfdt 2026.10.20.1 and lmpt 2026.10.20.1 (top-level `procs` / `queue` for lmpt's `solve.procs`; ranks capped at atoms / `LMPT_ATOMS_PER_RANK`, 2000). Same keys and variables for feat (feat: `procs` is threads, `--cpus-per-task`).
 
 ## Sizing jobs and timing (found with cfdt on mochi, 2026-10-19)
 
