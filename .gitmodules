@@ -14,3 +14,7 @@
 	path = lammps-translator
 	url = ../lammps-translator.git
 	branch = main
+[submodule "openmodelica-translator"]
+	path = openmodelica-translator
+	url = ../openmodelica-translator.git
+	branch = main

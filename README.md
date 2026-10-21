@@ -8,6 +8,7 @@ One place to install and run the translators that connect LLMs to engineering an
 | `feat` | [fea-translator](https://github.com/feranick/fea-translator) | FEA: linear static, modal, linear buckling, steady heat transfer (with thermal stress), DC electric conduction, electrostatics, Joule heating | Gmsh, CalculiX |
 | `cfdt` | [cfd-translator](https://github.com/feranick/cfd-translator) | CFD: steady flow, laminar or k-ω SST, internal or external, 2D or 3D. Incompressible, or with `energy`: compressible air from low speed to transonic, heated or cooled walls, buoyancy. Rotating zones (pumps, fans) | Gmsh, OpenFOAM |
 | `lmpt` | [lammps-translator](https://github.com/feranick/lammps-translator) | Atomistic: crystals and molecular liquids. Minimization, NVE/NVT/NPT MD, elastic constants, EOS, vacancies, surfaces, thermal expansion. Results include an FEA material for feat | LAMMPS |
+| `omct` | [openmodelica-translator](https://github.com/feranick/openmodelica-translator) | System dynamics on the Modelica Standard Library: circuits, translational and rotational mechanics, DC motors, heat paths, controllers (PI/PID/LimPID). Transient, steady, linearisation (modes, Bode), sweeps on one compiled model; energy balance and an independent reference on every run; takes feat's stiffness, mass and conductance and b3dt's masses | OpenModelica + MSL 4.0.0 |
 
 Each translator's README has the details. This table describes the commits pinned here (`llmt status` shows them).
 
@@ -133,7 +134,7 @@ It also comments out old aliases that activate a translator's own venv, such as 
 
 ## Long runs: SLURM
 
-On a workstation with SLURM (single node is enough), long studies can run as SLURM jobs instead of inside the MCP server, with `CFDT_EXECUTOR=slurm` (and `LMPT_`, `FEAT_`) in `config/env`. `llmt setup` and `llmt tune` offer it when they find `sbatch`.
+On a workstation with SLURM (single node is enough), long studies can run as SLURM jobs instead of inside the MCP server, with `CFDT_EXECUTOR=slurm` (and `LMPT_`, `FEAT_`, `OMCT_`) in `config/env`. `llmt setup` and `llmt tune` offer it when they find `sbatch`.
 
 - **One queue for every chat.** Several projects running cfdt at once no longer overload the machine: their studies wait in SLURM's queue.
 - **Runs outlive the conversation.** A job keeps running when the chat closes or ssh drops.

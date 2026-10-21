@@ -10,8 +10,9 @@ The translators call outside programs to mesh and solve. `llmt` never installs t
 | [CalculiX](#calculix) | feat | reference solver: static, modal, thermal on small meshes; no buckling | `FEAT_CCX` |
 | [OpenFOAM](#openfoam) | cfdt | meshing, case writing, 2D reference solver | `CFDT_FOAM` |
 | [LAMMPS](#lammps) | lmpt | inputs only, nothing runs | `LMPT_LMP`, `LMPT_POTENTIALS` |
+| [OpenModelica + MSL 4.0.0](#openmodelica) | omct | the reference solver runs linear networks; nothing builds | `OMCT_OMC`, `OMCT_MSL_VERSION` |
 | [MPI](#mpi) | cfdt, lmpt (`procs` > 1) | one rank per study | `LMPT_MPIRUN` |
-| [SLURM](#slurm) (optional) | cfdt, lmpt, feat | each MCP server runs its studies itself, with no queue shared between chats | `CFDT_EXECUTOR`, `LMPT_EXECUTOR`, `FEAT_EXECUTOR` |
+| [SLURM](#slurm) (optional) | cfdt, lmpt, feat, omct | each MCP server runs its studies itself, with no queue shared between chats | `CFDT_EXECUTOR`, `LMPT_EXECUTOR`, `FEAT_EXECUTOR`, `OMCT_EXECUTOR` |
 
 build123d-translator needs nothing beyond pip (build123d and its OpenCascade wheels). Those wheels exist for the common platforms and recent Python versions; if `pip` cannot find one for yours, use another Python for the venv (`llmt install --python /path/to/python3.x`, on a fresh venv).
 
@@ -74,6 +75,33 @@ How it is found: `LMPT_LMP` (a command, e.g. `/usr/bin/lmp` or `lmp_mpi`; `~` al
 Potential files are looked up in `LMPT_POTENTIALS` (`:`-separated), `LAMMPS_POTENTIALS`, `/usr/share/lammps/potentials`, `/usr/local/share/lammps/potentials`, the `lammps` Python package's `share/lammps/potentials`, and `../share/lammps/potentials` next to the executable.
 
 Check: `bin/run lmpt status` (version, packages, potential folders), then `llmt bench lmpt`.
+
+## OpenModelica
+
+openmodelica-translator runs `omc` (OpenModelica 1.27.1 on mochi) with the Modelica Standard Library 4.0.0. omc compiles each model to C with gcc or clang, so a C compiler must be installed too; it works headless (over ssh).
+
+- **Ubuntu/Debian (x86-64):** OpenModelica's own apt repository (mochi has exactly this, `/etc/apt/sources.list.d/openmodelica.list`):
+
+  ```bash
+  sudo apt install -y ca-certificates curl gnupg build-essential
+  curl -fsSL http://build.openmodelica.org/apt/openmodelica.asc | sudo gpg --dearmor -o /usr/share/keyrings/openmodelica-keyring.gpg
+  echo "deb [arch=amd64 signed-by=/usr/share/keyrings/openmodelica-keyring.gpg] https://build.openmodelica.org/apt $(lsb_release -cs) stable" \
+    | sudo tee /etc/apt/sources.list.d/openmodelica.list
+  sudo apt update && sudo apt install -y --no-install-recommends omc
+  ```
+
+- **The library:** with OpenModelica's package manager, as the user who runs the translator (it installs into `~/.openmodelica/libraries`):
+
+  ```bash
+  printf 'updatePackageIndex(); getErrorString();\ninstallPackage(Modelica, "4.0.0+maint.om", exactMatch=true); getErrorString();\n' > /tmp/msl.mos
+  omc /tmp/msl.mos           # true, then the library is in ~/.openmodelica/libraries/Modelica 4.0.0+maint.om
+  ```
+
+- **macOS:** OpenModelica does not ship current macOS packages; run the translator on a Linux machine (`suggest: remote`), or OpenModelica in a Linux container.
+
+How it is found: `OMCT_OMC` (the omc executable), else `omc` on the PATH. The library version is `OMCT_MSL_VERSION` (4.0.0), loaded with `loadModel(Modelica, {"4.0.0"})`.
+
+Check: `bin/run omct status` (omc version, the MSL path, the C compiler, the build cache), then `llmt bench omct` (11 closed-form benchmarks, a minute). `bin/run omct bench chain_feat_modal chain_b3dt_mass` checks the chains with feat and b3dt.
 
 ## MPI
 

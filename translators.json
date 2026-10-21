@@ -133,6 +133,55 @@
   "LMPT_MAX_MEM": "ceiling for a study's run.mem (e.g. 32G; unset: none)",
   "LMPT_MAX_PROCS": "ceiling for a study's run.procs / procs (unset: none)"
    }
+  },
+  "omct": {
+   "repo": "openmodelica-translator",
+   "package": "openmodelica_translator",
+   "summary": "System dynamics: circuits, mechanics, DC motors, heat paths, controllers on MSL 4.0.0; transient, steady, linearisation (modes, Bode), sweeps on one build (OpenModelica)",
+   "cost": "light (seconds per study; sweeps minutes): runs where OpenModelica is installed",
+   "suggest": "remote",
+   "cli": "omct",
+   "port": 8770,
+   "extras": ["mcp"],
+   "test_extra": "test",
+   "optional_extras": {},
+   "uses": {
+    "feat": "stiffness, mass, modal frequency, conductance as lumped values; chain benchmark",
+    "b3dt": "masses from goals' volumes; chain benchmark"
+   },
+   "status": true,
+   "bench": true,
+   "executor": {"prefix": "OMCT", "kind": "threads", "min_minutes": 1},
+   "tuning": {"procs": "OMCT_PROCS", "workers": "OMCT_WORKERS", "workers_default": 2, "set": {},
+              "why": ""},
+   "backends": [
+    {"key": "omc", "name": "OpenModelica (omc)", "doc": "openmodelica",
+     "without": "the reference solver runs linear networks (no build, no OpenModelica checks)"},
+    {"key": "msl", "name": "Modelica Standard Library 4.0.0", "doc": "openmodelica",
+     "without": "nothing builds (omc cannot load MSL 4.0.0)"}
+   ],
+   "env": {
+    "OMCT_OMC": "the omc executable (default: omc on the PATH)",
+    "OMCT_MSL_VERSION": "Modelica Standard Library version to load (default 4.0.0)",
+    "OMCT_OUT": "output folder (default ~/omct_runs)",
+    "OMCT_CACHE": "build cache of compiled models (default $OMCT_OUT/.cache)",
+    "OMCT_SOLVER": "auto | omc | ref (auto: omc when found; ref: the reference solver, linear networks only)",
+    "OMCT_WORKERS": "worker processes (default 2)",
+    "OMCT_TIMEOUT": "seconds per study (default 600)",
+    "OMCT_PROCS": "sweep points at once per study (default 1; a study's run.procs overrides it)",
+    "OMCT_COMPILE_PROCS": "parallel C compile of a build, omc -n (default 4)",
+    "OMCT_OMP_THREADS": "threads inside one simulation (default 1: more only slow it down, measured on mochi)",
+    "OMCT_EXECUTOR": "local | slurm: long studies (big sweeps) as SLURM jobs (docs/EXECUTION.md)",
+    "OMCT_SLURM_MIN_MINUTES": "studies estimated shorter than this run locally (default 1)",
+    "OMCT_SLURM_ARGS": "extra sbatch arguments, e.g. --nice=100 (a --mem here replaces OMCT_SLURM_MEM)",
+    "OMCT_SLURM_MEM": "job memory: auto (default: 1 GB + 256 MB per CPU) | a size, e.g. 4G | none (SLURM's default)",
+    "OMCT_SLURM_TIME": "job time limit: timeout (default: OMCT_TIMEOUT + 10 min) | estimate (from the study's estimate, for backfill)",
+    "OMCT_SLURM_TIME_FACTOR": "with OMCT_SLURM_TIME=estimate: limit = factor x estimate + 10 min (default 3)",
+    "OMCT_SLURM_TIME_MIN": "with OMCT_SLURM_TIME=estimate: shortest limit, minutes (default 20)",
+    "OMCT_MAX_TIMEOUT": "ceiling for a study's run.timeout_s (seconds; unset: none)",
+    "OMCT_MAX_MEM": "ceiling for a study's run.mem (e.g. 16G; unset: none)",
+    "OMCT_MAX_PROCS": "ceiling for a study's run.procs (unset: none)"
+   }
   }
  }
 }
