@@ -97,6 +97,16 @@ openmodelica-translator runs `omc` (OpenModelica 1.27.1 on mochi) with the Model
   omc /tmp/msl.mos           # true, then the library is in ~/.openmodelica/libraries/Modelica 4.0.0+maint.om
   ```
 
+- **Don't rely on the `omlibrary` package's cache.** The `omlibrary` apt package ships the libraries as a cache of zip files, which omc unpacks into `~/.openmodelica/libraries` the first time a library is loaded. On a DGX Spark (arm64, 2026-10-21), the cache's `index.json` listed archives the package didn't contain. `llmt status` then showed `Modelica Standard Library 4.0.0: MISSING` with "Failed to open file: ~/.openmodelica/cache/<hash>.zip". Use the package manager as above instead, after moving the broken state aside (`mv ~/.openmodelica ~/.openmodelica.bak`). Without internet access, copy `~/.openmodelica/libraries/` (with its `index.json`) from a machine where it works.
+- **A shared install (docs/SHARED.md).** Every user's servers need the library, so install it once where all can read it, not in the admin's home. Run the package manager as the admin, copy the result to a shared folder, and point omc there in the machine's settings:
+
+  ```bash
+  sudo mkdir -p /opt/openmodelica && sudo cp -r ~/.openmodelica/libraries /opt/openmodelica/
+  sudo chmod -R a+rX /opt/openmodelica
+  sudo ./llmt env --system --edit       # add: OPENMODELICALIBRARY=/opt/openmodelica/libraries
+  ```
+
+  Then check it as a normal user: `/opt/llm-translators/current/llmt status omct` should show the library as ok. omc reads `OPENMODELICALIBRARY` as its library path. If omct's check still looks in the user's home, report it in the omct chat, so the translator passes the path on to omc explicitly.
 - **macOS:** OpenModelica does not ship current macOS packages; run the translator on a Linux machine (`suggest: remote`), or OpenModelica in a Linux container.
 
 How it is found: `OMCT_OMC` (the omc executable), else `omc` on the PATH. The library version is `OMCT_MSL_VERSION` (4.0.0), loaded with `loadModel(Modelica, {"4.0.0"})`.

@@ -1,14 +1,12 @@
 #!/bin/sh
-# Runs a command with the llm-translators venv first on PATH and config/env loaded.
+# Runs a command with the llm-translators venv first on PATH and the settings loaded (bin/llmt-env.sh:
+# the machine's /etc/llm-translators/env, then the user's file).
 #   bin/run feat status
 #   bin/run python -m pytest -q
 # Prints nothing of its own, so it is safe in front of an MCP server on stdio.
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-if [ -f "$ROOT/config/env" ]; then
-    set -a
-    . "$ROOT/config/env"
-    set +a
-fi
+_llmt_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+ROOT=$_llmt_root
+. "$ROOT/bin/llmt-env.sh"
 if [ ! -x "$ROOT/.venv/bin/python" ]; then
     echo "llm-translators: no venv at $ROOT/.venv (run $ROOT/llmt setup)" >&2
     exit 127

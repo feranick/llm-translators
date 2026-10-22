@@ -14,7 +14,11 @@
     llmt alias [--name N] [--rc F]  shell alias that activates the venv (default llmt-venv; old ones commented out)
     llmt tune [KEY...] [--print | --apply]   SLURM use, MPI ranks and timeouts for this machine, from its cores
     llmt jobs [KEY...]              the translators' SLURM jobs on this machine (queued, running)
-    llmt env [--edit]               the per-machine settings file (config/env)
+    llmt env [--edit] [--system]    the settings file (config/env; yours in a shared release; --system: the machine's)
+
+Shared install for all users (docs/SHARED.md), admin commands run from a checkout:
+    llmt deploy [KEY...] [--test] [--bench] [--prefix P]   build a release in /opt/llm-translators and switch to it
+    llmt releases | rollback [RELEASE] | gc [--keep N]     list, switch back, remove unused old releases
     llmt mcp setup                  choose local / remote (ssh) / existing install / none per translator
     llmt mcp config [--print | --claude-code | --file F]   write or print the MCP client entries
     llmt mcp test [KEY...]          start each server as the Claude app does; handshake, list tools
@@ -43,14 +47,45 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.10.18.2"
+__version__ = "2026.10.22.1"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
 VPY = VENV / "bin" / "python"
-CONFIG_DIR = ROOT / "config"
+# A shared release (docs/SHARED.md) has RELEASE.json next to llmt: <prefix>/releases/<name>/. Anything else is a
+# personal checkout, with its state in config/ inside it.
+RELEASE_FILE = ROOT / "RELEASE.json"
+SHARED = RELEASE_FILE.exists()
+PREFIX = ROOT.parent.parent if SHARED else None
+DEFAULT_PREFIX = Path(os.environ.get("LLMT_PREFIX", "/opt/llm-translators"))
+SYSTEM_ENV = Path(os.environ.get("LLMT_SYSTEM_ENV", "/etc/llm-translators/env"))
+USER_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "llm-translators"
+CONFIG_DIR = USER_DIR if SHARED else ROOT / "config"
 SETUP_FILE = CONFIG_DIR / "setup.json"
 ENV_FILE = CONFIG_DIR / "env"
+
+
+def _entry_root() -> Path:
+    """The folder MCP entries and the alias point to: <prefix>/current when it is this release (so they follow
+    the admin's updates), else this folder."""
+    if SHARED:
+        cur = PREFIX / "current"
+        try:
+            if cur.resolve() == ROOT:
+                return cur
+        except OSError:
+            pass
+    return ROOT
+
+
+ENTRY_ROOT = _entry_root()
+
+
+def release_info(path: Path | None = None) -> dict:
+    try:
+        return json.loads(((path or ROOT) / "RELEASE.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
 REGISTRY = json.loads((ROOT / "translators.json").read_text())["translators"]
 KEYS = list(REGISTRY)
 BACKENDS_MD = "BACKENDS.md"
@@ -112,16 +147,19 @@ def yes(prompt: str, default: bool = True) -> bool:
 
 
 def load_setup() -> dict:
+    s = {"installed": [], "extras": {}, "test": True, "mcp": {}}
     if SETUP_FILE.exists():
         try:
-            return json.loads(SETUP_FILE.read_text())
+            s = json.loads(SETUP_FILE.read_text())
         except json.JSONDecodeError:
             warn(f"{SETUP_FILE} is not valid JSON: starting from defaults")
-    return {"installed": [], "extras": {}, "test": True, "mcp": {}}
+    if SHARED:  # what is installed is the release's business
+        s["installed"] = [k for k in KEYS if k in release_info().get("keys", [])]
+    return s
 
 
 def save_setup(s: dict) -> None:
-    CONFIG_DIR.mkdir(exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     s["llmt"] = __version__
     s["updated"] = _dt.datetime.now().isoformat(timespec="seconds")
     SETUP_FILE.write_text(json.dumps(s, indent=1) + "\n")
@@ -193,7 +231,11 @@ def installed_in_venv() -> dict[str, str]:
 
 
 def submodule_states() -> dict[str, tuple[str, str]]:
-    """repo path -> (state, commit); state: pinned | moved | absent | conflict."""
+    """repo path -> (state, commit); state: pinned | moved | absent | conflict (a release: release | absent)."""
+    if SHARED:
+        info = release_info()
+        return {t["repo"]: (("release", info.get("commits", {}).get(t["repo"], "")[:7]) if k in info.get("keys", [])
+                            else ("absent", "")) for k, t in REGISTRY.items()}
     r = git("submodule", "status", check=False)
     out = {}
     for line in r.stdout.splitlines():
@@ -231,10 +273,15 @@ def with_uses(keys: list[str], interactive: bool, assume_yes: bool) -> list[str]
 
 # ---------------------------------------------------------------- the env file
 
-def env_read() -> dict[str, str]:
+def env_read(path: Path | None = None) -> dict[str, str]:
+    path = path or ENV_FILE
     vals = {}
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
+    try:
+        text = path.read_text() if path.exists() else ""
+    except OSError:
+        text = ""
+    if text:
+        for line in text.splitlines():
             m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
             if m:
                 v = m.group(2).strip()
@@ -246,11 +293,29 @@ def env_read() -> dict[str, str]:
     return vals
 
 
+def env_effective() -> dict[str, str]:
+    """The settings as bin/run loads them: the machine's file, then the user's, then (a release) the machine's caps."""
+    sysv = env_read(SYSTEM_ENV) if SYSTEM_ENV != ENV_FILE else {}
+    v = {**sysv, **env_read(ENV_FILE)}
+    if SHARED:
+        v.update({k: x for k, x in sysv.items() if "_MAX_" in k})
+    return v
+
+
 def env_template() -> str:
-    lines = [
-        "# llm-translators: settings for this machine (sourced by bin/run, bin/mcp and bin/activate).",
-        "# Shell syntax, KEY=value. Not tracked by git. The MCP servers do not read ~/.bashrc",
-        "# (ssh runs them in a non-interactive shell), so put backend paths here.",
+    if ENV_FILE == SYSTEM_ENV:
+        head = ["# llm-translators: settings for this machine, for every user and every install on it (docs/SHARED.md).",
+                "# Sourced first by bin/run, bin/mcp and bin/activate; a user's own file comes after it, but the",
+                "# caps (*_MAX_*) here always win for a shared release. Only the admin may write this file."]
+    elif SHARED:
+        head = ["# llm-translators: your own settings, sourced after the machine's " + str(SYSTEM_ENV) + ".",
+                "# Shell syntax, KEY=value. The machine's caps (*_MAX_*) always win (docs/SHARED.md)."]
+    else:
+        head = ["# llm-translators: settings for this machine (sourced by bin/run, bin/mcp and bin/activate).",
+                "# Shell syntax, KEY=value. Not tracked by git. The MCP servers do not read ~/.bashrc",
+                "# (ssh runs them in a non-interactive shell), so put backend paths here.",
+                f"# A machine-wide {SYSTEM_ENV}, if there is one, is loaded before this file."]
+    lines = head + [
         "",
         "# Extra folders for executables, e.g. Homebrew on macOS:",
         "# PATH=/opt/homebrew/bin:$PATH",
@@ -268,7 +333,7 @@ def env_template() -> str:
 
 def env_set(updates: dict[str, str]) -> None:
     """Sets (or comments out, for '') variables in config/env, keeping the rest of the file."""
-    CONFIG_DIR.mkdir(exist_ok=True)
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
     text = ENV_FILE.read_text() if ENV_FILE.exists() else env_template()
     lines = text.splitlines()
     for var, val in updates.items():
@@ -295,7 +360,7 @@ def env_set(updates: dict[str, str]) -> None:
 
 def ensure_env_file() -> None:
     if not ENV_FILE.exists():
-        CONFIG_DIR.mkdir(exist_ok=True)
+        ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
         ENV_FILE.write_text(env_template() + "\n")
 
 
@@ -574,7 +639,7 @@ def tune_suggestions(keys: list[str]) -> tuple[dict, list[str]]:
             lines.append(f"SLURM: {si.get('cpus', '?')} CPUs on {si.get('nodes', '?')}: long studies go to its queue")
     cpu = cpu_info()
     lines.append(f"CPU: {cpu['physical']} physical cores, {cpu['logical']} logical")
-    s2, notes = suggest_tuning([k for k in keys if REGISTRY[k].get("tuning")], {**env_read(), **sug})
+    s2, notes = suggest_tuning([k for k in keys if REGISTRY[k].get("tuning")], {**env_effective(), **sug})
     sug.update(s2)
     lines += [f"  {n}" for n in notes]
     return sug, lines
@@ -694,11 +759,11 @@ def default_rc() -> Path:
 
 def alias_line(name: str) -> str:
     try:
-        p = "~/" + str(ROOT.relative_to(Path.home()))
+        p = "~/" + str(ENTRY_ROOT.relative_to(Path.home()))
     except ValueError:
-        p = str(ROOT)
+        p = str(ENTRY_ROOT)
     if re.search(r"[^\w@%+=:,./~-]", p):
-        return f"alias {name}='source \"{ROOT}/bin/activate\"'"
+        return f"alias {name}='source \"{ENTRY_ROOT}/bin/activate\"'"
     return f"alias {name}='source {p}/bin/activate'"
 
 
@@ -739,7 +804,7 @@ def install_alias(name: str, rc: Path, comment_old: bool) -> None:
                 new = new[:a] + new[b + 1:]
                 while new and not new[-1].strip():
                     new.pop()
-            block = [ALIAS_BEGIN, "# the llm-translators venv and its settings (config/env)", alias_line(name), ALIAS_END]
+            block = [ALIAS_BEGIN, "# the llm-translators venv and its settings", alias_line(name), ALIAS_END]
             new += ([""] if new else []) + block
             say(f"  {f}: {alias_line(name)}")
         if new != lines:
@@ -812,7 +877,9 @@ def status_data(keys: list[str] | None = None) -> dict:
     subs = submodule_states()
     keys = keys or KEYS
     data = {"llmt": __version__, "root": str(ROOT), "venv": str(VENV) if VPY.exists() else None,
-            "python": venv_python_version(), "translators": {}}
+            "python": venv_python_version(), "translators": {},
+            "mode": "release" if SHARED else "checkout", "release": release_info() if SHARED else None,
+            "settings": [str(f) for f in ([SYSTEM_ENV] if SYSTEM_ENV.exists() else []) + [ENV_FILE] if f.exists()]}
     si = slurm_info()
     if si:
         data["slurm"] = {**si, "jobs": slurm_jobs()}
@@ -827,7 +894,7 @@ def status_data(keys: list[str] | None = None) -> dict:
             d["status"] = st
             ex = REGISTRY[k].get("executor")
             if ex:
-                want = env_read().get(f"{ex['prefix']}_EXECUTOR", "local")
+                want = env_effective().get(f"{ex['prefix']}_EXECUTOR", "local")
                 d["executor"] = {"setting": want, "supported": isinstance(st, dict) and "executor" in st,
                                  "reported": (st or {}).get("executor") if isinstance(st, dict) else None}
         data["translators"][k] = d
@@ -835,13 +902,21 @@ def status_data(keys: list[str] | None = None) -> dict:
 
 
 def print_status(data: dict, verbose: bool) -> None:
-    say(f"llm-translators {data['llmt']}  ({data['root']})")
+    if data.get("mode") == "release":
+        rel = data.get("release") or {}
+        say(f"llm-translators shared release {rel.get('release', '?')} ({data['root']}; llmt {data['llmt']}, "
+            f"built {rel.get('created', '?')} by {rel.get('built_by', '?')})")
+    else:
+        say(f"llm-translators {data['llmt']}  ({data['root']})")
+    if data.get("settings"):
+        say("settings: " + ", then ".join(data["settings"]))
     say(f"venv: {data['venv'] or 'none (llmt setup)'}" + (f"  Python {data['python']}" if data["python"] else ""))
     say("")
     say(f"  {'key':5} {'version':14} {'commit':8} {'submodule':10} backends")
     for k, d in data["translators"].items():
         if not d["version"]:
-            note = "not installed" if d["submodule"] == "absent" else "checked out, not installed"
+            note = ("not in this release" if data.get("mode") == "release" else
+                    "not installed" if d["submodule"] == "absent" else "checked out, not installed")
             say(f"  {k:5} {'-':14} {d['commit'] or '-':8} {d['submodule']:10} {note}")
             continue
         bes = d.get("backends", {})
@@ -913,7 +988,7 @@ def mcp_entry(key: str, spec: dict) -> dict:
                                                *[f"{k}={shlex.quote(v)}" for k, v in sets.items()]]}
     if w == "existing":
         return dict(spec["entry"])
-    return {"command": str(ROOT / "bin" / "mcp"), "args": [key, *[f"{k}={v}" for k, v in sets.items()]]}
+    return {"command": str(ENTRY_ROOT / "bin" / "mcp"), "args": [key, *[f"{k}={v}" for k, v in sets.items()]]}
 
 
 def mcp_entries(setup: dict) -> dict:
@@ -944,6 +1019,7 @@ _PROBE = r'''
 root={root}
 echo "ROOT $root"
 if [ -x "$root/llmt" ]; then echo "LLMT"; fi
+if [ -x /opt/llm-translators/current/llmt ]; then echo "SHARED /opt/llm-translators/current"; fi
 for k in {keys}; do
   for p in "$(command -v $k-mcp 2>/dev/null)" "$HOME"/Software/*/.venv/bin/$k-mcp "$HOME"/Software/*/venv/bin/$k-mcp \
            "$HOME"/*/.venv/bin/$k-mcp "$HOME"/Desktop/*/.venv/bin/$k-mcp "$HOME"/.local/bin/$k-mcp; do
@@ -983,9 +1059,11 @@ def probe(host: str | None, root: str, keys: list[str] | None = None) -> dict | 
             out["root"] = line[5:]
         elif line == "LLMT":
             out["llmt"] = True
+        elif line.startswith("SHARED "):
+            out["shared"] = line[7:]
         elif line.startswith("MCP "):
             _, k, p = line.split(" ", 2)
-            if not p.startswith(out["root"].rstrip("/") + "/.venv/"):
+            if not p.startswith(out["root"].rstrip("/") + "/.venv/") and "/llm-translators/releases/" not in p:
                 lst = out["found"].setdefault(k, [])
                 if p not in lst:
                     lst.append(p)
@@ -1158,9 +1236,15 @@ def mcp_setup_interactive(setup: dict, hint: dict | None = None) -> None:
             host = ask("ssh host (user@host, keys set up for BatchMode)", prev.get("host", last_host))
             while not host:
                 host = ask("ssh host (user@host)", "")
-            root = ask(f"llm-translators folder on {host}", prev.get("root", last_root))
+            check = yes(f"Check {host} now (ssh)?", True)
+            guess = prev.get("root", last_root)
+            info = probe(host, guess) if check else None
+            if info and not info["llmt"] and info.get("shared"):
+                say(f"  {host} has a shared install, kept up to date by its admin: {info['shared']} (docs/SHARED.md)")
+                guess = info["shared"]
+            root = ask(f"llm-translators folder on {host}", guess)
             spec = {"where": "remote", "host": host, "root": root, **entry_settings(k, prev, host)}
-            if yes(f"Check {host} now (ssh)?", True):
+            if check:
                 spec = report_remote(k, host, root, spec)
             mcp[k] = spec
             last_host, last_root = host, root
@@ -1415,6 +1499,332 @@ def mcp_serve(keys: list[str], host: str) -> None:
                 p.kill()
 
 
+# ---------------------------------------------------------------- shared releases (docs/SHARED.md)
+
+REL_NAME = re.compile(r"^(\d{4})\.(\d{2})\.(\d{2})\.(\d+)$")
+
+
+def refuse_in_release(what: str) -> None:
+    if SHARED:
+        die(f"this is a shared release ({ROOT}): {what} is the admin's job. From a checkout, 'llmt deploy' "
+            f"builds a new release (docs/SHARED.md).")
+
+
+def setup_shared(setup: dict) -> None:
+    rel = release_info()
+    say(f"llm-translators shared release {rel.get('release', '?')} — setup ({ENTRY_ROOT})\n")
+    say("The admin installs and updates the translators here; you choose how to use them.")
+    print_status(status_data([k for k in KEYS if k in rel.get("keys", [])]), False)
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        say("\nRunning as root: setup's remaining steps are for users. Admins: llmt deploy / tune --system "
+            "(docs/SHARED.md).")
+        return
+    alias_interactive(setup)
+    say("\nMCP servers")
+    has_app = sys.platform == "darwin" or os.name == "nt" or claude_desktop_config().exists()
+    if yes("Will a Claude app on this machine use the translators?", has_app):
+        mcp_setup_interactive(setup, hint={k: "here" for k in setup.get("installed", [])})
+    else:
+        say(f"  On the machine with the Claude app: 'llmt mcp setup', remote, with this host and {ENTRY_ROOT}.")
+    say("\nDone. Check any time with: llmt status")
+
+
+def prefix_of(a) -> Path:
+    if getattr(a, "prefix", None):
+        return Path(os.path.abspath(os.path.expanduser(a.prefix)))
+    return PREFIX if SHARED else DEFAULT_PREFIX
+
+
+def rel_key(p: Path):
+    m = REL_NAME.match(p.name)
+    return tuple(int(x) for x in m.groups()) if m else (0,)
+
+
+def releases_in(prefix: Path, complete: bool = True) -> list[Path]:
+    d = prefix / "releases"
+    if not d.is_dir():
+        return []
+    out = [p for p in d.iterdir() if p.is_dir() and REL_NAME.match(p.name)
+           and (not complete or (p / "RELEASE.json").exists())]
+    return sorted(out, key=rel_key)
+
+
+def current_release(prefix: Path) -> Path | None:
+    cur = prefix / "current"
+    if cur.is_symlink() or cur.exists():
+        try:
+            return cur.resolve()
+        except OSError:
+            return None
+    return None
+
+
+def next_release_name(prefix: Path) -> str:
+    today = _dt.date.today().strftime("%Y.%m.%d")
+    n = [int(p.name.rsplit(".", 1)[1]) for p in releases_in(prefix, complete=False) if p.name.startswith(today + ".")]
+    return f"{today}.{max(n, default=0) + 1}"
+
+
+def switch_current(prefix: Path, rel: Path) -> None:
+    """Points <prefix>/current to rel in one step (a new relative symlink renamed over the old one)."""
+    tmp = prefix / ".current.new"
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    os.symlink(Path("releases") / rel.name, tmp)
+    os.replace(tmp, prefix / "current")
+
+
+def releases_in_use(prefix: Path) -> dict[str, list[str]]:
+    """Releases that running processes (MCP servers, their workers, running jobs) or queued SLURM jobs use."""
+    base = str((prefix / "releases").resolve()) + "/"
+    pat = re.compile(re.escape(base) + r"([0-9.]+)/")
+    used: dict[str, list[str]] = {}
+    proc = Path("/proc")
+    if proc.is_dir():
+        for d in proc.iterdir():
+            if not d.name.isdigit():
+                continue
+            try:  # the program and its script (python, then e.g. .venv/bin/cfdt-mcp): not text that mentions a path
+                argv = (d / "cmdline").read_bytes().split(b"\0")[:2]
+                cmd = " ".join(x.decode(errors="replace") for x in argv)
+            except OSError:
+                continue
+            for name in set(pat.findall(cmd + " ")):
+                who = ""
+                try:
+                    import pwd
+                    who = pwd.getpwuid(d.stat().st_uid).pw_name
+                except (ImportError, KeyError, OSError):
+                    pass
+                used.setdefault(name, []).append(f"process {d.name}" + (f" ({who})" if who else ""))
+    if shutil.which("squeue"):
+        try:
+            r = subprocess.run(["squeue", "-h", "-o", "%i|%u|%o"], capture_output=True, text=True, timeout=20)
+            for line in r.stdout.splitlines():
+                jid, user, script = (line.split("|") + ["", "", ""])[:3]
+                try:
+                    text = Path(script).read_text(errors="replace")[:20000]
+                except OSError:
+                    continue
+                for name in set(pat.findall(text)):
+                    used.setdefault(name, []).append(f"job {jid} ({user})")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return used
+
+
+def export_tree(src: Path, dst: Path) -> None:
+    """The committed files of the git checkout src (its HEAD) into dst."""
+    dst.mkdir(parents=True, exist_ok=True)
+    a = subprocess.Popen(["git", "-C", str(src), "archive", "--format=tar", "HEAD"], stdout=subprocess.PIPE)
+    t = subprocess.run(["tar", "-x", "-C", str(dst)], stdin=a.stdout)
+    a.stdout.close()
+    if a.wait() != 0 or t.returncode != 0:
+        die(f"could not export {src} (git archive HEAD)")
+
+
+def make_readonly(root: Path) -> None:
+    for d, dirs, files in os.walk(root):
+        os.chmod(d, 0o755)
+        for f in files:
+            p = os.path.join(d, f)
+            if os.path.islink(p):
+                continue
+            m = os.stat(p).st_mode & 0o777
+            os.chmod(p, (m | 0o444 | (0o111 if m & 0o100 else 0)) & ~0o022)
+
+
+def cmd_deploy(a) -> None:
+    if SHARED:
+        die("deploy builds from a checkout (e.g. /opt/llm-translators/src), not from inside a release")
+    prefix = prefix_of(a)
+    subs = submodule_states()
+    keys = parse_keys(a.keys) if a.keys else [k for k in KEYS if subs.get(REGISTRY[k]["repo"], ("absent",))[0] != "absent"]
+    if not keys:
+        die("no translator is checked out here: git submodule update --init (docs/SHARED.md)")
+    problems = []
+    for k in keys:
+        repo = REGISTRY[k]["repo"]
+        st = subs.get(repo, ("absent", ""))[0]
+        if st == "absent":
+            problems.append(f"{repo} is not checked out (git submodule update --init {repo})")
+        elif st != "pinned":
+            problems.append(f"{repo} is not at the umbrella's pin ({st}): git submodule update {repo}")
+        elif git("-C", repo, "status", "--porcelain", check=False).stdout.strip():
+            problems.append(f"{repo} has uncommitted changes (they would not be deployed)")
+    if git("status", "--porcelain", "--ignore-submodules=all", check=False).stdout.strip():
+        problems.append("the umbrella has uncommitted changes (they would not be deployed)")
+    if problems:
+        for p_ in problems:
+            warn(p_)
+        if not a.allow_dirty:
+            die("fix these, or deploy the committed state anyway with --allow-dirty")
+    try:
+        (prefix / "releases").mkdir(parents=True, exist_ok=True)
+        probe_f = prefix / "releases" / ".write-test"
+        probe_f.write_text("")
+        probe_f.unlink()
+    except OSError:
+        die(f"no write access to {prefix}: run as the admin (sudo ./llmt deploy) or choose --prefix")
+    name = next_release_name(prefix)
+    rel = prefix / "releases" / name
+    say(f"Building release {name} in {rel} ({', '.join(keys)})")
+    ok = False
+    try:
+        export_tree(ROOT, rel)
+        for k in keys:
+            export_tree(ROOT / REGISTRY[k]["repo"], rel / REGISTRY[k]["repo"])
+        # the venv
+        needs_gmsh = any(b["key"] == "gmsh" for k in keys for b in REGISTRY[k]["backends"])
+        arm_linux = sys.platform.startswith("linux") and platform.machine() in ("aarch64", "arm64")
+        py = a.python or ("/usr/bin/python3" if arm_linux and needs_gmsh else default_python())
+        v = python_version(py)
+        if not v or v < (3, 10):
+            die(f"{py}: Python 3.10+ needed (--python)")
+        vdir = rel / ".venv"
+        vpy = vdir / "bin" / "python"
+        run([py, "-m", "venv", "--prompt", f"llm-translators {name}", vdir])
+        run([vpy, "-m", "pip", "install", "--quiet", "--upgrade", "pip"])
+        extra_opt: dict[str, list[str]] = {}
+        for spec in a.extra or []:
+            k_, _, e_ = spec.partition(":")
+            if k_ not in REGISTRY or e_ not in REGISTRY[k_]["optional_extras"]:
+                die(f"--extra {spec}: expected KEY:EXTRA")
+            extra_opt.setdefault(k_, []).append(e_)
+        specs = []
+        for k in keys:
+            t = REGISTRY[k]
+            ex = list(t["extras"]) + ([t["test_extra"]] if t.get("test_extra") else []) + extra_opt.get(k, [])
+            specs += ["-e", f"{rel / t['repo']}[{','.join(ex)}]"]
+        run([vpy, "-m", "pip", "install", *specs])
+        if needs_gmsh and run([vpy, "-c", "import gmsh"], capture=True, check=False).returncode != 0:
+            sysmod = Path("/usr/lib/python3/dist-packages/gmsh.py")
+            site = vdir / "lib" / f"python{v[0]}.{v[1]}" / "site-packages"
+            if sysmod.exists() and site.is_dir():
+                (site / "gmsh.py").symlink_to(sysmod)
+                say(f"  linked {sysmod} into the venv")
+            else:
+                warn(f"Gmsh is not importable in the release's venv: see {BACKENDS_MD}#gmsh")
+        run([vpy, "-m", "compileall", "-q", "-j", "0", str(rel)], check=False)
+        commits = {REGISTRY[k]["repo"]: git("-C", REGISTRY[k]["repo"], "rev-parse", "HEAD").stdout.strip() for k in keys}
+        import getpass
+        info = {"release": name, "llmt": __version__, "created": _dt.datetime.now().isoformat(timespec="seconds"),
+                "built_by": getpass.getuser(), "python": f"{py} ({'.'.join(map(str, v))})", "keys": keys,
+                "umbrella": git("rev-parse", "HEAD").stdout.strip(), "commits": commits, "source": str(ROOT),
+                "dirty": bool(problems)}
+        (rel / "RELEASE.json").write_text(json.dumps(info, indent=1) + "\n")
+        make_readonly(rel)
+        # the machine's settings file: created once, then only new settings described
+        global ENV_FILE
+        saved, ENV_FILE = ENV_FILE, SYSTEM_ENV
+        try:
+            if not SYSTEM_ENV.exists():
+                ensure_env_file()
+                os.chmod(SYSTEM_ENV, 0o644)
+                say(f"  created {SYSTEM_ENV} (the machine's settings: edit it with llmt env --system --edit)")
+            else:
+                added = env_refresh()
+                if added:
+                    say(f"  {SYSTEM_ENV}: described the new settings {', '.join(added)}")
+        except OSError as exc:
+            warn(f"could not write {SYSTEM_ENV} ({exc}): create it as the admin")
+        finally:
+            ENV_FILE = saved
+        # checks, with the new release's own llmt
+        say("\nChecking the new release")
+        r = subprocess.run([sys.executable, str(rel / "llmt"), "status", "--json", *keys], capture_output=True, text=True)
+        try:
+            st = json.loads(r.stdout)
+        except json.JSONDecodeError:
+            die(f"the new release's status failed:\n{(r.stderr or r.stdout)[-1500:]}")
+        bad = [k for k in keys if not st["translators"].get(k, {}).get("version")]
+        for k in keys:
+            d = st["translators"].get(k, {})
+            miss = [n for n, v_ in d.get("backends", {}).items() if not v_["found"]]
+            say(f"  {k:5} {d.get('version') or 'NOT IMPORTABLE'}" + (f"; missing: {', '.join(miss)}" if miss else ""))
+        if bad:
+            die(f"not importable in the new release: {', '.join(bad)}")
+        if a.test:
+            r = subprocess.run([sys.executable, str(rel / "llmt"), "test", *keys])
+            if r.returncode != 0:
+                die("tests failed: the release is kept but not switched to (llmt rollback / gc)")
+        if a.bench:
+            for k in keys:
+                if REGISTRY[k]["bench"] and subprocess.run([sys.executable, str(rel / "llmt"), "bench", k]).returncode != 0:
+                    die(f"{k} benchmarks failed: the release is kept but not switched to")
+        ok = True
+    finally:
+        if not ok and rel.exists() and not (rel / "RELEASE.json").exists():
+            shutil.rmtree(rel, ignore_errors=True)
+            warn(f"removed the incomplete {rel}")
+    if a.no_switch:
+        say(f"\nRelease {name} is ready; users still get {current_release(prefix) or 'nothing'}. Switch: llmt rollback {name}")
+        return
+    old = current_release(prefix)
+    switch_current(prefix, rel)
+    say(f"\n{prefix / 'current'} -> releases/{name}" + (f" (was {old.name})" if old else ""))
+    say("  New MCP sessions use it; running servers and queued jobs finish on the release they started with.")
+    say(f"  Users: MCP entries run {prefix / 'current'}/bin/mcp KEY; llmt alias points llmt-venv there.")
+    say("  Undo: llmt rollback. Old releases: llmt gc.")
+
+
+def cmd_releases(a) -> None:
+    prefix = prefix_of(a)
+    rels = releases_in(prefix)
+    if not rels:
+        say(f"  no releases in {prefix}/releases")
+        return
+    cur = current_release(prefix)
+    used = releases_in_use(prefix)
+    say(f"  {prefix}")
+    for r in reversed(rels):
+        info = release_info(r)
+        mark = "current" if cur == r.resolve() else ""
+        use = used.get(r.name, [])
+        say(f"  {r.name:14} {mark:8} {info.get('created', '?'):20} {','.join(info.get('keys', [])):28} "
+            + (f"in use: {len(use)} ({', '.join(use[:3])}{'...' if len(use) > 3 else ''})" if use else ""))
+
+
+def cmd_rollback(a) -> None:
+    prefix = prefix_of(a)
+    rels = releases_in(prefix)
+    cur = current_release(prefix)
+    if a.release:
+        target = prefix / "releases" / a.release
+        if target not in rels:
+            die(f"no complete release {a.release} in {prefix}/releases (llmt releases)")
+    else:
+        older = [r for r in rels if cur is None or rel_key(r) < rel_key(cur)]
+        if not older:
+            die("no release older than the current one")
+        target = older[-1]
+    switch_current(prefix, target)
+    say(f"{prefix / 'current'} -> releases/{target.name}" + (f" (was {cur.name})" if cur else ""))
+
+
+def cmd_gc(a) -> None:
+    prefix = prefix_of(a)
+    rels = releases_in(prefix, complete=False)
+    cur = current_release(prefix)
+    used = releases_in_use(prefix)
+    complete = [r for r in rels if (r / "RELEASE.json").exists()]
+    keep = set(complete[-max(a.keep, 1):]) | ({cur} if cur else set())
+    drop = [r for r in rels if r not in keep and r.resolve() != cur and r.name not in used]
+    for r in rels:
+        if r.name in used and r not in keep:
+            say(f"  keeping {r.name}: in use ({', '.join(used[r.name][:3])})")
+    if not drop:
+        say("  nothing to remove")
+        return
+    say("  to remove: " + ", ".join(r.name for r in drop))
+    if not a.yes and not (sys.stdin.isatty() and yes("Remove them?", False)):
+        say("  nothing removed (--yes to remove without asking)")
+        return
+    for r in drop:
+        shutil.rmtree(r)
+        say(f"  removed {r.name}")
+
+
 # ---------------------------------------------------------------- commands
 
 def table() -> None:
@@ -1436,6 +1846,8 @@ def cmd_setup(a) -> None:
     if not sys.stdin.isatty():
         die("setup is interactive; use 'llmt install KEY...' and 'llmt mcp config' in scripts")
     setup = load_setup()
+    if SHARED:
+        return setup_shared(setup)
     say(f"llm-translators {__version__} — setup ({ROOT})\n")
     show_macos_warnings()
     say("Available translators:")
@@ -1569,6 +1981,7 @@ def cmd_list(a) -> None:
 
 
 def cmd_install(a) -> None:
+    refuse_in_release("installing")
     setup = load_setup()
     keys = parse_keys(a.keys) if a.keys else setup.get("installed", [])
     if not keys:
@@ -1597,6 +2010,7 @@ def cmd_install(a) -> None:
 
 
 def cmd_remove(a) -> None:
+    refuse_in_release("removing translators")
     keys = parse_keys(a.keys)
     setup = load_setup()
     if VPY.exists():
@@ -1619,6 +2033,7 @@ def cmd_status(a) -> None:
 
 
 def cmd_update(a) -> None:
+    refuse_in_release("updating")
     setup = load_setup()
     keys = parse_keys(a.keys) if a.keys else setup.get("installed", [])
     if not keys:
@@ -1676,6 +2091,7 @@ def submodule_branch(path: str) -> str:
 
 def cmd_pin(a) -> None:
     """Moves the umbrella's pins to each translator's latest pushed commit (or --to COMMIT)."""
+    refuse_in_release("pinning")
     keys = parse_keys(a.keys) if a.keys else KEYS
     if a.to and len(keys) != 1:
         die("--to needs exactly one translator")
@@ -1748,8 +2164,10 @@ def cmd_test(a) -> None:
     results = {}
     for k in keys:
         say(f"\n=== {k}: pytest")
-        r = subprocess.run([str(ROOT / "bin" / "run"), "python", "-m", "pytest", "-q", *a.pytest_args],
-                           cwd=ROOT / REGISTRY[k]["repo"])
+        extra = ["-p", "no:cacheprovider"] if SHARED else []
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"} if SHARED else None
+        r = subprocess.run([str(ROOT / "bin" / "run"), "python", "-m", "pytest", "-q", *extra, *a.pytest_args],
+                           cwd=ROOT / REGISTRY[k]["repo"], env=env)
         results[k] = r.returncode
     say("\n" + "  ".join(f"{k}: {'pass' if rc == 0 else 'FAIL'}" for k, rc in results.items()))
     sys.exit(0 if all(rc == 0 for rc in results.values()) else 1)
@@ -1782,6 +2200,9 @@ def cmd_alias(a) -> None:
 
 
 def cmd_tune(a) -> None:
+    use_system_env(a)
+    if SHARED and not a.system:
+        say(f"  (your own settings, {ENV_FILE}; the machine's are set by the admin with llmt tune --system)")
     setup = load_setup()
     keys = parse_keys(a.keys) if a.keys else [k for k in setup.get("installed", [])]
     if not (a.apply or a.print):
@@ -1817,7 +2238,17 @@ def cmd_jobs(a) -> None:
     say("  Cancel one: scancel ID (or ask the model: cancel(request))")
 
 
+def use_system_env(a) -> None:
+    """--system: the machine's file (/etc/llm-translators/env) instead of the user's."""
+    global ENV_FILE
+    if getattr(a, "system", False):
+        ENV_FILE = SYSTEM_ENV
+
+
 def cmd_env(a) -> None:
+    use_system_env(a)
+    if not a.system and ENV_FILE != SYSTEM_ENV and SYSTEM_ENV.exists():
+        say(f"# the machine's settings, loaded first: {SYSTEM_ENV} (llmt env --system)")
     ensure_env_file()
     env_refresh()
     if a.edit:
@@ -1904,10 +2335,30 @@ def main(argv: list[str] | None = None) -> None:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--print", action="store_true", help="only show the suggestion")
     g.add_argument("--apply", action="store_true", help="write the suggestion without asking")
+    p.add_argument("--system", action="store_true", help=f"the machine's file, {SYSTEM_ENV} (admin)")
     p = sub.add_parser("jobs", help="the translators' SLURM jobs on this machine")
     p.add_argument("keys", nargs="*")
-    p = sub.add_parser("env", help="per-machine settings (config/env)")
+    p = sub.add_parser("deploy", help="admin: build a shared release from this checkout and switch to it")
+    p.add_argument("keys", nargs="*", help="default: every translator checked out here")
+    p.add_argument("--prefix", help=f"default {DEFAULT_PREFIX} (LLMT_PREFIX)")
+    p.add_argument("--python", help="interpreter for the release's venv")
+    p.add_argument("--extra", action="append", metavar="KEY:EXTRA", help="optional extra, e.g. lmpt:lammps")
+    p.add_argument("--test", action="store_true", help="run each translator's tests before switching")
+    p.add_argument("--bench", action="store_true", help="run the benchmarks before switching")
+    p.add_argument("--no-switch", action="store_true", help="build it, but leave 'current' as it is")
+    p.add_argument("--allow-dirty", action="store_true", help="deploy the committed state despite local changes")
+    p = sub.add_parser("releases", help="the shared releases, which is current, which are in use")
+    p.add_argument("--prefix")
+    p = sub.add_parser("rollback", help="admin: point 'current' to the previous (or the named) release")
+    p.add_argument("release", nargs="?")
+    p.add_argument("--prefix")
+    p = sub.add_parser("gc", help="admin: remove old releases nobody uses")
+    p.add_argument("--keep", type=int, default=3, help="always keep the newest N (default 3)")
+    p.add_argument("--prefix")
+    p.add_argument("--yes", action="store_true")
+    p = sub.add_parser("env", help="settings: config/env, or yours in a shared release; --system: the machine's")
     p.add_argument("--edit", action="store_true")
+    p.add_argument("--system", action="store_true", help=f"the machine's file, {SYSTEM_ENV} (admin)")
     p = sub.add_parser("mcp", help="MCP servers")
     msub = p.add_subparsers(dest="mcp_cmd", required=True)
     msub.add_parser("setup", help="local / remote / existing / none per translator")
@@ -1930,7 +2381,8 @@ def main(argv: list[str] | None = None) -> None:
         ap.print_help()
         return
     {"setup": cmd_setup, "list": cmd_list, "install": cmd_install, "remove": cmd_remove, "status": cmd_status,
-     "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "tune": cmd_tune, "jobs": cmd_jobs, "env": cmd_env, "mcp": cmd_mcp}[a.cmd](a)
+     "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "tune": cmd_tune, "jobs": cmd_jobs, "env": cmd_env,
+     "deploy": cmd_deploy, "releases": cmd_releases, "rollback": cmd_rollback, "gc": cmd_gc, "mcp": cmd_mcp}[a.cmd](a)
 
 
 if __name__ == "__main__":
@@ -1939,6 +2391,10 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nllmt: interrupted", file=sys.stderr)
         sys.exit(130)
+    except PermissionError as exc:
+        print(f"llmt: permission denied: {exc.filename or exc} (the machine's files and shared releases need the "
+              f"admin: sudo)", file=sys.stderr)
+        sys.exit(13)
     except BrokenPipeError:   # e.g. llmt list | head
         sys.stderr.close()
         sys.exit(0)

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Starts one translator's MCP server: bin/mcp KEY [VAR=value ...] [--http PORT [--host H]]
 #   KEY: b3dt | feat | cfdt | lmpt (see translators.json)
-#   VAR=value: settings for this server only, applied after config/env (so they override it), e.g.
+#   VAR=value: settings for this server only, applied after the settings files (so they override them), e.g.
 #     bin/mcp cfdt CFDT_TIMEOUT=10800 CFDT_PROCS=18
 # This is the command the Claude app runs, locally or over ssh. It prints nothing of its own on stdout.
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
@@ -16,10 +16,17 @@ case "$KEY" in
 esac
 EXE="$ROOT/.venv/bin/$KEY-mcp"
 if [ ! -x "$EXE" ]; then
-    echo "llm-translators: $KEY is not installed here ($EXE missing; run $ROOT/llmt install $KEY)" >&2
+    if [ -f "$ROOT/RELEASE.json" ]; then
+        echo "llm-translators: $KEY is not in this shared release ($ROOT); ask the admin to deploy it" >&2
+    else
+        echo "llm-translators: $KEY is not installed here ($EXE missing; run $ROOT/llmt install $KEY)" >&2
+    fi
     exit 127
 fi
 # Leading VAR=value arguments stay first; the server goes after them: env VAR=value ... EXE options...
+# In a shared release (RELEASE.json) the machine's caps cannot be raised: *_MAX_* arguments are dropped.
+SHARED=0
+[ -f "$ROOT/RELEASE.json" ] && SHARED=1
 n=0
 for a in "$@"; do
     case "$a" in
@@ -28,6 +35,30 @@ for a in "$@"; do
     esac
     n=$((n + 1))
 done
+if [ "$SHARED" -eq 1 ] && [ "$n" -gt 0 ]; then
+    total=$#
+    i=0
+    for a in "$@"; do
+        if [ "$i" -lt "$n" ]; then
+            case "${a%%=*}" in
+                *_MAX_*) echo "llm-translators: ignoring $a (caps are the machine's: /etc/llm-translators/env)" >&2 ;;
+                *) set -- "$@" "$a" ;;
+            esac
+        else
+            set -- "$@" "$a"
+        fi
+        i=$((i + 1))
+    done
+    shift "$total"
+    n=0
+    for a in "$@"; do
+        case "$a" in
+            *=*) case "${a%%=*}" in ""|[0-9]*|*[!A-Za-z0-9_]*) break ;; esac ;;
+            *) break ;;
+        esac
+        n=$((n + 1))
+    done
+fi
 total=$#
 i=0
 for a in "$@"; do

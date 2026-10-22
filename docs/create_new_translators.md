@@ -230,7 +230,7 @@ Copy cfd-translator's file. It works with the MCP Python SDK 1.x and 2.x (both `
 
 ### Settings (environment variables)
 
-These are read from the environment only, never from shell startup files. llm-translators' `bin/mcp` loads them from `config/env`, and only a person edits that file. A study changes its own run within the caps through `run`.
+These are read from the environment only, never from shell startup files. A translator may also run from a read-only shared release (docs/SHARED.md), so it writes only to `<KEY>_OUT`, to its caches (under the user's home, configurable) and to temporary folders: never inside its package folder or the venv. llm-translators' `bin/mcp` loads them from `config/env`, and only a person edits that file. A study changes its own run within the caps through `run`.
 
 | Variable | Meaning |
 |---|---|
