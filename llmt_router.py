@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.23.3
+Version: 2026.10.23.4
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -28,7 +28,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.23.3"
+__version__ = "2026.10.23.4"
 
 HERE = Path(__file__).resolve().parent
 
@@ -71,12 +71,15 @@ def ssh_base(host: dict) -> list:
 
 
 def remote_cmd(host: dict, script: str, timeout: float = 120) -> subprocess.CompletedProcess:
-    """Runs a shell script on the host (sh -c locally when ssh is empty)."""
+    """Runs a shell script on the host (sh -c locally when ssh is empty). stdin is /dev/null (and ssh -n): the
+    router's own stdin is the app's MCP channel; ssh would read it (eating requests) and set it non-blocking, and
+    the router's read loop would then see end of input and exit quietly right after initialize."""
     if host.get("ssh"):
-        cmd = ssh_base(host) + [script]
+        cmd = ssh_base(host)
+        cmd = cmd[:-1] + ["-n", cmd[-1], script]
     else:
         cmd = ["sh", "-c", script]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
 
 
 def root_expr(root: str) -> str:
