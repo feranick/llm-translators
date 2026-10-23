@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.23.2
+Version: 2026.10.23.3
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -28,7 +28,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.23.2"
+__version__ = "2026.10.23.3"
 
 HERE = Path(__file__).resolve().parent
 
@@ -43,6 +43,8 @@ def _load_llmt():
 
 L = _load_llmt()
 
+POOL = 3                 # connections per machine at most
+STUCK_AFTER = 20.0       # a connection whose oldest request waits longer than this is not given new ones
 STATUS_TTL = 60.0        # older than this: refreshed in the background, the older answer is used meanwhile
 STATUS_MAX_AGE = 1800.0  # older than this: not used (asked again, waiting for the answer)
 STATUS_WAIT = 12.0       # how long a placement waits for machines it has no answer from yet
@@ -100,12 +102,13 @@ class Child:
         self.waiting: dict = {}
         self.err: list = []
         self.init_result: dict | None = None
+        self.inflight: dict = {}
         self.tools: list | None = None
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, init_params: dict) -> None:
+    def start(self, init_params: dict, timeout: float = 120.0) -> None:
         root = self.host["root"].rstrip("/")
         if self.host.get("ssh"):
             cmd = [L.ssh_exe(), *L.SSH_OPTS, "-o", "ConnectTimeout=10", self.host["ssh"], f"{root}/bin/mcp", self.key]
@@ -117,7 +120,7 @@ class Child:
         threading.Thread(target=self._read_err, daemon=True).start()
         params = {"protocolVersion": init_params.get("protocolVersion", "2025-06-18"), "capabilities": {},
                   "clientInfo": {"name": "llmt-router", "version": __version__}}
-        r = self.request("initialize", params, timeout=120)
+        r = self.request("initialize", params, timeout=timeout)
         self.init_result = r
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
@@ -132,6 +135,8 @@ class Child:
                 q = self.waiting.get(msg["id"])
                 if q is not None:
                     q.put(msg)
+                else:                                   # a late answer to a request we gave up on: free again
+                    self.inflight.pop(msg["id"], None)
             elif "id" in msg and "method" in msg:            # a request from the server to us: we offer nothing
                 reply = {"jsonrpc": "2.0", "id": msg["id"]}
                 reply.update({"result": {}} if msg["method"] == "ping" else
@@ -163,11 +168,14 @@ class Child:
             rid = self.next_id
         q: queue.Queue = queue.Queue()
         self.waiting[rid] = q
+        self.inflight[rid] = time.time()
+        late = False
         try:
             self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
             try:
                 msg = q.get(timeout=timeout)
             except queue.Empty:
+                late = True                             # the server is still on it: keep counting it as busy
                 raise ChildError(f"{self.host['name']}: no answer to {method} within {timeout:.0f} s")
             if msg is None:
                 raise ChildError(f"{self.host['name']}: the server ended{self.tail()}")
@@ -176,6 +184,12 @@ class Child:
             return msg["result"]
         finally:
             self.waiting.pop(rid, None)
+            if not late:
+                self.inflight.pop(rid, None)
+
+    def stuck_for(self) -> float:
+        """Seconds the oldest unanswered request has been waiting (0: none)."""
+        return max((time.time() - t for t in list(self.inflight.values())), default=0.0)
 
     def close(self) -> None:
         if self.alive():
@@ -222,16 +236,36 @@ class Router:
         pref = [self.host(n) for n in self.prefer if self.host(n)]
         return [h for h in pref + [h for h in self.hosts if h not in pref] if h["name"] not in self.exclude]
 
-    def child(self, name: str) -> Child:
+    def child(self, name: str, timeout: float = 120.0) -> Child:
+        """A connection to the machine's server that is not stuck. A server busy with a long request (e.g. a
+        compile inside a call) answers nothing else meanwhile, so the router opens another connection (up to
+        POOL per machine) instead of queueing behind it. Runs are found from any server process (files, queue)."""
         with self.child_lock:
             lock = self.host_locks.setdefault(name, threading.Lock())
-        with lock:                          # one start at a time per machine; machines start independently
-            c = self.children.get(name)
-            if c is None or not c.alive():
+        if not lock.acquire(timeout=max(1.0, timeout)):
+            raise ChildError(f"{name}: still connecting (no answer to the connection within {timeout:.0f} s)")
+        try:
+            pool = [c for c in self.children.get(name, []) if c.alive()]
+            for c in pool:
+                if c.stuck_for() < STUCK_AFTER:
+                    self.children[name] = pool
+                    return c
+            if len(pool) < POOL:
+                if pool:
+                    log(f"{name}: its server has been busy for {pool[0].stuck_for():.0f} s: opening another connection")
                 c = Child(self.host(name), self.key)
-                c.start(self.init_params)
-                self.children[name] = c
-            return c
+                try:
+                    c.start(self.init_params, timeout=max(3.0, timeout))
+                except ChildError:
+                    c.close()
+                    raise
+                pool.append(c)
+                self.children[name] = pool
+                return c
+            self.children[name] = pool
+            return min(pool, key=lambda c: c.stuck_for())
+        finally:
+            lock.release()
 
     def warm(self, name: str) -> None:
         """Connects to a machine in the background, so its first call does not pay for ssh and the server start."""
@@ -481,7 +515,8 @@ class Router:
                 args = dict(args, wait_s=max(0.0, min(want, rem - 8.0)))
             timeout = max(3.0, rem)
         try:
-            return self.child(name).request("tools/call", {"name": tool, "arguments": args}, timeout=timeout)
+            return self.child(name, timeout=timeout).request("tools/call", {"name": tool, "arguments": args},
+                                                             timeout=timeout)
         except ChildError as exc:
             if "no answer" in str(exc):
                 raise ChildError(f"{name} did not answer {tool} in time (an MCP call must end within a minute). It may "
@@ -774,9 +809,10 @@ class Router:
     def initialize(self, params: dict) -> dict:
         self.init_params = params or {}
         errors = []
+        t_end = time.time() + 40.0
         for h in self.ordered() or self.hosts:
             try:
-                c = self.child(h["name"])
+                c = self.child(h["name"], timeout=max(3.0, min(30.0, t_end - time.time())))
                 self.instructions = (c.init_result or {}).get("instructions") or ""
                 self.tools = c.request("tools/list", {}).get("tools", [])
                 for t in self.tools:
@@ -812,8 +848,9 @@ class Router:
         return {"tools": [t for t in self.tools if t.get("name") != "machines"] + [own]}
 
     def close(self) -> None:
-        for c in self.children.values():
-            c.close()
+        for pool in self.children.values():
+            for c in pool:
+                c.close()
 
 
 def serve(key: str) -> None:
@@ -834,7 +871,30 @@ def serve(key: str) -> None:
             elif method == "tools/list":
                 res = router.tools_list()
             elif method == "tools/call":
-                res = router.tool_call(params.get("name", ""), params.get("arguments") or {})
+                tool = params.get("name", "")
+                box: dict = {}
+                t0 = time.time()
+
+                def work():
+                    try:
+                        box["res"] = router.tool_call(tool, params.get("arguments") or {})
+                    except Exception as exc:  # noqa: BLE001
+                        box["exc"] = exc
+                th = threading.Thread(target=work, daemon=True)
+                th.start()
+                th.join(BUDGET + 5.0)     # never let the Claude app time out: it would close this server for every chat
+                if th.is_alive():
+                    log(f"{tool}: no answer within {BUDGET + 5:.0f} s; answered with an error, the call goes on")
+                    res = router.text_result({"error": f"{tool}: the machine did not answer within {BUDGET + 5:.0f} s. "
+                                                       f"It may still be working: look with jobs() or study_status "
+                                                       f"before running it again"}, True)
+                elif "exc" in box:
+                    raise box["exc"]
+                else:
+                    res = box["res"]
+                    data = Router.parse(res) if isinstance(res, dict) else None
+                    log(f"{tool} -> {(data or {}).get('machine', '?') if isinstance(data, dict) else '?'} "
+                        f"({time.time() - t0:.1f} s{', error' if res.get('isError') else ''})")
             elif method == "ping":
                 res = {}
             else:
