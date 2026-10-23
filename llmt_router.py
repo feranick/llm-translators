@@ -270,7 +270,7 @@ class Router:
 
     def fetch_status(self, name: str) -> dict:
         h = self.host(name)
-        script = (f"r={root_expr(h['root'])}; \"$r/llmt\" status --json {self.key} 2>/dev/null; echo; echo @@LOAD; "
+        script = (f"r={root_expr(h['root'])}; python3 \"$r/llmt\" status --json {self.key} 2>/dev/null; echo; echo @@LOAD; "
                   f"cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/null; "
                   f"nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null")
         out = {"name": name, "reachable": False}

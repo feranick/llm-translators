@@ -1144,7 +1144,7 @@ def remote_status(host: str, root: str) -> dict | None:
     """llmt status --json on host (cached)."""
     if (host, root) in _REMOTE_STATUS:
         return _REMOTE_STATUS[(host, root)]
-    cmd = [ssh_exe(), *SSH_OPTS, "-o", "ConnectTimeout=10", host, f"{root}/llmt", "status", "--json"]
+    cmd = [ssh_exe(), *SSH_OPTS, "-o", "ConnectTimeout=10", host, "python3", f"{root}/llmt", "status", "--json"]
     say(f"  checking llm-translators on {host} ...")
     data = None
     try:
@@ -1757,6 +1757,9 @@ def cmd_deploy(a) -> None:
         export_tree(ROOT, rel)
         for k in keys:
             export_tree(ROOT / REGISTRY[k]["repo"], rel / REGISTRY[k]["repo"])
+        for f in ["llmt", "llmt_router.py", "bin/run", "bin/mcp", "bin/router"]:   # executable whatever git recorded
+            if (rel / f).exists():
+                os.chmod(rel / f, 0o755)
         # the venv
         needs_gmsh = any(b["key"] == "gmsh" for k in keys for b in REGISTRY[k]["backends"])
         arm_linux = sys.platform.startswith("linux") and platform.machine() in ("aarch64", "arm64")
@@ -1914,7 +1917,7 @@ def host_overview(h: dict) -> dict:
     """{key: version} of the translators installed at a router machine (None: unreachable)."""
     r_ = h["root"].rstrip("/")
     r_ = '"$HOME' + r_[1:] + '"' if r_.startswith("~") else shlex.quote(r_)
-    script = f'r={r_}; "$r/llmt" status --json'
+    script = f'r={r_}; python3 "$r/llmt" status --json'
     cmd = ([ssh_exe(), *SSH_OPTS, "-o", "ConnectTimeout=10", h["ssh"], script] if h.get("ssh")
            else ["sh", "-c", script])
     try:
