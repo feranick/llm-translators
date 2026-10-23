@@ -263,6 +263,12 @@ class Router:
         self.status_cache[name] = (time.time(), out)
         return out
 
+    def forget(self, name: str) -> None:
+        """Drops what the router knows about a machine's load, so the next placement asks it again."""
+        self.status_cache.pop(name, None)
+        for k in [k for k in self.start_cache if k[0] == name]:
+            self.start_cache.pop(k, None)
+
     def statuses(self, names: list, fresh: bool = False) -> dict:
         res: dict = {}
         ths = [threading.Thread(target=lambda n=n: res.__setitem__(n, self.status(n, fresh))) for n in names]
@@ -574,6 +580,7 @@ class Router:
             if starts_work:
                 name, send, info = self.place(tool, args)
                 r = self.call(name, tool, send)
+                self.forget(name)                     # it has new work: the next placement asks it again
                 self.learn(self.parse(r), name)
                 return self.with_fields(r, {"machine": name, "router": info})
             name, send = self.route_path(args)
