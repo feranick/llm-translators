@@ -48,7 +48,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.10.23.2"
+__version__ = "2026.10.23.6"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -540,9 +540,20 @@ def slurm_info() -> dict | None:
     if nodes:                       # per node (scontrol): robust to several partitions or node groups in sinfo
         ok = [n for n in nodes if n["usable"]]
         use = ok or nodes
-        info.update(cpus=sum(n["cpus"] for n in use), cpus_allocated=sum(n["alloc"] for n in use),
-                    nodes=",".join(n["name"] for n in nodes), state=use[0]["state"],
-                    nodes_usable=len(ok), mem_mb=str(sum(n["mem"] for n in use)))
+        me = local_node(nodes)
+        info.update(cluster_nodes=len(nodes), node=me,
+                    cluster_cpus=sum(n["cpus"] for n in use), cluster_cpus_allocated=sum(n["alloc"] for n in use))
+        if len(nodes) > 1 and me:   # a cluster: this machine's jobs run on its own node (docs/EXECUTION.md)
+            n = next(x for x in nodes if x["name"] == me)
+            info.update(cpus=n["cpus"], cpus_allocated=n["alloc"], nodes=",".join(x["name"] for x in nodes),
+                        state=n["state"], nodes_usable=1 if n["usable"] else 0, mem_mb=str(n["mem"]),
+                        shared_home=shared_home())
+        else:
+            info.update(cpus=sum(n["cpus"] for n in use), cpus_allocated=sum(n["alloc"] for n in use),
+                        nodes=",".join(n["name"] for n in nodes), state=use[0]["state"],
+                        nodes_usable=len(ok), mem_mb=str(sum(n["mem"] for n in use)))
+            if len(nodes) > 1:
+                info["shared_home"] = shared_home()
     try:
         r = subprocess.run(["sinfo", "-h", "-o", "%C|%m|%l|%N|%t"], capture_output=True, text=True, timeout=20)
         line = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else ""
@@ -585,10 +596,48 @@ def slurm_nodes() -> list[dict]:
         try:
             out.append({"name": f["NodeName"], "state": st + ("+" + "+".join(flags[1:]).lower() if len(flags) > 1 else ""),
                         "usable": not bad, "cpus": int(f.get("CPUTot", 0) or 0), "alloc": int(f.get("CPUAlloc", 0) or 0),
-                        "mem": int(f.get("RealMemory", 0) or 0)})
+                        "mem": int(f.get("RealMemory", 0) or 0), "host": f.get("NodeHostName", ""),
+                        "addr": f.get("NodeAddr", "")})
         except ValueError:
             continue
     return out
+
+
+def local_node(nodes: list) -> str | None:
+    """The SLURM node that is this machine: by host name (NodeName, NodeHostName), else by address (NodeAddr)."""
+    import socket
+    names = {socket.gethostname(), socket.gethostname().split(".")[0]}
+    for n in nodes:
+        if n["name"] in names or n.get("host") in names or (n.get("host") or "").split(".")[0] in names:
+            return n["name"]
+    addrs = set()
+    try:
+        r = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5)
+        addrs.update(r.stdout.split())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        addrs.update(a[4][0] for a in socket.getaddrinfo(socket.gethostname(), None))
+    except OSError:
+        pass
+    for n in nodes:
+        if n.get("addr") in addrs:
+            return n["name"]
+    return None
+
+
+SHARED_FS = ("nfs", "nfs4", "cifs", "smb", "smb2", "smbfs", "lustre", "gpfs", "beegfs", "ceph", "cephfs", "glusterfs",
+             "fuse.sshfs", "fuse.glusterfs", "fuse.cephfs", "panfs", "wekafs", "afs")
+
+
+def shared_home() -> bool:
+    """The home folder is on a network filesystem (a job on another node would see the same run folders)."""
+    try:
+        r = subprocess.run(["stat", "-f", "-c", "%T", str(Path.home())], capture_output=True, text=True, timeout=5)
+        t = r.stdout.strip().lower()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return t in SHARED_FS or t.startswith(("nfs", "fuse.s", "ceph", "lustre", "gpfs"))
 
 
 def slurm_jobs() -> list[dict]:
@@ -618,6 +667,9 @@ def slurm_notes(info: dict) -> list[str]:
     if info.get("nodes_usable") == 0 or (info.get("nodes_usable") is None and
                                           info.get("state", "").rstrip("*") in ("down", "drain", "drng", "fail")):
         out.append(f"the node is '{info['state']}': jobs will wait until it is back (scontrol update ... state=resume)")
+    if (info.get("cluster_nodes") or 1) > 1 and not info.get("node"):
+        out.append(f"SLURM has {info['cluster_nodes']} nodes ({info.get('nodes')}) but none of them is this machine "
+                   f"(by name or address): jobs cannot be kept on it; check NodeName/NodeAddr in slurm.conf")
     if info.get("SelectType", "").endswith("linear"):
         out.append("SelectType=select/linear gives each job the whole machine: studies run one at a time "
                    "(select/cons_tres lets them share it by cores; see BACKENDS.md)")
@@ -699,7 +751,25 @@ def tune_suggestions(keys: list[str]) -> tuple[dict, list[str]]:
         lines += [f"warning: {n}" for n in slurm_notes(si)]
         if not si.get("error"):
             sug.update({f"{REGISTRY[k]['executor']['prefix']}_EXECUTOR": "slurm" for k in executor_keys(keys)})
-            lines.append(f"SLURM: {si.get('cpus', '?')} CPUs on {si.get('nodes', '?')}: long studies go to its queue")
+            lines.append(f"SLURM: {si.get('cpus', '?')} CPUs on {si.get('node') or si.get('nodes', '?')}: long studies go to its queue")
+            if (si.get("cluster_nodes") or 1) > 1 and si.get("node"):
+                shared = si.get("shared_home")
+                val = "any" if shared else "local"
+                lines.append(f"cluster of {si['cluster_nodes']} nodes ({si.get('nodes')}); this machine is {si['node']}; "
+                             + ("the home folder is shared: SLURM may run jobs on any node (_SLURM_NODE=any)" if shared else
+                                "the home folder is not shared: jobs stay on this node (_SLURM_NODE=local), since "
+                                "their run folders are only here"))
+                cur = env_effective()
+                for k in executor_keys(keys):
+                    pre = REGISTRY[k]["executor"]["prefix"]
+                    sug[f"{pre}_SLURM_NODE"] = val
+                    st = tool_status(k) if REGISTRY[k]["status"] else None
+                    knows = isinstance(st, dict) and isinstance(st.get("executor"), dict) and "node" in st["executor"]
+                    args = cur.get(f"{pre}_SLURM_ARGS", "")
+                    if val == "local" and not knows and not re.search(r"(--nodelist|-w)\b", args):
+                        sug[f"{pre}_SLURM_ARGS"] = (args + " " if args else "") + f"--nodelist={si['node']}"
+                        lines.append(f"  {k} does not know {pre}_SLURM_NODE yet: --nodelist={si['node']} in "
+                                     f"{pre}_SLURM_ARGS until it does")
     cpu = cpu_info()
     lines.append(f"CPU: {cpu['physical']} physical cores, {cpu['logical']} logical")
     s2, notes = suggest_tuning([k for k in keys if REGISTRY[k].get("tuning")], {**env_effective(), **sug})

@@ -10,3 +10,4 @@ dist/
 config/env
 config/setup.json
 config/router_paths.json
+config/*.bak-*

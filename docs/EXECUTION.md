@@ -20,6 +20,7 @@ The machines (mochi, carbonio) have SLURM on a single node. Submitting each long
 | `P_EXECUTOR` | `local` \| `slurm` (`local`) | `slurm`: long studies become SLURM jobs. `local`: the worker pool, as today. |
 | `P_SLURM_MIN_MINUTES` | number (cfdt 0, lmpt 1, feat 5) | Studies whose own time estimate is below this run locally even with `slurm`, because queueing would cost more than it saves. A study with no estimate goes to SLURM. |
 | `P_SLURM_ARGS` | text (empty) | Extra `sbatch` arguments, split like a shell does, e.g. `--mem=64G --nice=100`. |
+| `P_SLURM_NODE` | `local` \| `any` \| a node list (`local`) | Where jobs may run when the SLURM cluster has several nodes; see "Clusters of several nodes". A `--nodelist`/`-w` in `P_SLURM_ARGS` wins. |
 | `P_PROCS` | integer (1) | MPI ranks per study (cfdt, lmpt) or threads (feat, CalculiX), as today. A study's own `procs` overrides it. |
 | `P_TIMEOUT` | seconds | Per study, as today. With SLURM it also sets the job's time limit (below). |
 | `P_WORKERS` | integer (2) | Local pool only. With SLURM, the queue decides how many run at once. |
@@ -149,6 +150,26 @@ Threaded translators (feat) put threads in `procs_requested`/`procs_used` and le
 llm-translators' router (docs/ROUTER.md) reads these to place a run on the machine where it should finish first. Without them, it places by start time only. They come from the same functions that size SLURM jobs, so they cost nothing extra.
 
 - **Status.** cfdt 2026.10.22.10: `executor.estimate` (ranks after the cells-per-rank cap, `--mem` as the job asks, minutes from cells × iterations or time steps × 4.6e-6 s per cell-iteration / rank speed-up, measured on mochi, plus meshing and results, +30 %; also `cells`). No estimate for a STEP geometry (its cells cannot be told before meshing). Implemented in omct 2026.10.22.1 (`executor.estimate`: `cpus_for_job`, `mem_for_job`, `estimate_minutes`) and lmpt 2026.10.22.1 (`executor.sizing`: `ranks_for`, `mem_mb_for`, `estimate_minutes`).
+
+## Clusters of several nodes
+
+A machine can be one node of a SLURM cluster with several nodes. For example, the DGX Sparks spark1 (`spark-5da5`, the controller) and spark2 (`spark-0808`) form the cluster `flash-dgx` (2026-10-23).
+
+- **The problem.** A job submitted on one of them can then run on the other. Its run folder (`~/<key>_runs/...`) is only on the machine that submitted it, unless the home folders are shared (NFS or similar), so such a job fails.
+- **The setting.** `P_SLURM_NODE`:
+  - **`local` (the default).** Every job gets `--nodelist=<this node>`. *This node* is the cluster node that is this machine: `scontrol -o show node`, matching the host name to `NodeName` or `NodeHostName`, else one of the machine's addresses to `NodeAddr`.
+  - **`any`:** SLURM picks the node. Use it when the home folders are shared.
+  - **A node list** (`spark-5da5,spark-0808`): exactly those nodes.
+
+  A `--nodelist` or `-w` in `P_SLURM_ARGS` wins. On a single-node cluster the setting changes nothing.
+- **Estimates.** `sbatch --test-only` (the router's start estimate) uses the same `--nodelist`.
+- **Status.** `tool_status().executor` reports `"node": {"setting": "local", "nodelist": "spark-5da5", "cluster_nodes": 2}`, with `nodelist: null` when SLURM may choose. `llmt` and the router read it to show this node and to estimate on it.
+
+What llm-translators does:
+
+- **`llmt status`** reports SLURM for this node in a cluster (`node`, its `cpus`, `cpus_allocated`, `state`), plus `cluster_nodes`, `cluster_cpus` and whether the home folder is on a network filesystem (`shared_home`).
+- **`llmt tune`** suggests `P_SLURM_NODE=local`, or `any` when the home folder is shared. For a translator that doesn't report `executor.node` yet, it also suggests `--nodelist=<this node>` in `P_SLURM_ARGS` as a stopgap.
+- **The router** keeps two nodes of one cluster as two machines, each judged by its own node. With `any` and shared homes, they behave as one cluster: the same estimate, and SLURM chooses the node.
 
 ## Status for llm-translators
 

@@ -141,6 +141,8 @@ srun -n 2 hostname                      # a two-task job runs
 - **Memory.** Check `scontrol show config | grep -E 'SelectTypeParameters|DefMem'`. With `CR_Core_Memory` and `DefMemPerNode = UNLIMITED` (no `DefMemPerCPU`), a job that does not ask for memory gets the whole node, and jobs run one at a time however many cores are free (mochi: every job `mem=60000M`). lmpt and feat ask for memory themselves (`LMPT_SLURM_MEM=auto`, `FEAT_SLURM_MEM=auto`: feat from the mesh size when it is known before meshing, else 8 GB); for cfdt, put `--mem=...` in `CFDT_SLURM_ARGS` (e.g. `--mem=16G`). Alternatively set `DefMemPerCPU` in `slurm.conf` (about RealMemory / CPUs, e.g. 1500 on a 64 GB, 40-CPU node), which changes the default for everyone's jobs.
 - **Time limits.** Long limits block backfill: a short study waits behind a large job even when cores are free. `LMPT_SLURM_TIME=estimate` sizes lmpt's limits from each study's estimate.
 
+**A cluster of several nodes** (one controller, compute nodes, like the two DGX Sparks): each translator keeps its jobs on the node it runs on (`<KEY>_SLURM_NODE=local`, the default), because the run folders live in the home folder of that machine. If the home folders are shared (NFS), `<KEY>_SLURM_NODE=any` lets SLURM use any node. `llmt status` shows this node and the cluster, and `llmt tune` suggests the setting (docs/EXECUTION.md, "Clusters of several nodes"). The nodes need the same `slurm.conf` and munge key. Each node's `NodeAddr` must be reachable from the others (the Sparks use their Tailscale addresses). `RealMemory` must not exceed what `slurmd -C` reports.
+
 ## Where things run
 
 The translators are cheap to install everywhere; the backends are not. A common layout:

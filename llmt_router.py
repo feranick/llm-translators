@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.23.5
+Version: 2026.10.23.6
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -28,7 +28,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.23.5"
+__version__ = "2026.10.23.6"
 
 HERE = Path(__file__).resolve().parent
 
@@ -327,7 +327,9 @@ class Router:
                 jobs = [j for j in sl.get("jobs", []) if j.get("key") == self.key]
                 out.update(reachable=True, mode=data.get("mode"), release=(data.get("release") or {}).get("release"),
                            version=d.get("version"), backends_missing=miss, executor=ex,
-                           slurm={k: sl.get(k) for k in ("cpus", "cpus_allocated", "time_limit", "state", "nodes_usable")}
+                           slurm={k: sl.get(k) for k in ("cpus", "cpus_allocated", "time_limit", "state", "nodes_usable",
+                                                         "node", "cluster_nodes", "nodes", "shared_home",
+                                                         "cluster_cpus", "cluster_cpus_allocated")}
                            if sl else None,
                            queue={"running": sum(1 for j in jobs if j.get("state") == "RUNNING"),
                                   "waiting": sum(1 for j in jobs if j.get("state") != "RUNNING")} if sl else None)
@@ -374,6 +376,28 @@ class Router:
         return [n for n in (h["name"] for h in self.ordered())
                 if sts.get(n, {}).get("reachable") and sts[n].get("version") and not sts[n].get("backends_missing")]
 
+    @staticmethod
+    def nodelist(st: dict) -> str | None:
+        """The node(s) this machine's jobs are kept on, for the start estimate (docs/EXECUTION.md, P_SLURM_NODE):
+        what the translator reports, else a --nodelist in its SLURM arguments, else (a cluster of several nodes
+        without a shared home) the machine's own node. None: SLURM may choose any node."""
+        ex = st.get("executor") or {}
+        sl = st.get("slurm") or {}
+        node = ex.get("node")
+        if isinstance(node, dict):
+            if node.get("setting") == "any" or (node.get("nodelist") is None and "setting" in node):
+                return node.get("nodelist")
+            if node.get("nodelist"):
+                return node["nodelist"]
+        elif isinstance(node, str) and node and node not in ("local", "any"):
+            return node
+        m = re.search(r"(?:--nodelist[= ]|-w\s*)(\S+)", str(ex.get("args") or ex.get("slurm_args") or ""))
+        if m:
+            return m.group(1)
+        if (sl.get("cluster_nodes") or 1) > 1 and sl.get("node") and not sl.get("shared_home"):
+            return sl["node"]
+        return None
+
     def expected_start(self, name: str, st: dict, procs: int, minutes: float, mem_mb: float | None) -> tuple:
         """Minutes until a job of this size would start on the machine, and why."""
         ex = st.get("executor") or {}
@@ -384,6 +408,8 @@ class Router:
             size = f"-n {procs}" if kind == "mpi" else f"-n 1 -c {procs}"
             mins = max(1, int(math.ceil(minutes or ex.get("time_limit_min") or 60)))
             mem = f" --mem={int(mem_mb)}M" if mem_mb else ""
+            nl = self.nodelist(st)
+            mem += f" --nodelist={nl}" if nl else ""
             ck = (name, procs, mins, mem)
             hit = self.start_cache.get(ck)
             if hit and time.time() - hit[0] < START_TTL:
@@ -399,7 +425,7 @@ class Router:
                     sl = st["slurm"]
                     free = (sl.get("cpus") or 0) - (sl.get("cpus_allocated") or 0)
                     why = ("starts now" if wait < 0.5 else f"SLURM expects a start in {wait:.0f} min") + \
-                          f" ({free} of {sl.get('cpus')} CPUs free)"
+                          f" ({free} of {sl.get('cpus')} CPUs free" + (f" on node {nl}" if nl else "") + ")"
                     res = (wait, why)
                 else:
                     res = (None, "sbatch --test-only gave no start time: " + (r.stdout + r.stderr).strip()[-160:])

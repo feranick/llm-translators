@@ -80,6 +80,15 @@ Placement applies to calls that start work: those with a `studies` or `goals` ar
            "warnings": ["cfdt versions differ: mochi 2026.10.22.6, carbonio 2026.10.22.5"]}
 ```
 
+### Machines that are nodes of one SLURM cluster
+
+The DGX Sparks are one cluster of two nodes. Each one is still a machine of its own for the router:
+
+- **Separate nodes, separate machines.** Without a shared home folder, a job must run on the node holding its run folder, so each machine's jobs stay on its own node (`P_SLURM_NODE=local`, docs/EXECUTION.md).
+- **Estimates per node.** The router's start estimate asks SLURM about that node (`sbatch --test-only --nodelist=<node>`), and `machines()` shows that node's CPUs.
+- **The result.** The router picks the spark whose own node frees up first.
+- **With shared homes (`any`)** both machines report the cluster's estimate, and SLURM chooses the node: in effect, one machine.
+
 ## Following up: where each request lives
 
 The results stay as the translator wrote them; their paths are real paths on their machine. The router keeps a map from each request folder to its machine. It learns it from `request` / `bench` fields in answers and from `jobs()` lists, and keeps it across restarts in `router_paths.json`, next to `setup.json`. Calls are then routed by their argument:
