@@ -9,3 +9,4 @@ dist/
 # llm-translators: per-machine settings
 config/env
 config/setup.json
+config/router_paths.json

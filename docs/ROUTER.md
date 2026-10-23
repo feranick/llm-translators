@@ -1,6 +1,6 @@
 # The router: one translator, several machines
 
-Status: design and implementation, llmt 2026.10.22.3.
+Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1.
 
 Until now, each MCP entry in the Claude app pointed to one machine (`ssh mochi .../bin/mcp cfdt`). With several machines able to run a translator (mochi, carbonio, a DGX Spark), choosing one by hand wastes the others, and one entry per machine (`cfdt-mochi`, `cfdt-carbonio`, ...) multiplies the tools in every chat.
 
@@ -123,6 +123,16 @@ An entry through the router:
 ```
 
 `llmt mcp test cfdt` tests it like any entry: the handshake goes through the router to the first machine.
+
+## Time limits
+
+The Claude app gives up on a tool call after about a minute, and then closes the server, which every chat using it notices. The router therefore answers every call within 50 seconds.
+
+- **Placement takes at most half of that.** Machines whose status hasn't arrived within 12 seconds are left out, and the answer's warnings say so. A translator's status can take seconds: omct loads the Modelica library, cfdt sources OpenFOAM.
+- **The tool's own wait is shortened to fit.** Calls with a `wait_s` argument (`run_studies`, `study_status`, `run_benchmarks`, `bench_status`) get what's left of the 50 seconds. Studies still running come back as pending, as usual.
+- **Status is fetched in the background.** It's fetched when the router starts, and again in the background once it's older than a minute; meanwhile the older answer is used. After the router sends a machine work, that machine's queue estimate is asked again at the next placement.
+- **Connections are opened ahead.** The router connects to every machine when it starts, so a first call doesn't pay for ssh and the server start.
+- **A machine that doesn't answer in time** gets an error saying the call may still be working there, and to look with `jobs()` or `study_status` before running it again. The router itself keeps running.
 
 ## Limits, and what comes later
 

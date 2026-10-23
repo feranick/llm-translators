@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.22.3
+Version: 2026.10.23.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -28,7 +28,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.22.3"
+__version__ = "2026.10.23.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -43,7 +43,10 @@ def _load_llmt():
 
 L = _load_llmt()
 
-STATUS_TTL = 60.0
+STATUS_TTL = 60.0        # older than this: refreshed in the background, the older answer is used meanwhile
+STATUS_MAX_AGE = 1800.0  # older than this: not used (asked again, waiting for the answer)
+STATUS_WAIT = 12.0       # how long a placement waits for machines it has no answer from yet
+BUDGET = 50.0            # every tool call is answered within this: the Claude app gives up after about 60 s
 START_TTL = 30.0
 CALL_TIMEOUT = 600.0
 PLACE_ARGS = ("studies", "goals")
@@ -200,6 +203,10 @@ class Router:
         self.children: dict = {}
         self.child_lock = threading.Lock()
         self.status_cache: dict = {}
+        self.refreshing: set = set()
+        self.ref_lock = threading.Lock()
+        self.host_locks: dict = {}
+        self.wait_defaults: dict = {}
         self.start_cache: dict = {}
         self.init_params: dict = {}
         self.instructions = ""
@@ -217,6 +224,8 @@ class Router:
 
     def child(self, name: str) -> Child:
         with self.child_lock:
+            lock = self.host_locks.setdefault(name, threading.Lock())
+        with lock:                          # one start at a time per machine; machines start independently
             c = self.children.get(name)
             if c is None or not c.alive():
                 c = Child(self.host(name), self.key)
@@ -224,11 +233,42 @@ class Router:
                 self.children[name] = c
             return c
 
+    def warm(self, name: str) -> None:
+        """Connects to a machine in the background, so its first call does not pay for ssh and the server start."""
+        def run():
+            try:
+                self.child(name)
+            except ChildError as exc:
+                log(f"{name}: {exc}")
+        threading.Thread(target=run, daemon=True).start()
+
     def status(self, name: str, fresh: bool = False) -> dict:
-        """What the machine says about itself (llmt status --json KEY, load), cached STATUS_TTL seconds."""
+        """What the machine says about itself (llmt status --json KEY, load). A cached answer is used while it is
+        younger than STATUS_MAX_AGE; past STATUS_TTL a background refresh starts (a translator's status can take
+        seconds: OpenModelica loads its library, OpenFOAM sources its environment)."""
         hit = self.status_cache.get(name)
-        if hit and not fresh and time.time() - hit[0] < STATUS_TTL:
-            return hit[1]
+        if hit and not fresh:
+            age = time.time() - hit[0]
+            if age > STATUS_TTL:
+                self.refresh(name)
+            if age < STATUS_MAX_AGE:
+                return hit[1]
+        return self.fetch_status(name)
+
+    def refresh(self, name: str) -> None:
+        with self.ref_lock:
+            if name in self.refreshing:
+                return
+            self.refreshing.add(name)
+
+        def run():
+            try:
+                self.fetch_status(name)
+            finally:
+                self.refreshing.discard(name)
+        threading.Thread(target=run, daemon=True).start()
+
+    def fetch_status(self, name: str) -> dict:
         h = self.host(name)
         script = (f"r={root_expr(h['root'])}; \"$r/llmt\" status --json {self.key} 2>/dev/null; echo; echo @@LOAD; "
                   f"cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/null; "
@@ -264,18 +304,31 @@ class Router:
         return out
 
     def forget(self, name: str) -> None:
-        """Drops what the router knows about a machine's load, so the next placement asks it again."""
-        self.status_cache.pop(name, None)
+        """After sending a machine work: its queue estimate is asked again at the next placement, and its status
+        is refreshed in the background."""
+        hit = self.status_cache.get(name)
+        if hit:
+            self.status_cache[name] = (0.0, hit[1])
         for k in [k for k in self.start_cache if k[0] == name]:
             self.start_cache.pop(k, None)
+        self.refresh(name)
 
-    def statuses(self, names: list, fresh: bool = False) -> dict:
+    def statuses(self, names: list, fresh: bool = False, wait: float = STATUS_WAIT) -> dict:
+        """Each machine's status, waiting at most `wait` seconds: a machine without an answer by then is reported
+        as still being checked (its earlier answer is used if there is one)."""
         res: dict = {}
-        ths = [threading.Thread(target=lambda n=n: res.__setitem__(n, self.status(n, fresh))) for n in names]
-        for t in ths:
+        ths = {n: threading.Thread(target=lambda n=n: res.__setitem__(n, self.status(n, fresh)), daemon=True)
+               for n in names}
+        for t in ths.values():
             t.start()
-        for t in ths:
-            t.join()
+        end = time.time() + max(wait, 0.5)
+        for t in ths.values():
+            t.join(max(0.0, end - time.time()))
+        for n in names:
+            if n not in res:
+                hit = self.status_cache.get(n)
+                res[n] = hit[1] if hit else {"name": n, "reachable": False,
+                                             "error": f"no answer within {wait:.0f} s (still being checked)"}
         return res
 
     def candidates(self, sts: dict) -> list:
@@ -411,33 +464,57 @@ class Router:
         return {"content": [{"type": "text", "text": json.dumps(data, indent=1, default=str)}], "isError": error}
 
     # ---- calls
-    def call(self, name: str, tool: str, args: dict) -> dict:
-        return self.child(name).request("tools/call", {"name": tool, "arguments": args})
+    def call(self, name: str, tool: str, args: dict, deadline: float | None = None) -> dict:
+        """Calls the tool on a machine. With a deadline, the tool's own wait (wait_s) is shortened to fit, and the
+        call gives up at the deadline (it may still finish there: the answer says how to check)."""
+        timeout = CALL_TIMEOUT
+        if deadline is not None:
+            rem = deadline - time.time()
+            if tool in self.wait_defaults:
+                want = args.get("wait_s", self.wait_defaults[tool])
+                try:
+                    want = float(want)
+                except (TypeError, ValueError):
+                    want = 0.0
+                args = dict(args, wait_s=max(0.0, min(want, rem - 8.0)))
+            timeout = max(3.0, rem)
+        try:
+            return self.child(name).request("tools/call", {"name": tool, "arguments": args}, timeout=timeout)
+        except ChildError as exc:
+            if "no answer" in str(exc):
+                raise ChildError(f"{name} did not answer {tool} in time (an MCP call must end within a minute). It may "
+                                 f"still be working there: look with jobs() or study_status before running it again")
+            raise
 
-    def call_all(self, names: list, tool: str, args: dict) -> dict:
+    def call_all(self, names: list, tool: str, args: dict, deadline: float | None = None) -> dict:
         res: dict = {}
 
         def one(n):
             try:
-                r = self.call(n, tool, args)
+                r = self.call(n, tool, args, deadline)
                 data = self.parse(r)
                 self.learn(data, n)
                 res[n] = data if data is not None else r
             except ChildError as exc:
                 res[n] = {"unreachable": str(exc)}
-        ths = [threading.Thread(target=one, args=(n,)) for n in names]
-        for t in ths:
+        ths = {n: threading.Thread(target=one, args=(n,), daemon=True) for n in names}
+        for t in ths.values():
             t.start()
-        for t in ths:
-            t.join()
+        for t in ths.values():
+            t.join(None if deadline is None else max(0.0, deadline - time.time() + 1.0))
+        for n in names:
+            res.setdefault(n, {"unreachable": f"{n}: no answer in time"})
         return res
 
     def validate_tool(self) -> str | None:
         names = {t["name"] for t in self.tools}
         return next((n for n in ("validate_studies", "validate_goals") if n in names), None)
 
-    def place(self, tool: str, args: dict) -> tuple:
-        """-> (machine name, args to send, router info) for a call that starts work."""
+    def place(self, tool: str, args: dict, deadline: float | None = None) -> tuple:
+        """-> (machine name, args to send, router info) for a call that starts work. Placement takes at most about
+        half of the call's time budget; the rest is the run's own wait."""
+        deadline = deadline or (time.time() + BUDGET)
+        p_end = time.time() + (deadline - time.time()) * 0.5
         warnings: list = []
         arg = next((a for a in PLACE_ARGS if isinstance(args.get(a), dict)), None)
         studies = copy.deepcopy(args.get(arg)) if arg else {}
@@ -454,11 +531,11 @@ class Router:
                                      f"one call goes to one machine; split it")
                 manual = want
         send = dict(args, **({arg: studies} if arg else {}))
-        sts = self.statuses([h["name"] for h in self.ordered()])
+        sts = self.statuses([h["name"] for h in self.ordered()], wait=min(STATUS_WAIT, max(1.0, p_end - time.time())))
         cands = self.candidates(sts)
-        unreach = [n for n, s in sts.items() if not s.get("reachable")]
+        unreach = [f"{n} ({str(s.get('error') or 'no answer')[:80]})" for n, s in sts.items() if not s.get("reachable")]
         if unreach:
-            warnings.append(f"unreachable: {', '.join(unreach)}")
+            warnings.append(f"left out: {'; '.join(unreach)}")
         if manual:
             unknown = [m for m in manual if not self.host(m)]
             if unknown:
@@ -488,7 +565,7 @@ class Router:
         est: dict = {}
         vt = self.validate_tool() if arg else None
         if vt and studies:
-            vres = self.call_all(cands, vt, {arg: studies})
+            vres = self.call_all(cands, vt, {arg: studies}, deadline=min(p_end, time.time() + 15.0))
             ok = []
             for n in cands:
                 v = vres.get(n)
@@ -507,14 +584,23 @@ class Router:
                 warnings.append("not valid on " + ", ".join(n for n in cands if n not in ok) +
                                 " (an older version?): left out")
                 cands = ok
+        starts: dict = {}
+
+        def one_start(n):
+            st_, e_ = sts[n], est.get(n, {})
+            pr = int(e_.get("procs") or (st_.get("executor") or {}).get("procs") or 1)
+            starts[n] = self.expected_start(n, st_, pr, e_.get("minutes") or 0, e_.get("mem_mb"))
+        ths = {n: threading.Thread(target=one_start, args=(n,), daemon=True) for n in cands}
+        for t in ths.values():
+            t.start()
+        for t in ths.values():
+            t.join(max(0.0, p_end - time.time()))
         rows = []
         for i, n in enumerate(cands):
             st = sts[n]
-            ex = st.get("executor") or {}
             e = est.get(n, {})
-            procs = int(e.get("procs") or ex.get("procs") or 1)
             minutes = e.get("minutes")
-            start, why = self.expected_start(n, st, procs, minutes or 0, e.get("mem_mb"))
+            start, why = starts.get(n, (None, "no queue estimate in time"))
             start = start if start is not None else 0.0
             run_min = (minutes or 0) * float(self.speed.get(n, 1.0))
             small = minutes is not None and minutes < self.small
@@ -549,7 +635,7 @@ class Router:
 
         def one(h):
             try:
-                r = remote_cmd(h, f"test -e {shlex.quote(path)} && echo yes", timeout=30)
+                r = remote_cmd(h, f"test -e {shlex.quote(path)} && echo yes", timeout=15)
                 hits[h["name"]] = "yes" in r.stdout
             except (OSError, subprocess.TimeoutExpired):
                 hits[h["name"]] = False
@@ -568,24 +654,25 @@ class Router:
         return c[0]
 
     def tool_call(self, tool: str, args: dict) -> dict:
+        deadline = time.time() + BUDGET
         if tool == "machines":
             return self.text_result(self.machines())
         try:
             if tool in ALL_TOOLS or tool in BROADCAST_TOOLS:
                 sts = self.statuses([h["name"] for h in self.ordered()])
                 names = [n for n in self.candidates(sts)] or [n for n, s in sts.items() if s.get("reachable")]
-                return self.text_result({"machines": self.call_all(names, tool, args)})
+                return self.text_result({"machines": self.call_all(names, tool, args, deadline)})
             starts_work = tool == "run_benchmarks" or (not tool.startswith(("validate_", "get_")) and
                                                         any(isinstance(args.get(a), dict) for a in PLACE_ARGS))
             if starts_work:
-                name, send, info = self.place(tool, args)
-                r = self.call(name, tool, send)
+                name, send, info = self.place(tool, args, deadline)
+                r = self.call(name, tool, send, deadline)
                 self.forget(name)                     # it has new work: the next placement asks it again
                 self.learn(self.parse(r), name)
                 return self.with_fields(r, {"machine": name, "router": info})
             name, send = self.route_path(args)
             if name:
-                r = self.call(name, tool, send)
+                r = self.call(name, tool, send, deadline)
                 self.learn(self.parse(r), name)
                 return self.with_fields(r, {"machine": name})
             if any(isinstance(args.get(a), str) for a in PATH_ARGS):     # a path the router has not seen: find it
@@ -599,18 +686,18 @@ class Router:
                                                       f"say which machine ran it, as machine:{path}"}, True)
                 n = where[0]
                 self.remember(path, n)
-                r = self.call(n, tool, send)
+                r = self.call(n, tool, send, deadline)
                 self.learn(self.parse(r), n)
                 return self.with_fields(r, {"machine": n})
             name = self.default_machine()
-            r = self.call(name, tool, args)
+            r = self.call(name, tool, args, deadline)
             self.learn(self.parse(r), name)
             return self.with_fields(r, {"machine": name})
         except (ValueError, ChildError) as exc:
             return self.text_result({"error": str(exc), "router": "llmt-router (machines() shows the machines)"}, True)
 
     def machines(self) -> dict:
-        sts = self.statuses([h["name"] for h in self.hosts], fresh=True)
+        sts = self.statuses([h["name"] for h in self.hosts], fresh=True, wait=35.0)
         out = []
         for h in self.hosts:
             st = sts.get(h["name"], {})
@@ -640,6 +727,10 @@ class Router:
                 c = self.child(h["name"])
                 self.instructions = (c.init_result or {}).get("instructions") or ""
                 self.tools = c.request("tools/list", {}).get("tools", [])
+                for t in self.tools:
+                    props = ((t.get("inputSchema") or {}).get("properties") or {})
+                    if "wait_s" in props:
+                        self.wait_defaults[t["name"]] = props["wait_s"].get("default", 45)
                 proto = (c.init_result or {}).get("protocolVersion") or params.get("protocolVersion")
                 break
             except ChildError as exc:
@@ -648,6 +739,9 @@ class Router:
             proto = params.get("protocolVersion", "2025-06-18")
             self.instructions = (f"llm-translators router for {self.key}: no machine answered ({'; '.join(errors)}). "
                                  f"Call machines() to see why.")
+        for h in self.ordered():           # warm the status cache and the connections, so the first calls don't wait
+            self.refresh(h["name"])
+            self.warm(h["name"])
         names = ", ".join(h["name"] for h in self.hosts)
         note = (f"\nMachines: this server runs {self.key} on several machines ({names}). Calls that start work are "
                 f"placed on the machine where they should finish first; answers say which ('machine', 'router'). "
