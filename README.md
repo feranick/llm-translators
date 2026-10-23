@@ -27,7 +27,7 @@ Each translator's README has the details. This table describes the commits pinne
 
 That only works when they are installed in the same venv, which is why there is a single venv here.
 
-Version: 2026.10.22.1.
+Version: 2026.10.22.3.
 
 **Contents:**
 
@@ -35,6 +35,7 @@ Version: 2026.10.22.1.
 - [Commands](#commands)
 - [Settings](#settings)
 - [Long runs: SLURM](#long-runs-slurm)
+- [Several machines: the router](#several-machines-the-router)
 - [Updating](#updating)
 - [How it fits together](#how-it-fits-together)
 - [Moving and migrating](#moving-and-migrating)
@@ -260,7 +261,9 @@ llmt jobs [KEY...]              the translators' SLURM jobs on this machine
 llmt env [--edit] [--system]    the settings file (config/env; yours in a shared release; --system: the machine's)
 llmt alias [--name N] [--rc F]  shell alias for the venv (default llmt-venv; replaces the old 'cad')
 
-llmt mcp setup                  local / remote / existing / none per translator
+llmt mcp setup                  local / remote / auto (router) / existing / none per translator
+llmt router setup               the machines the router may use; which translators go through it
+llmt router status [KEY...]     each machine as the router sees it: version, backends, CPUs in use, queue, expected start
 llmt mcp config                 write the entries into the Claude desktop config (backup kept)
 llmt mcp config --print         the mcpServers JSON, for any MCP client
 llmt mcp config --claude-code   'claude mcp add-json' commands for Claude Code
@@ -339,6 +342,38 @@ The contract the translators implement is [docs/EXECUTION.md](docs/EXECUTION.md)
 
 ---
 
+## Several machines: the router
+
+When several machines can run a translator (mochi, carbonio, a DGX Spark), the router gives the Claude app **one** server per translator that uses all of them. The design is in [docs/ROUTER.md](docs/ROUTER.md).
+
+- **Placement.** Each run goes to the machine where it should finish first: the earliest expected start, which with SLURM is SLURM's own estimate for a job of that size, plus the estimated run time.
+  - Small jobs go where they can start now.
+  - A study can choose with `"run": {"host": "mochi"}`, or a list in order of preference.
+  - Studies that refer to an earlier request stay on its machine.
+  - Machines whose versions differ are used, with a warning.
+- **Follow-up calls** (`study_status`, `cancel`, `get_file`, `get_image`, ...) go to the machine that holds the request.
+- **`jobs()`** combines all machines, and **`machines()`**, a tool the router adds, shows their load, queues and versions.
+- **Answers say where they ran:** `"machine": "mochi"`, plus `"router": {chose, why, candidates}` for placed runs.
+
+Setting it up, on the Mac:
+
+```bash
+./llmt router setup        # add each machine: ssh user@host and its llm-translators folder (a shared /opt install is found)
+                           # then choose the translators that go through the router; it writes the Claude entries
+./llmt router status       # what the router sees on each machine
+./llmt mcp test            # each entry, through the router
+```
+
+The entries then run `bin/router KEY` on the Mac:
+
+```json
+"cfdt": {"command": "/Users/feranick/Software/llm-translators/bin/router", "args": ["cfdt"]}
+```
+
+The router learns everything else from each machine's `llmt status`: which translators are there, their versions, backends and SLURM queues. In `llmt router setup` you can also mark machines as *preferred* (they win ties), *excluded*, or faster or slower (`speed`). The router itself is part of llm-translators and uses only the Python standard library, so the Mac needs nothing installed for it.
+
+Placement gets better when a translator returns an `estimate` (minutes, ranks or threads, memory) for each study in `validate_studies`. That is a small addition to the translators' contract ([docs/EXECUTION.md](docs/EXECUTION.md)). Without it, the router places by start time only.
+
 ## Updating
 
 The umbrella pins one commit of each translator, so a given umbrella commit is a combination that was installed and tested together. The submodules track `main` (`branch = main` in `.gitmodules`). Their URLs are relative (`../fea-translator.git`): cloning the umbrella over ssh fetches them over ssh, and over https over https.
@@ -367,6 +402,7 @@ llm-translators/
   bin/mcp               starts one MCP server: bin/mcp KEY [VAR=value ...] [--http PORT] (what the Claude app runs)
   bin/activate          source it for an interactive shell with the venv and the settings
   bin/llmt-env.sh       loads the settings in their three layers (used by the three above)
+  bin/router            the router: one MCP server for a translator over several machines (llmt_router.py)
   config/env            your settings in a personal checkout (not tracked)
   config/setup.json     what was chosen here: installed translators, extras, MCP placement, alias (not tracked)
   BACKENDS.md           installing Gmsh, CalculiX, OpenFOAM, LAMMPS, OpenModelica, MPI, SLURM
@@ -433,6 +469,8 @@ To finish moving over:
 | Shared release: `permission denied` from `llmt` | Machine settings and releases belong to the admin: use `sudo`. Users change only their own settings (`llmt env --edit`). |
 | Shared release: a user still gets the old version | Their server started before the switch: reconnect. `llmt releases` shows which releases are still in use. |
 | `llmt gc` keeps an old release | A running server or a queued job still uses it. It goes once they finish. |
+| Router: `llmt mcp test` says "the router reached no machine" | ssh to every machine failed. `llmt router status` shows each machine's error; check `ssh -o BatchMode=yes HOST true`. |
+| Router: "exists on mochi, carbonio (a shared filesystem?)" | The machines share a home folder, so the router can't tell from the path which one ran the request. Use `machine:/path` (e.g. `mochi:/home/...`). Requests the router placed itself are always known. |
 
 ---
 
@@ -461,4 +499,5 @@ Users then remove their entries and alias as above, plus `~/.config/llm-translat
 - [BACKENDS.md](BACKENDS.md): installing and checking each backend, MPI and SLURM.
 - [docs/SHARED.md](docs/SHARED.md): the shared install's design (releases, settings layers, caps, security).
 - [docs/EXECUTION.md](docs/EXECUTION.md): the SLURM contract the translators implement.
+- [docs/ROUTER.md](docs/ROUTER.md): the router, which spreads one translator over several machines.
 - [docs/create_new_translators.md](docs/create_new_translators.md): building a new translator and adding it here.

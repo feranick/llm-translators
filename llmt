@@ -19,7 +19,8 @@
 Shared install for all users (docs/SHARED.md), admin commands run from a checkout:
     llmt deploy [KEY...] [--test] [--bench] [--prefix P]   build a release in /opt/llm-translators and switch to it
     llmt releases | rollback [RELEASE] | gc [--keep N]     list, switch back, remove unused old releases
-    llmt mcp setup                  choose local / remote (ssh) / existing install / none per translator
+    llmt mcp setup                  choose local / remote (ssh) / auto (router) / existing install / none per translator
+    llmt router setup | status [KEY...]   one server per translator over several machines (docs/ROUTER.md)
     llmt mcp config [--print | --claude-code | --file F]   write or print the MCP client entries
     llmt mcp test [KEY...]          start each server as the Claude app does; handshake, list tools
     llmt mcp serve [KEY...] [--host H]   serve MCP over streamable HTTP on each translator's port
@@ -47,7 +48,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.10.22.1"
+__version__ = "2026.10.22.3"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -230,6 +231,32 @@ def installed_in_venv() -> dict[str, str]:
         return {}
 
 
+_GIT_WARNED = False
+
+
+def git_trouble(stderr: str, fatal: bool = False) -> None:
+    """Says why git failed in this checkout, once (e.g. 'dubious ownership' when the checkout belongs to
+    another user, such as root after 'sudo git clone')."""
+    global _GIT_WARNED
+    msg = (stderr or "git failed").strip().splitlines()
+    text = msg[0] if msg else "git failed"
+    if "dubious ownership" in (stderr or ""):
+        owner = ""
+        try:
+            import pwd
+            owner = pwd.getpwuid(ROOT.stat().st_uid).pw_name
+        except (ImportError, KeyError, OSError):
+            pass
+        text = (f"git refuses this checkout: it belongs to {owner or 'another user'}, not to you. Run llmt as "
+                f"{owner or 'its owner'} (e.g. sudo ./llmt ...), or trust it: git config --global --add "
+                f"safe.directory {ROOT}")
+    if fatal:
+        die(text)
+    if not _GIT_WARNED:
+        warn(text)
+        _GIT_WARNED = True
+
+
 def submodule_states() -> dict[str, tuple[str, str]]:
     """repo path -> (state, commit); state: pinned | moved | absent | conflict (a release: release | absent)."""
     if SHARED:
@@ -237,6 +264,8 @@ def submodule_states() -> dict[str, tuple[str, str]]:
         return {t["repo"]: (("release", info.get("commits", {}).get(t["repo"], "")[:7]) if k in info.get("keys", [])
                             else ("absent", "")) for k, t in REGISTRY.items()}
     r = git("submodule", "status", check=False)
+    if r.returncode != 0:
+        git_trouble(r.stderr)
     out = {}
     for line in r.stdout.splitlines():
         if not line.strip():
@@ -975,8 +1004,9 @@ def entry_text(e: dict) -> str:
 
 
 def is_managed(e: dict) -> bool:
-    """Entries llmt writes run llm-translators' bin/mcp."""
-    return "/bin/mcp" in entry_text(e)
+    """Entries llmt writes run llm-translators' bin/mcp (or bin/router)."""
+    t = entry_text(e)
+    return "/bin/mcp" in t or "/bin/router" in t
 
 
 def mcp_entry(key: str, spec: dict) -> dict:
@@ -988,12 +1018,14 @@ def mcp_entry(key: str, spec: dict) -> dict:
                                                *[f"{k}={shlex.quote(v)}" for k, v in sets.items()]]}
     if w == "existing":
         return dict(spec["entry"])
+    if w == "router":
+        return {"command": str(ENTRY_ROOT / "bin" / "router"), "args": [key]}
     return {"command": str(ENTRY_ROOT / "bin" / "mcp"), "args": [key, *[f"{k}={v}" for k, v in sets.items()]]}
 
 
 def mcp_entries(setup: dict) -> dict:
     return {k: mcp_entry(k, s) for k, s in setup.get("mcp", {}).items()
-            if s.get("where") in ("local", "remote", "existing")}
+            if s.get("where") in ("local", "remote", "existing", "router")}
 
 
 def existing_entry(path: str, host: str | None, env: dict[str, str]) -> dict:
@@ -1190,6 +1222,7 @@ def entry_settings(key: str, prev: dict, where: str) -> dict:
 def mcp_setup_interactive(setup: dict, hint: dict | None = None) -> None:
     """hint: the placement chosen in setup's step 1 (here / remote / none), used for the defaults."""
     say("\nMCP servers for the Claude app on THIS machine. For each translator:")
+    say("  a = auto: one server that places each run on the best of several machines (llmt router, docs/ROUTER.md)")
     say("  l = local (llm-translators here)    r = remote (llm-translators on another machine, over ssh)")
     say("  e = existing (an install outside llm-translators, here or over ssh)    n = none")
     mcp = setup.setdefault("mcp", {})
@@ -1214,7 +1247,7 @@ def mcp_setup_interactive(setup: dict, hint: dict | None = None) -> None:
         elif h == "none":
             default = "n"
         elif prev.get("where"):
-            default = {"local": "l", "remote": "r", "existing": "e", "none": "n"}[prev["where"]]
+            default = {"local": "l", "remote": "r", "existing": "e", "router": "a", "none": "n"}[prev["where"]]
         elif cur_entry and not is_managed(cur_entry):
             default = "e"
         else:
@@ -1223,8 +1256,8 @@ def mcp_setup_interactive(setup: dict, hint: dict | None = None) -> None:
         if cur_entry:
             say(f"  current entry{'' if is_managed(cur_entry) else ' (not from llmt)'}: {entry_text(cur_entry)}")
         while True:
-            a = ask(f"{k}: [l]ocal, [r]emote, [e]xisting, [n]one", default).lower()[:1]
-            if a in ("l", "r", "e", "n"):
+            a = ask(f"{k}: [l]ocal, [r]emote, [a]uto (several machines), [e]xisting, [n]one", default).lower()[:1]
+            if a in ("l", "r", "a", "e", "n"):
                 break
         if a == "l":
             if k not in inst:
@@ -1248,6 +1281,16 @@ def mcp_setup_interactive(setup: dict, hint: dict | None = None) -> None:
                 spec = report_remote(k, host, root, spec)
             mcp[k] = spec
             last_host, last_root = host, root
+        elif a == "a":
+            if not (setup.get("router") or {}).get("hosts"):
+                say("  The router needs the machines it may use (docs/ROUTER.md):")
+                router_hosts_interactive(setup)
+            have = [n for n, keys in router_overview(setup).items() if k in keys]
+            if not have:
+                warn(f"no router machine has {k} installed yet (llmt router setup)")
+            else:
+                say(f"  {k} on: {', '.join(have)}")
+            mcp[k] = {"where": "router"}
         elif a == "e":
             spec = choose_existing(k, cur_entry, last_host)
             if spec:
@@ -1301,7 +1344,7 @@ def write_desktop_config(entries: dict, path: Path, drop: list[str]) -> None:
         servers[k] = e
     for k in drop:  # only entries llmt wrote (they run bin/mcp); others with the same name are left alone
         e = servers.get(k)
-        if e and "/bin/mcp" in " ".join([e.get("command", "")] + list(e.get("args", []))):
+        if e and is_managed(e):
             say(f"  {k}: removed (set to none)")
             servers.pop(k)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1406,6 +1449,9 @@ def mcp_test_one(key: str, entry: dict, timeout: float = 180) -> bool:
             r2 = wait_for(2, time.monotonic() + 60)
             tools = (r2 or {}).get("result", {}).get("tools", [])
             ok = bool(tools)
+            if "llmt-router" in str(info.get("name", "")) and len(tools) <= 1:
+                ok = False
+                say("    FAILED: the router reached no machine (only its machines() tool); llmt router status shows why")
             say(f"    {'ok' if ok else 'NO TOOLS'}: {info.get('name', '?')} {info.get('version', '')}, "
                 f"{len(tools)} tools, started in {t_init:.1f} s")
             if t_init > 30:
@@ -1638,10 +1684,13 @@ def cmd_deploy(a) -> None:
     if SHARED:
         die("deploy builds from a checkout (e.g. /opt/llm-translators/src), not from inside a release")
     prefix = prefix_of(a)
+    r = git("rev-parse", "HEAD", check=False)
+    if r.returncode != 0:
+        git_trouble(r.stderr, fatal=True)
     subs = submodule_states()
     keys = parse_keys(a.keys) if a.keys else [k for k in KEYS if subs.get(REGISTRY[k]["repo"], ("absent",))[0] != "absent"]
     if not keys:
-        die("no translator is checked out here: git submodule update --init (docs/SHARED.md)")
+        die("no translator is checked out here: sudo git submodule update --init (docs/SHARED.md)")
     problems = []
     for k in keys:
         repo = REGISTRY[k]["repo"]
@@ -1823,6 +1872,147 @@ def cmd_gc(a) -> None:
     for r in drop:
         shutil.rmtree(r)
         say(f"  removed {r.name}")
+
+
+# ---------------------------------------------------------------- the router (docs/ROUTER.md)
+
+def host_overview(h: dict) -> dict:
+    """{key: version} of the translators installed at a router machine (None: unreachable)."""
+    r_ = h["root"].rstrip("/")
+    r_ = '"$HOME' + r_[1:] + '"' if r_.startswith("~") else shlex.quote(r_)
+    script = f'r={r_}; "$r/llmt" status --json'
+    cmd = ([ssh_exe(), *SSH_OPTS, "-o", "ConnectTimeout=10", h["ssh"], script] if h.get("ssh")
+           else ["sh", "-c", script])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        data = json.loads(r.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    return {k: d.get("version") for k, d in data.get("translators", {}).items() if d.get("version")}
+
+
+_OVERVIEW: dict = {}
+
+
+def router_overview(setup: dict) -> dict:
+    out = {}
+    for h in (setup.get("router") or {}).get("hosts", []):
+        key = (h["name"], h.get("ssh"), h["root"])
+        if key not in _OVERVIEW:
+            _OVERVIEW[key] = host_overview(h)
+        out[h["name"]] = _OVERVIEW[key] or {}
+    return out
+
+
+def router_hosts_interactive(setup: dict) -> None:
+    rc = setup.setdefault("router", {})
+    hosts = rc.setdefault("hosts", [])
+    while True:
+        say("\n  Router machines:")
+        if not hosts:
+            say("    (none yet)")
+        for h in hosts:
+            ov = _OVERVIEW.pop((h["name"], h.get("ssh"), h["root"]), None) or host_overview(h)
+            _OVERVIEW[(h["name"], h.get("ssh"), h["root"])] = ov
+            tr = "unreachable" if ov is None else (", ".join(f"{k} {v}" for k, v in ov.items()) or "no translators")
+            flags = [f for f, on in (("preferred", h["name"] in rc.get("prefer", [])),
+                                     ("excluded", h["name"] in rc.get("exclude", []))) if on]
+            sp = rc.get("speed", {}).get(h["name"])
+            say(f"    {h['name']:10} {h.get('ssh') or '(this machine)'}:{h['root']}  {tr}"
+                + (f"  [{', '.join(flags)}]" if flags else "") + (f"  speed {sp}" if sp else ""))
+        a = ask("[a]dd, [r]emove, [p]refer, e[x]clude, [s]peed, [d]one", "a" if not hosts else "d").lower()[:1]
+        if a == "a":
+            ssh = ask("ssh user@host (empty: this machine)", "")
+            name = ask("short name", (ssh.split("@")[-1].split(".")[0] if ssh else platform.node().split(".")[0]) or "local")
+            guess = str(ROOT) if not ssh else "~/Software/llm-translators"
+            if ssh:
+                info = probe(ssh, guess)
+                if info and not info.get("llmt") and info.get("shared"):
+                    guess = info["shared"]
+                    say(f"  {ssh} has a shared install: {guess}")
+            root = ask("llm-translators folder there", guess)
+            hosts[:] = [h for h in hosts if h["name"] != name] + [{"name": name, "ssh": ssh, "root": root}]
+        elif a == "r":
+            n = ask("machine to remove", "")
+            hosts[:] = [h for h in hosts if h["name"] != n]
+        elif a == "p":
+            rc["prefer"] = [x for x in ask("preferred machines, in order (comma-separated)",
+                                           ",".join(rc.get("prefer", []))).replace(" ", "").split(",") if x]
+        elif a == "x":
+            rc["exclude"] = [x for x in ask("excluded machines (comma-separated)",
+                                            ",".join(rc.get("exclude", []))).replace(" ", "").split(",") if x]
+        elif a == "s":
+            cur = ",".join(f"{k}={v}" for k, v in rc.get("speed", {}).items())
+            sp = {}
+            for part in ask("speed factors, machine=factor (1 = normal, 0.8 = 20 % faster runs)", cur).split(","):
+                k_, _, v_ = part.strip().partition("=")
+                try:
+                    sp[k_] = float(v_)
+                except ValueError:
+                    pass
+            rc["speed"] = sp
+        else:
+            break
+    save_setup(setup)
+
+
+def cmd_router(a) -> None:
+    setup = load_setup()
+    if a.router_cmd == "setup":
+        if not sys.stdin.isatty():
+            die("router setup is interactive")
+        router_hosts_interactive(setup)
+        ov = router_overview(setup)
+        if not any(ov.values()):
+            return
+        mcp = setup.setdefault("mcp", {})
+        say("\n  Which translators should go through the router (one server, several machines)?")
+        changed = False
+        for k in KEYS:
+            on = [n for n, keys in ov.items() if k in keys]
+            if not on:
+                continue
+            now = mcp.get(k, {}).get("where") == "router"
+            if yes(f"{k} (on {', '.join(on)}) through the router?", now or len(on) > 1):
+                if not now:
+                    mcp[k] = {"where": "router"}
+                    changed = True
+            elif now:
+                warn(f"{k} stays on the router until you choose otherwise in llmt mcp setup")
+        save_setup(setup)
+        if changed or yes("Write the MCP entries into the Claude desktop config now?", True):
+            write_desktop_config(mcp_entries(setup), claude_desktop_config(),
+                                 [k for k, s in mcp.items() if s.get("where") == "none"])
+            say("  Then: llmt mcp test, and restart the Claude app.")
+    elif a.router_cmd == "status":
+        import importlib.util as _u
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("llmt_router", str(ROOT / "llmt_router.py"))
+        mod = _u.module_from_spec(_u.spec_from_loader("llmt_router", loader))
+        loader.exec_module(mod)
+        keys = parse_keys(a.keys) if a.keys else [k for k, s in setup.get("mcp", {}).items() if s.get("where") == "router"]
+        if not (setup.get("router") or {}).get("hosts"):
+            die("no router machines yet: llmt router setup")
+        for k in keys or KEYS:
+            data = mod.Router(k).machines()
+            say(f"\n{k}")
+            for m in data["machines"]:
+                if not m.get("reachable"):
+                    say(f"  {m['machine']:10} unreachable: {str(m.get('error', ''))[:120]}")
+                    continue
+                if not m.get("version"):
+                    say(f"  {m['machine']:10} {k} not installed")
+                    continue
+                ex = m.get("executor") or {}
+                sl = m.get("slurm") or {}
+                q = m.get("queue") or {}
+                use = (f"{sl.get('cpus_allocated')}/{sl.get('cpus')} CPUs in use, {q.get('running', 0)} running, "
+                       f"{q.get('waiting', 0)} waiting" if sl else f"load {m.get('load')} on {m.get('cores')} cores")
+                miss = m.get("backends_missing") or []
+                say(f"  {m['machine']:10} {m['version']:14} {ex.get('kind', 'local'):6} {use}; "
+                    f"typical job starts in {m.get('typical_job_start_min')} min"
+                    + (f"; MISSING {', '.join(miss)}" if miss else "")
+                    + ("  [preferred]" if m.get("preferred") else "") + ("  [excluded]" if m.get("excluded") else ""))
 
 
 # ---------------------------------------------------------------- commands
@@ -2338,6 +2528,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--system", action="store_true", help=f"the machine's file, {SYSTEM_ENV} (admin)")
     p = sub.add_parser("jobs", help="the translators' SLURM jobs on this machine")
     p.add_argument("keys", nargs="*")
+    p = sub.add_parser("router", help="one MCP server per translator over several machines (docs/ROUTER.md)")
+    rsub = p.add_subparsers(dest="router_cmd", required=True)
+    rsub.add_parser("setup", help="the machines, and which translators go through the router")
+    q = rsub.add_parser("status", help="the machines as the router sees them")
+    q.add_argument("keys", nargs="*")
     p = sub.add_parser("deploy", help="admin: build a shared release from this checkout and switch to it")
     p.add_argument("keys", nargs="*", help="default: every translator checked out here")
     p.add_argument("--prefix", help=f"default {DEFAULT_PREFIX} (LLMT_PREFIX)")
@@ -2382,7 +2577,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     {"setup": cmd_setup, "list": cmd_list, "install": cmd_install, "remove": cmd_remove, "status": cmd_status,
      "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "tune": cmd_tune, "jobs": cmd_jobs, "env": cmd_env,
-     "deploy": cmd_deploy, "releases": cmd_releases, "rollback": cmd_rollback, "gc": cmd_gc, "mcp": cmd_mcp}[a.cmd](a)
+     "deploy": cmd_deploy, "releases": cmd_releases, "rollback": cmd_rollback, "gc": cmd_gc, "router": cmd_router, "mcp": cmd_mcp}[a.cmd](a)
 
 
 if __name__ == "__main__":

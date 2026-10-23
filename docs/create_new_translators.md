@@ -148,7 +148,7 @@ The same functions and shapes as cfdt, so the model, the CLI and llm-translators
 | Function | Returns |
 |---|---|
 | `study_format()` | The format as JSON. Keep it compact, around 10–12 kB: kinds, parameters, units, conventions, one example. Also include `status: tool_status()`, so the model sees the backend and the run caps before it writes a study. |
-| `validate(studies)` | `{name: {ok, errors: [...], warnings: [...]}}`. Each error says the fix. Static only: no meshing, no backend run. It includes `run` against the caps. |
+| `validate(studies)` | `{name: {ok, errors: [...], warnings: [...], estimate: {minutes, procs, mem_mb}}}`. Each error says the fix. Static only: no meshing, no backend run. It includes `run` against the caps. The `estimate` lets the router place the run (docs/ROUTER.md, docs/EXECUTION.md "Estimates in validation"). |
 | `run(studies, solver, wait)` | Creates a request folder `<KEY>_OUT/run_<date>_<time>_<id>/`, with `request.json`, `studies.json`, and per study `<name>/` and `<name>/<name>.json`. Returns after at most `wait` seconds: `{request, translator, done, pending: [...], studies: {name: result}, progress: {name: {state, ...}}, next}`. |
 | `start(studies, solver)` | The same in the background: returns the request folder. |
 | `status(request, wait)` | The same shape, for an existing request. It works from any server process: read files and the queue, never in-memory handles. SLURM studies still pending are returned after at most about 15 s, because they don't need the server. |

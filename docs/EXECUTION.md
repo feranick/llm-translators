@@ -134,6 +134,20 @@ Threaded translators (feat) put threads in `procs_requested`/`procs_used` and le
 
 > Long studies run as SLURM jobs on the machine (when P_EXECUTOR=slurm): run_studies returns them pending with job ids. They do not depend on this conversation. Report the expected finish time and stop; do not poll. Later, study_status(request) collects them; jobs() lists recent and active runs (also those started in other conversations); cancel(request) stops them.
 
+## Estimates in validation (for the router)
+
+`validate_studies` returns, for each valid study, the estimate the translator would use to size its job:
+
+```json
+{"ar": {"ok": true, "errors": [], "warnings": [], "estimate": {"minutes": 18.0, "procs": 9, "mem_mb": 6000}}}
+```
+
+- **`minutes`:** the expected run time with `procs` ranks or threads; an upper bound is fine.
+- **`procs`:** the ranks or threads the study can use, after the size cap (see "Sizing jobs").
+- **`mem_mb`:** the memory it will need.
+
+llm-translators' router (docs/ROUTER.md) reads these to place a run on the machine where it should finish first. Without them, it places by start time only. They come from the same functions that size SLURM jobs, so they cost nothing extra.
+
 ## Status for llm-translators
 
 `tool_status()` (`<cli> status`) adds:

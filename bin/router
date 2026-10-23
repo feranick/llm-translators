@@ -1,0 +1,7 @@
+#!/bin/sh
+# One MCP server for a translator over several machines (docs/ROUTER.md): bin/router KEY
+# This is what the Claude app runs for an entry placed on [a]uto. It prints nothing but MCP on stdout.
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+PY=python3
+[ -x "$ROOT/.venv/bin/python" ] && PY="$ROOT/.venv/bin/python"
+exec "$PY" "$ROOT/llmt_router.py" "$@"
