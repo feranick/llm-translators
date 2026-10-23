@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.23.4
+Version: 2026.10.23.5
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -28,7 +28,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.23.4"
+__version__ = "2026.10.23.5"
 
 HERE = Path(__file__).resolve().parent
 
@@ -51,6 +51,7 @@ STATUS_WAIT = 12.0       # how long a placement waits for machines it has no ans
 BUDGET = 50.0            # every tool call is answered within this: the Claude app gives up after about 60 s
 START_TTL = 30.0
 CALL_TIMEOUT = 600.0
+STALE_MARK = "STALE_SERVER"    # a translator server refusing a call because a newer release is installed (it exits)
 PLACE_ARGS = ("studies", "goals")
 PATH_ARGS = ("request", "bench", "study_folder", "path")
 ALL_TOOLS = {"jobs", "list_geometry"}
@@ -518,13 +519,39 @@ class Router:
                 args = dict(args, wait_s=max(0.0, min(want, rem - 8.0)))
             timeout = max(3.0, rem)
         try:
-            return self.child(name, timeout=timeout).request("tools/call", {"name": tool, "arguments": args},
-                                                             timeout=timeout)
+            for attempt in (0, 1):
+                c = self.child(name, timeout=timeout)
+                try:
+                    r = c.request("tools/call", {"name": tool, "arguments": args}, timeout=timeout)
+                except ChildError as exc:
+                    if attempt or not self.stale_child(c, str(exc)):
+                        raise
+                    continue
+                if attempt or not (r.get("isError") and self.stale_child(c, json.dumps(r.get("content", "")))):
+                    return r
+            return r
         except ChildError as exc:
             if "no answer" in str(exc):
                 raise ChildError(f"{name} did not answer {tool} in time (an MCP call must end within a minute). It may "
                                  f"still be working there: look with jobs() or study_status before running it again")
             raise
+
+    def stale_child(self, c: Child, text: str) -> bool:
+        """True when the server refused the call (or ended) because a newer release is installed there (it says
+        STALE_SERVER and exits while idle, so nothing of the call ran): the child is dropped and the call can be
+        repeated on a new server, which runs the installed release."""
+        if "server ended" in text or "connection is closed" in text:
+            time.sleep(0.3)                             # its last stderr line may still be on the way
+            text += c.tail()
+        if STALE_MARK not in text:
+            return False
+        log(f"{c.host['name']}: its server runs an old release; starting a new one")
+        with self.child_lock:
+            pool = self.children.get(c.host["name"], [])
+            if c in pool:
+                pool.remove(c)
+        c.close()
+        return True
 
     def call_all(self, names: list, tool: str, args: dict, deadline: float | None = None) -> dict:
         res: dict = {}

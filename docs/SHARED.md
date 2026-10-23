@@ -126,6 +126,8 @@ Nothing new, but a shared release makes it a requirement: a translator writes on
 - omct's build cache is `OMCT_CACHE`, under `~/omct_runs`.
 - omct's job scripts put the package's folder on `PYTHONPATH`. That is the release's copy, which is correct.
 
+A running server keeps the release it started from (`bin/mcp` resolves `current` once), and the router keeps its servers for hours. So after a deploy a translator's server should notice that `<prefix>/current` now points to another release and, while idle, refuse a call with a message containing `STALE_SERVER` and exit. The router (2026.10.23.5) then drops that server and repeats the call once on a new one. omct does this since 2026.10.23.3 (an idle stale server also exits within 20 s by itself). The other translators don't yet; their servers pick up a new release only when the Claude app (and with it the router) restarts.
+
 Libraries a backend installs per user, such as OpenModelica's `~/.openmodelica/libraries`, are better installed once by the admin. Point to them in the machine file, e.g. `OPENMODELICALIBRARY=/opt/openmodelica/libraries`.
 
 ## Security notes
