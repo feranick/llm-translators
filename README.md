@@ -195,6 +195,10 @@ Installing is skipped. Setup shows the release and its translators, offers the `
 
 **Each user, on their Mac:** layout B, Mac part. In step 4 → *remote*, setup finds `/opt/llm-translators/current` on the host and proposes it as the folder.
 
+munge -n | ssh 100.77.175.91 unmunge | grep STATUS         # Success = same key
+sinfo -N -o "%N %t %E"                                    # both nodes, idle
+sudo scontrol update nodename=spark-5da5,spark-0808 state=resume   # if either is down
+
 **Updates:**
 
 ```bash
