@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.23.1
+Version: 2026.10.23.2
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -28,7 +28,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.23.1"
+__version__ = "2026.10.23.2"
 
 HERE = Path(__file__).resolve().parent
 
@@ -289,7 +289,8 @@ class Router:
                 jobs = [j for j in sl.get("jobs", []) if j.get("key") == self.key]
                 out.update(reachable=True, mode=data.get("mode"), release=(data.get("release") or {}).get("release"),
                            version=d.get("version"), backends_missing=miss, executor=ex,
-                           slurm={k: sl.get(k) for k in ("cpus", "cpus_allocated", "time_limit", "state")} if sl else None,
+                           slurm={k: sl.get(k) for k in ("cpus", "cpus_allocated", "time_limit", "state", "nodes_usable")}
+                           if sl else None,
                            queue={"running": sum(1 for j in jobs if j.get("state") == "RUNNING"),
                                   "waiting": sum(1 for j in jobs if j.get("state") != "RUNNING")} if sl else None)
             nums = [x for x in re.split(r"[\s{}]+", load) if x]
@@ -338,6 +339,8 @@ class Router:
     def expected_start(self, name: str, st: dict, procs: int, minutes: float, mem_mb: float | None) -> tuple:
         """Minutes until a job of this size would start on the machine, and why."""
         ex = st.get("executor") or {}
+        if ex.get("kind") == "slurm" and st.get("slurm") and st["slurm"].get("nodes_usable") == 0:
+            return None, f"its SLURM node is {st['slurm'].get('state')}"
         if ex.get("kind") == "slurm" and st.get("slurm"):
             kind = (self.t.get("executor") or {}).get("kind", "mpi")
             size = f"-n {procs}" if kind == "mpi" else f"-n 1 -c {procs}"
@@ -365,8 +368,7 @@ class Router:
             except (OSError, subprocess.TimeoutExpired) as exc:
                 res = (None, f"sbatch --test-only failed: {exc}")
             self.start_cache[ck] = (time.time(), res)
-            if res[0] is not None:
-                return res
+            return res                       # a SLURM machine without a start time is not judged by its load
         load, cores = st.get("load"), st.get("cores")
         if load is None or not cores:
             return 0.0, "load unknown"
@@ -601,7 +603,12 @@ class Router:
             e = est.get(n, {})
             minutes = e.get("minutes")
             start, why = starts.get(n, (None, "no queue estimate in time"))
-            start = start if start is not None else 0.0
+            if start is None:
+                if (st.get("executor") or {}).get("kind") == "slurm":
+                    start = 1e6                # SLURM gave no start time (node down? limits?): only as a last resort
+                    why = "SLURM gives no start time: " + why
+                else:
+                    start = 0.0
             run_min = (minutes or 0) * float(self.speed.get(n, 1.0))
             small = minutes is not None and minutes < self.small
             score = start + (0 if small else run_min) - (0.5 * (len(self.prefer) - self.prefer.index(n))
@@ -617,6 +624,40 @@ class Router:
         if warnings:
             info["warnings"] = warnings
         return best["machine"], send, info
+
+    @staticmethod
+    def take_host(args: dict) -> tuple:
+        """-> (machines named in run.host, args without run.host) for studies / goals / study arguments."""
+        pinned: list = []
+        out = dict(args)
+        for a in (*PLACE_ARGS, "study"):
+            v = args.get(a)
+            if not isinstance(v, dict):
+                continue
+            items = {"_": v} if a == "study" else v
+            new = {}
+            for k, st in items.items():
+                if isinstance(st, dict) and isinstance(st.get("run"), dict) and "host" in st["run"]:
+                    st = copy.deepcopy(st)
+                    want = st["run"].pop("host")
+                    for m in ([want] if isinstance(want, str) else list(want or [])):
+                        if m not in pinned:
+                            pinned.append(m)
+                    if not st["run"]:
+                        st.pop("run")
+                new[k] = st
+            out[a] = new["_"] if a == "study" else new
+        return pinned, out
+
+    @staticmethod
+    def put_host(args: dict, pinned: list) -> dict:
+        """Puts run.host back on every study, for place() to read (it removes it again before sending)."""
+        out = dict(args)
+        for a in PLACE_ARGS:
+            if isinstance(args.get(a), dict):
+                out[a] = {k: ({**st, "run": {**(st.get("run") or {}), "host": pinned}} if isinstance(st, dict) else st)
+                          for k, st in args[a].items()}
+        return out
 
     def route_path(self, args: dict) -> tuple:
         """-> (machine or None, args) for a call about an existing request or file."""
@@ -662,6 +703,17 @@ class Router:
                 sts = self.statuses([h["name"] for h in self.ordered()])
                 names = [n for n in self.candidates(sts)] or [n for n, s in sts.items() if s.get("reachable")]
                 return self.text_result({"machines": self.call_all(names, tool, args, deadline)})
+            pinned, args = self.take_host(args)
+            if pinned and not (tool == "run_benchmarks" or (not tool.startswith(("validate_", "get_")) and
+                                                           any(isinstance(args.get(a), dict) for a in PLACE_ARGS))):
+                sts = self.statuses([h["name"] for h in self.ordered()])
+                n = next((m for m in pinned if sts.get(m, {}).get("reachable")), None)
+                if n is None:
+                    raise ValueError(f"run.host: {', '.join(pinned)} does not answer now")
+                r = self.call(n, tool, args, deadline)
+                return self.with_fields(r, {"machine": n})
+            if pinned:                                                   # placement reads it back from the studies
+                args = self.put_host(args, pinned)
             starts_work = tool == "run_benchmarks" or (not tool.startswith(("validate_", "get_")) and
                                                         any(isinstance(args.get(a), dict) for a in PLACE_ARGS))
             if starts_work:

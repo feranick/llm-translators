@@ -48,7 +48,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.10.22.3"
+__version__ = "2026.10.23.2"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -536,13 +536,22 @@ def slurm_info() -> dict | None:
     if not sb:
         return None
     info = {"sbatch": sb}
+    nodes = slurm_nodes()
+    if nodes:                       # per node (scontrol): robust to several partitions or node groups in sinfo
+        ok = [n for n in nodes if n["usable"]]
+        use = ok or nodes
+        info.update(cpus=sum(n["cpus"] for n in use), cpus_allocated=sum(n["alloc"] for n in use),
+                    nodes=",".join(n["name"] for n in nodes), state=use[0]["state"],
+                    nodes_usable=len(ok), mem_mb=str(sum(n["mem"] for n in use)))
     try:
         r = subprocess.run(["sinfo", "-h", "-o", "%C|%m|%l|%N|%t"], capture_output=True, text=True, timeout=20)
         line = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else ""
         if line:
-            c, mem, lim, nodes, st = (line.split("|") + [""] * 5)[:5]
+            c, mem, lim, nodes_, st = (line.split("|") + [""] * 5)[:5]
             a, i, o, t = (c.split("/") + ["0"] * 4)[:4]
-            info.update(cpus=int(t), cpus_allocated=int(a), mem_mb=mem, time_limit=lim, nodes=nodes, state=st)
+            info["time_limit"] = lim
+            if not nodes:
+                info.update(cpus=int(t), cpus_allocated=int(a), mem_mb=mem, nodes=nodes_, state=st)
         else:
             info["error"] = (r.stderr or "sinfo printed nothing").strip()[-200:]
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
@@ -556,6 +565,30 @@ def slurm_info() -> dict | None:
     except (OSError, subprocess.TimeoutExpired):
         pass
     return info
+
+
+def slurm_nodes() -> list[dict]:
+    """Each SLURM node (scontrol -o show node): name, state, usable, CPUs, allocated CPUs, memory (MB)."""
+    try:
+        r = subprocess.run(["scontrol", "-o", "show", "node"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        f = dict(kv.split("=", 1) for kv in line.split() if "=" in kv)
+        if "NodeName" not in f:
+            continue
+        flags = f.get("State", "").upper().split("+")
+        st = flags[0].lower() if flags and flags[0] else "?"
+        bad = st.rstrip("*") in ("down", "drain", "fail", "future", "inval", "unknown") or \
+            any(x in ("DRAIN", "DRAINED", "DRAINING", "NOT_RESPONDING", "FAIL") for x in flags[1:])
+        try:
+            out.append({"name": f["NodeName"], "state": st + ("+" + "+".join(flags[1:]).lower() if len(flags) > 1 else ""),
+                        "usable": not bad, "cpus": int(f.get("CPUTot", 0) or 0), "alloc": int(f.get("CPUAlloc", 0) or 0),
+                        "mem": int(f.get("RealMemory", 0) or 0)})
+        except ValueError:
+            continue
+    return out
 
 
 def slurm_jobs() -> list[dict]:
@@ -582,7 +615,8 @@ def slurm_notes(info: dict) -> list[str]:
     out = []
     if info.get("error"):
         out.append(f"sbatch is here but sinfo failed ({info['error']}): is slurmctld running?")
-    if info.get("state", "").rstrip("*") in ("down", "drain", "drng", "fail"):
+    if info.get("nodes_usable") == 0 or (info.get("nodes_usable") is None and
+                                          info.get("state", "").rstrip("*") in ("down", "drain", "drng", "fail")):
         out.append(f"the node is '{info['state']}': jobs will wait until it is back (scontrol update ... state=resume)")
     if info.get("SelectType", "").endswith("linear"):
         out.append("SelectType=select/linear gives each job the whole machine: studies run one at a time "
