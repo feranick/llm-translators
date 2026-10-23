@@ -1567,7 +1567,7 @@ def setup_shared(setup: dict) -> None:
         return
     alias_interactive(setup)
     say("\nMCP servers")
-    has_app = sys.platform == "darwin" or os.name == "nt" or claude_desktop_config().exists()
+    has_app = has_claude_app()
     if yes("Will a Claude app on this machine use the translators?", has_app):
         mcp_setup_interactive(setup, hint={k: "here" for k in setup.get("installed", [])})
     else:
@@ -1956,11 +1956,21 @@ def router_hosts_interactive(setup: dict) -> None:
     save_setup(setup)
 
 
+def has_claude_app() -> bool:
+    """A Claude desktop app is (probably) used on this machine."""
+    return sys.platform == "darwin" or os.name == "nt" or claude_desktop_config().exists()
+
+
 def cmd_router(a) -> None:
     setup = load_setup()
     if a.router_cmd == "setup":
         if not sys.stdin.isatty():
             die("router setup is interactive")
+        if not has_claude_app():
+            say("The router runs where the Claude app runs (usually your Mac), and reaches the servers over ssh.")
+            say("This machine has no Claude app, so a router here would serve nobody (docs/ROUTER.md).")
+            if not yes("Set it up here anyway?", False):
+                return
         router_hosts_interactive(setup)
         ov = router_overview(setup)
         if not any(ov.values()):
@@ -2059,7 +2069,7 @@ def cmd_setup(a) -> None:
     say("      app here reaches it over ssh. Nothing is installed here for it; step 4 asks for the host.")
     say("  n = not used from this machine")
     say("  On a workstation that only serves translators to other machines, answer h for what it runs.")
-    has_app = sys.platform == "darwin" or os.name == "nt" or claude_desktop_config().exists()
+    has_app = has_claude_app()
     prev_mcp = setup.get("mcp", {})
     inst = set(installed_in_venv())
     place = {}
