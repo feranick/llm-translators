@@ -146,7 +146,9 @@ Threaded translators (feat) put threads in `procs_requested`/`procs_used` and le
 - **`procs`:** the ranks or threads the study can use, after the size cap (see "Sizing jobs").
 - **`mem_mb`:** the memory it will need.
 
-llm-translators' router (docs/ROUTER.md) reads these to place a run on the machine where it should finish first. Without them, it places by start time only. They come from the same functions that size SLURM jobs, so they cost nothing extra. Implemented in omct 2026.10.22.1 (`executor.estimate`: `cpus_for_job`, `mem_for_job`, `estimate_minutes`) and lmpt 2026.10.22.1 (`executor.sizing`: `ranks_for`, `mem_mb_for`, `estimate_minutes`).
+llm-translators' router (docs/ROUTER.md) reads these to place a run on the machine where it should finish first. Without them, it places by start time only. They come from the same functions that size SLURM jobs, so they cost nothing extra.
+
+- **Status.** cfdt 2026.10.22.10: `executor.estimate` (ranks after the cells-per-rank cap, `--mem` as the job asks, minutes from cells × iterations or time steps × 4.6e-6 s per cell-iteration / rank speed-up, measured on mochi, plus meshing and results, +30 %; also `cells`). No estimate for a STEP geometry (its cells cannot be told before meshing). Implemented in omct 2026.10.22.1 (`executor.estimate`: `cpus_for_job`, `mem_for_job`, `estimate_minutes`) and lmpt 2026.10.22.1 (`executor.sizing`: `ranks_for`, `mem_mb_for`, `estimate_minutes`).
 
 ## Status for llm-translators
 
