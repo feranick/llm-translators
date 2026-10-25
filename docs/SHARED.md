@@ -126,7 +126,16 @@ Nothing new, but a shared release makes it a requirement: a translator writes on
 - omct's build cache is `OMCT_CACHE`, under `~/omct_runs`.
 - omct's job scripts put the package's folder on `PYTHONPATH`. That is the release's copy, which is correct.
 
-A running server keeps the release it started from (`bin/mcp` resolves `current` once), and the router keeps its servers for hours. So after a deploy a translator's server should notice that `<prefix>/current` now points to another release and, while idle, refuse a call with a message containing `STALE_SERVER` and exit. The router (2026.10.23.5) then drops that server and repeats the call once on a new one. omct does this since 2026.10.23.3 (an idle stale server also exits within 20 s by itself). The other translators don't yet; their servers pick up a new release only when the Claude app (and with it the router) restarts.
+A running server keeps the release it started from (`bin/mcp` resolves `current` once), and the router keeps its servers for hours. So after a deploy a translator's server should notice that `<prefix>/current` now points to another release and, while idle, refuse a call with a message containing `STALE_SERVER` and exit. The router (2026.10.23.5) then drops that server and repeats the call once on a new one. Implemented by all four (2026-10-25):
+
+- **omct** 2026.10.23.3. An idle stale server also exits within 20 s by itself. Since 2026.10.25.1, only a running server refuses calls or exits; tests and `run-study` run normally in a release that is not yet current.
+- **cfdt** 2026.10.25.4 (`CFDT_EXIT_WHEN_STALE`; only a server started by `main()` refuses or exits).
+- **lmpt** 2026.10.25.1 (`stale.py`, as cfdt; `LMPT_EXIT_WHEN_STALE`, `LMPT_STALE_CHECK_S` 20 s).
+  - A busy server (a call in progress, or a study in its local worker pool) still answers, adds a `server_stale` note, and exits once idle.
+  - In a checkout, a changed `__init__.py` version also counts as stale.
+- **feat** 2026.10.25.1 (`FEAT_EXIT_WHEN_STALE`; only a server started by `main()` refuses or exits).
+
+`<KEY>_EXIT_WHEN_STALE`: `1` always, `0` never; by default only servers from a shared release exit.
 
 Libraries a backend installs per user, such as OpenModelica's `~/.openmodelica/libraries`, are better installed once by the admin. Point to them in the machine file, e.g. `OPENMODELICALIBRARY=/opt/openmodelica/libraries`.
 
