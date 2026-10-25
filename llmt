@@ -43,12 +43,13 @@ import shutil
 import textwrap
 import signal
 import subprocess
+import tempfile
 import sys
 import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.10.23.6"
+__version__ = "2026.10.25.1"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -2473,9 +2474,22 @@ def cmd_test(a) -> None:
         say(f"\n=== {k}: pytest")
         extra = ["-p", "no:cacheprovider"] if SHARED else []
         env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"} if SHARED else None
-        r = subprocess.run([str(ROOT / "bin" / "run"), "python", "-m", "pytest", "-q", *extra, *a.pytest_args],
-                           cwd=ROOT / REGISTRY[k]["repo"], env=env)
-        results[k] = r.returncode
+        # pytest writes a JUnit report at the very end: a run that ends without it (a test that killed the process,
+        # e.g. with os._exit(0)) is a failure even with exit code 0 (omct 2026.10.23.3 under deploy --test)
+        fd, junit = tempfile.mkstemp(prefix=f"llmt-{k}-", suffix=".xml")
+        os.close(fd)
+        os.unlink(junit)
+        try:
+            r = subprocess.run([str(ROOT / "bin" / "run"), "python", "-m", "pytest", "-q", *extra,
+                                f"--junit-xml={junit}", *a.pytest_args], cwd=ROOT / REGISTRY[k]["repo"], env=env)
+            rc = r.returncode
+            if rc == 0 and not os.path.exists(junit):
+                warn(f"{k}: pytest exited with 0 but did not finish (no report): counted as a failure")
+                rc = 1
+        finally:
+            if os.path.exists(junit):
+                os.unlink(junit)
+        results[k] = rc
     say("\n" + "  ".join(f"{k}: {'pass' if rc == 0 else 'FAIL'}" for k, rc in results.items()))
     sys.exit(0 if all(rc == 0 for rc in results.values()) else 1)
 

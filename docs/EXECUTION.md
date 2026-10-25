@@ -164,6 +164,7 @@ A machine can be one node of a SLURM cluster with several nodes. For example, th
   A `--nodelist` or `-w` in `P_SLURM_ARGS` wins. On a single-node cluster the setting changes nothing.
 - **Estimates.** `sbatch --test-only` (the router's start estimate) uses the same `--nodelist`.
 - **Status.** `tool_status().executor` reports `"node": {"setting": "local", "nodelist": "spark-5da5", "cluster_nodes": 2}`, with `nodelist: null` when SLURM may choose. `llmt` and the router read it to show this node and to estimate on it.
+- **Implemented:** cfdt 2026.10.25.2 (also caps ranks at the node's cores: CPUs / threads per core from `sinfo -N`, since jobs ask for one rank per core; mochi's 40 CPUs at 2 threads per core give 20).
 
 What llm-translators does:
 

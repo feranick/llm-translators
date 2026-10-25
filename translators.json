@@ -93,7 +93,7 @@
     "CFDT_CELLS_PER_RANK": "at most cells/N MPI ranks, so small cases run serially (default 5000)",
     "CFDT_MAX_TIMEOUT": "ceiling for a study's run.timeout_s (seconds; unset: none)",
     "CFDT_MAX_MEM": "ceiling for a study's run.mem (e.g. 32G; unset: none)",
-    "CFDT_MAX_PROCS": "ceiling for a study's run.procs / solve.procs (unset: none)"
+    "CFDT_MAX_PROCS": "ceiling for a study's run.procs / solve.procs (unset: none; with SLURM also a node's cores)"
    }
   },
   "lmpt": {
