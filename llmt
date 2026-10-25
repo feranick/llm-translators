@@ -323,6 +323,34 @@ def env_read(path: Path | None = None) -> dict[str, str]:
     return vals
 
 
+def env_problems(path: Path) -> list[str]:
+    """Lines of a settings file the shell would misread: a value with spaces and no quotes runs its second word
+    as a command (e.g. CFDT_SLURM_ARGS=--mem=8G --nodelist=x: "--nodelist=x: not found", and the variable is lost)."""
+    out = []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return out
+    for i, line in enumerate(lines, 1):
+        t = line.strip()
+        if not t or t.startswith("#"):
+            continue
+        m = re.match(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", t)
+        if not m:
+            out.append(f"{path}:{i}: not VAR=value: {t[:80]}")
+            continue
+        val = m.group(2)
+        try:
+            words = shlex.split(val, comments=True)
+        except ValueError as exc:
+            out.append(f"{path}:{i}: {m.group(1)}: {exc}")
+            continue
+        if len(words) > 1:
+            out.append(f"{path}:{i}: {m.group(1)} has spaces without quotes: write "
+                       f"{m.group(1)}={shlex.quote(' '.join(words))}")
+    return out
+
+
 def env_effective() -> dict[str, str]:
     """The settings as bin/run loads them: the machine's file, then the user's, then (a release) the machine's caps."""
     sysv = env_read(SYSTEM_ENV) if SYSTEM_ENV != ENV_FILE else {}
@@ -1044,6 +1072,9 @@ def print_status(data: dict, verbose: bool) -> None:
         say(f"llm-translators {data['llmt']}  ({data['root']})")
     if data.get("settings"):
         say("settings: " + ", then ".join(data["settings"]))
+        for f in data["settings"]:
+            for prob in env_problems(Path(f)):
+                say(f"  ! {prob}")
     say(f"venv: {data['venv'] or 'none (llmt setup)'}" + (f"  Python {data['python']}" if data["python"] else ""))
     say("")
     say(f"  {'key':5} {'version':14} {'commit':8} {'submodule':10} backends")
@@ -1820,6 +1851,11 @@ def cmd_deploy(a) -> None:
         probe_f.unlink()
     except OSError:
         die(f"no write access to {prefix}: run as the admin (sudo ./llmt deploy) or choose --prefix")
+    bad = env_problems(SYSTEM_ENV)
+    if bad:
+        for b in bad:
+            warn(b)
+        die(f"fix {SYSTEM_ENV} first (sudo ./llmt env --system --edit): every server sources it")
     name = next_release_name(prefix)
     rel = prefix / "releases" / name
     say(f"Building release {name} in {rel} ({', '.join(keys)})")
