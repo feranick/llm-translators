@@ -1,6 +1,6 @@
 # The router: one translator, several machines
 
-Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1.
+Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2.
 
 Until now, each MCP entry in the Claude app pointed to one machine (`ssh mochi .../bin/mcp cfdt`). With several machines able to run a translator (mochi, carbonio, a DGX Spark), choosing one by hand wastes the others, and one entry per machine (`cfdt-mochi`, `cfdt-carbonio`, ...) multiplies the tools in every chat.
 
@@ -99,7 +99,7 @@ The results stay as the translator wrote them; their paths are real paths on the
 | `jobs(...)`, `list_geometry()` | all machines | asked in parallel and combined: `{"machines": {name: result}}` |
 | `add_geometry(...)` | all machines | sent to every machine, so a registered geometry works wherever a run goes |
 | `study_format`, `goal_format`, `get_case` / `get_inputs` / `get_model` and other calls | the preferred machine | the first one that answers |
-| `machines()` | the router itself | each machine: reachable, mode (release or checkout), version, backends, executor, CPUs and their use, the translator's queued and running jobs, load, expected start of a typical job, speed, preferred or excluded |
+| `machines()` | the router itself | each machine: reachable, mode (release or checkout), `release`, `version` (installed), `serving` (what the server process the router uses runs; `server_stale` and a `note` when it differs), backends, executor, CPUs and their use, the translator's queued and running jobs, load, expected start of a typical job, speed, preferred or excluded |
 
 Answers from a single machine get `"machine": "<name>"` at the top.
 
@@ -132,6 +132,28 @@ An entry through the router:
 ```
 
 `llmt mcp test cfdt` tests it like any entry: the handshake goes through the router to the first machine.
+
+## Servers that run an old release
+
+**What happened** (incident 2026-10-25, cfdt on spark2). `machines()` listed cfdt 2026.10.25.6, the installed version. The server process the router used, though, ran 2026.10.22.10.
+
+- **How it got there.** It had started under a release built before the cfdt pin was moved.
+- **Why it stayed.** It was older than the stale-server rule (docs/SHARED.md), so it never exited after the deploy.
+- **The damage.** Every job it submitted ran its old code too, since a job runs the Python of the server that submitted it.
+
+**What the router does now:**
+
+- **Learns what each server runs.** Each server process reports the version it runs as `"translator"` in its answers (`jobs()`, `study_format`'s status). The router records it for each connection. It asks when it opens a connection, and reads it from every answer afterwards.
+- **Shows it.** `machines()` shows it as `serving`, next to `version` (installed, from `llmt status`) and `release`. When they differ: `server_stale: true`, with a note.
+- **Replaces such a server.** A server whose version differs from the installed one is retired:
+  - closed at once if idle, otherwise as soon as its calls finish;
+  - the next call starts a server on the installed release;
+  - the router's log says so.
+
+  The installed version must come from a status asked *after* that server started; otherwise the router asks again first, so it never closes a server that is newer than its information.
+- **Translators that exit by themselves** (`STALE_SERVER`) keep working as before. This is the backstop for servers that don't.
+
+On a machine, `llmt servers` lists the running servers and their releases, and `llmt servers --stop` ends those not on `current` (docs/SHARED.md).
 
 ## Time limits
 

@@ -1,6 +1,6 @@
 # A shared install for all users
 
-Status: design and implementation, llmt 2026.10.22.1.
+Status: design and implementation, llmt 2026.10.22.1; old servers and pin check 2026.10.25.2.
 
 Today each user who runs the translators on a server (mochi, carbonio, a DGX Spark) has a personal llm-translators checkout with its own venv, and has to keep it up to date. This design adds a **shared install**:
 
@@ -66,6 +66,7 @@ A personal checkout also reads `/etc/llm-translators/env` first, so its backend 
 | `llmt deploy [KEY...] [--prefix P] [--python PY] [--test] [--bench] [--no-switch]` | Builds a new release and switches `current` to it (detailed below) |
 | `llmt releases` | Lists the releases, with which one is current, their translators and versions, and whether they are in use |
 | `llmt rollback [RELEASE]` | Switches `current` back to the previous release (or the one named) |
+| `llmt servers [--stop]` | Lists the translator MCP servers running on the machine (user, release) and flags those not on `current`; `--stop` ends them (SIGTERM), never jobs or other processes |
 | `llmt gc [--keep N]` | Deletes old releases: never `current`, never one in use, and always keeps the newest N (default 3) |
 | `llmt tune --system`, `llmt env --system [--edit]` | Machine settings in `/etc/llm-translators/env` |
 
@@ -136,6 +137,19 @@ A running server keeps the release it started from (`bin/mcp` resolves `current`
 - **feat** 2026.10.25.1 (`FEAT_EXIT_WHEN_STALE`; only a server started by `main()` refuses or exits).
 
 `<KEY>_EXIT_WHEN_STALE`: `1` always, `0` never; by default only servers from a shared release exit.
+
+**Backstops** (llmt 2026.10.25.2):
+
+- **The router.** It compares the version each server process reports (`"translator"` in its answers) with the installed one. It shows it as `serving` / `server_stale` in `machines()`, and closes such a server once idle (docs/ROUTER.md, "Servers that run an old release"). This catches servers older than the rule above, which never exit.
+- **`llmt servers [--stop]`,** run on the machine as the admin.
+  - It lists the running translator MCP servers: each process whose program or script is `<root>/.venv/bin/<key>-mcp`, with its user and its release. The path is resolved with `readlink -f`, so a symlinked prefix works.
+  - It flags those whose release is not `current`.
+  - **`--stop`** sends SIGTERM to those only. It never touches SLURM jobs (`<key> run-study`), personal checkouts, or its own command line, so `ssh host 'sudo .../llmt servers --stop'` is safe.
+
+  Jobs already running keep their code. Only new submissions use the new release.
+- **`llmt deploy`'s pin check.** Before building, it shows each translator's pinned commit and version against the newest commit on its tracked branch. When a pin is behind, it warns, and asks in interactive use. This catches a deploy made before `llmt pin` was committed and pulled, which is how the old cfdt reached spark2.
+  - `--yes` only warns.
+  - `--no-pin-check` skips the check, e.g. without network access.
 
 Libraries a backend installs per user, such as OpenModelica's `~/.openmodelica/libraries`, are better installed once by the admin. Point to them in the machine file, e.g. `OPENMODELICALIBRARY=/opt/openmodelica/libraries`.
 

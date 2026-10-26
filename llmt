@@ -19,6 +19,7 @@
 Shared install for all users (docs/SHARED.md), admin commands run from a checkout:
     llmt deploy [KEY...] [--test] [--bench] [--prefix P]   build a release in /opt/llm-translators and switch to it
     llmt releases | rollback [RELEASE] | gc [--keep N]     list, switch back, remove unused old releases
+    llmt servers [--stop]                                  the translator MCP servers running here; end old-release ones
     llmt mcp setup                  choose local / remote (ssh) / auto (router) / existing install / none per translator
     llmt router setup | status [KEY...]   one server per translator over several machines (docs/ROUTER.md)
     llmt mcp config [--print | --claude-code | --file F]   write or print the MCP client entries
@@ -49,7 +50,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.10.25.1"
+__version__ = "2026.10.25.2"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -1816,6 +1817,145 @@ def make_readonly(root: Path) -> None:
             os.chmod(p, (m | 0o444 | (0o111 if m & 0o100 else 0)) & ~0o022)
 
 
+def pin_report(path: Path, url: str, branch: str, package: str) -> dict:
+    """The checked-out (pinned) commit of a translator against the newest commit of its tracked branch:
+    {pinned, pinned_version, newest, newest_version, behind, ahead} or {error}."""
+    def g(*args, check=True):
+        r = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=120)
+        if check and r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout).strip()
+                               else f"git {' '.join(args)} failed")
+        return r.stdout.strip()
+
+    def version(ref: str) -> str | None:
+        r = subprocess.run(["git", "-C", str(path), "show", f"{ref}:{package}/__init__.py"],
+                           capture_output=True, text=True, timeout=30)
+        m = re.search(r"__version__\s*=\s*[\"']([^\"']+)", r.stdout)
+        return m.group(1) if m else None
+    try:
+        head = g("rev-parse", "HEAD")
+        g("fetch", "--quiet", url or "origin", branch)
+        newest = g("rev-parse", "FETCH_HEAD")
+        behind = int(g("rev-list", "--count", f"{head}..{newest}") or 0)
+        ahead = int(g("rev-list", "--count", f"{newest}..{head}") or 0)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return {"error": str(exc)[:200]}
+    return {"pinned": head[:7], "pinned_version": version(head), "newest": newest[:7],
+            "newest_version": version(newest), "behind": behind, "ahead": ahead}
+
+
+def check_pins(keys: list[str], interactive: bool) -> None:
+    """Before a deploy: each translator's pin against its newest commit. A pin that is behind means the umbrella
+    was not re-pinned (llmt pin) before this deploy, so the release would carry the older translator."""
+    say("Pins against each translator's newest commit (on its tracked branch):")
+    behind = []
+    for k in keys:
+        repo = REGISTRY[k]["repo"]
+        rep_ = pin_report(ROOT / repo, submodule_url(repo), submodule_branch(repo), REGISTRY[k]["package"])
+        if "error" in rep_:
+            say(f"  {k:5} pinned {git('-C', repo, 'rev-parse', '--short', 'HEAD', check=False).stdout.strip()}: "
+                f"could not read the newest commit ({rep_['error']})")
+            continue
+        state = ("up to date" if not rep_["behind"] else f"BEHIND by {rep_['behind']} commit(s)") + \
+                (f", {rep_['ahead']} ahead" if rep_["ahead"] else "")
+        say(f"  {k:5} pinned {rep_['pinned']} ({rep_['pinned_version'] or '?'})  newest {rep_['newest']} "
+            f"({rep_['newest_version'] or '?'})  {state}")
+        if rep_["behind"]:
+            behind.append(k)
+    if not behind:
+        return
+    warn(f"the pins of {', '.join(behind)} are behind: this release would run the older code. On your checkout: "
+         f"llmt pin {' '.join(behind)} --commit --push; then here: git pull && git submodule update --init")
+    if interactive and not yes("Deploy with these older pins anyway?", False):
+        die("not deployed")
+
+
+MCP_SCRIPT = re.compile(r"^(?P<root>.+)/\.venv/bin/(?P<key>[a-z0-9_]+)-mcp$")
+
+
+def own_ancestors(proc: Path = Path("/proc")) -> set:
+    """This process and its parents (a shell running 'llmt servers --stop' over ssh must never match)."""
+    out, pid = set(), os.getpid()
+    while pid > 1 and pid not in out:
+        out.add(pid)
+        try:
+            pid = int((proc / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return out
+
+
+def scan_servers(prefix: Path, proc: Path = Path("/proc"), skip: set | None = None) -> list[dict]:
+    """The translator MCP servers running on this machine: processes whose program or script is
+    <root>/.venv/bin/<key>-mcp (only the first two words of the command line count, so a shell whose command
+    merely mentions such a path is not one). root resolved with realpath; a root under <prefix>/releases/ is a
+    release, 'current' when <prefix>/current points to it."""
+    real_prefix = os.path.realpath(str(prefix))
+    rel_dir = real_prefix.rstrip("/") + "/releases/"
+    cur_link = Path(real_prefix) / "current"
+    cur = os.path.realpath(str(cur_link)) if cur_link.exists() or cur_link.is_symlink() else None
+    out = []
+    for d in sorted(proc.iterdir(), key=lambda x: int(x.name) if x.name.isdigit() else 0):
+        if not d.name.isdigit() or (skip and int(d.name) in skip):
+            continue
+        try:
+            argv = [x.decode(errors="replace") for x in (d / "cmdline").read_bytes().split(b"\0")[:2] if x]
+        except OSError:
+            continue
+        for word in argv:
+            if not word.startswith("/") or not os.path.basename(word).endswith("-mcp"):
+                continue
+            m = MCP_SCRIPT.match(os.path.realpath(word))
+            if not m or m.group("key") not in REGISTRY:
+                continue
+            root = m.group("root")
+            release = root[len(rel_dir):] if root.startswith(rel_dir) and "/" not in root[len(rel_dir):] else None
+            user = "?"
+            try:
+                uid = int(next(l.split()[1] for l in (d / "status").read_text().splitlines() if l.startswith("Uid:")))
+                import pwd
+                user = pwd.getpwuid(uid).pw_name
+            except (OSError, StopIteration, ValueError, KeyError, ImportError):
+                pass
+            out.append({"pid": int(d.name), "user": user, "key": m.group("key"), "root": root, "release": release,
+                        "current": release is not None and cur is not None and root == cur,
+                        "old": release is not None and (cur is None or root != cur)})
+            break
+    return out
+
+
+def cmd_servers(a) -> None:
+    proc = Path("/proc")
+    if not proc.is_dir():
+        die("llmt servers reads /proc: Linux only")
+    prefix = prefix_of(a)
+    found = scan_servers(prefix, proc, own_ancestors(proc))
+    cur = current_release(prefix)
+    say(f"Translator MCP servers on this machine (shared prefix {prefix}, current: {cur.name if cur else '-'})")
+    if not found:
+        say("  none running")
+        return
+    for e in found:
+        where = (f"release {e['release']}" + (" (current)" if e["current"] else "  OLD: not current")) \
+            if e["release"] else f"checkout {e['root']}"
+        say(f"  {e['pid']:>8}  {e['user']:12} {e['key']:5} {where}")
+    old = [e for e in found if e["old"]]
+    if not old:
+        return
+    if not a.stop:
+        say(f"\n  {len(old)} server(s) run an old release: they keep their code until they exit, and jobs they "
+            f"submit run it too. 'llmt servers --stop' ends them (SIGTERM; the router starts new ones).")
+        return
+    for e in old:
+        try:
+            os.kill(e["pid"], signal.SIGTERM)
+            say(f"  stopped {e['pid']} ({e['user']}, {e['key']}, release {e['release']})")
+        except ProcessLookupError:
+            say(f"  {e['pid']} had already ended")
+        except PermissionError:
+            warn(f"{e['pid']} belongs to {e['user']}: run as root (sudo) to stop it")
+
+
 def cmd_deploy(a) -> None:
     if SHARED:
         die("deploy builds from a checkout (e.g. /opt/llm-translators/src), not from inside a release")
@@ -1851,6 +1991,8 @@ def cmd_deploy(a) -> None:
         probe_f.unlink()
     except OSError:
         die(f"no write access to {prefix}: run as the admin (sudo ./llmt deploy) or choose --prefix")
+    if not a.no_pin_check:
+        check_pins(keys, interactive=sys.stdin.isatty() and not a.yes)
     bad = env_problems(SYSTEM_ENV)
     if bad:
         for b in bad:
@@ -2709,6 +2851,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--bench", action="store_true", help="run the benchmarks before switching")
     p.add_argument("--no-switch", action="store_true", help="build it, but leave 'current' as it is")
     p.add_argument("--allow-dirty", action="store_true", help="deploy the committed state despite local changes")
+    p.add_argument("--no-pin-check", action="store_true", help="do not compare the pins with the newest commits")
+    p.add_argument("--yes", action="store_true", help="do not ask (a pin behind is only warned about)")
+    p = sub.add_parser("servers", help="admin: the translator MCP servers running here; --stop ends old-release ones")
+    p.add_argument("--stop", action="store_true", help="SIGTERM to servers of a release that is not current")
+    p.add_argument("--prefix")
     p = sub.add_parser("releases", help="the shared releases, which is current, which are in use")
     p.add_argument("--prefix")
     p = sub.add_parser("rollback", help="admin: point 'current' to the previous (or the named) release")
@@ -2744,7 +2891,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     {"setup": cmd_setup, "list": cmd_list, "install": cmd_install, "remove": cmd_remove, "status": cmd_status,
      "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "tune": cmd_tune, "jobs": cmd_jobs, "env": cmd_env,
-     "deploy": cmd_deploy, "releases": cmd_releases, "rollback": cmd_rollback, "gc": cmd_gc, "router": cmd_router, "mcp": cmd_mcp}[a.cmd](a)
+     "deploy": cmd_deploy, "releases": cmd_releases, "rollback": cmd_rollback, "servers": cmd_servers, "gc": cmd_gc, "router": cmd_router, "mcp": cmd_mcp}[a.cmd](a)
 
 
 if __name__ == "__main__":

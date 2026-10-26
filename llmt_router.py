@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.23.6
+Version: 2026.10.25.2
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -28,7 +28,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.23.6"
+__version__ = "2026.10.25.2"
 
 HERE = Path(__file__).resolve().parent
 
@@ -108,6 +108,9 @@ class Child:
         self.init_result: dict | None = None
         self.inflight: dict = {}
         self.tools: list | None = None
+        self.started = 0.0                  # when this server process was started (its release is resolved then)
+        self.serving: str | None = None     # the translator version this server process runs ("translator")
+        self.retire = False                 # runs another version than the installed one: closed once idle
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -119,6 +122,7 @@ class Child:
         else:
             cmd = [str(Path(os.path.expanduser(root)) / "bin" / "mcp"), self.key]
         self.err = []
+        self.started = time.time()
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=self._read_err, daemon=True).start()
@@ -202,6 +206,12 @@ class Child:
                 self.proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 self.proc.kill()
+        if self.proc is not None:
+            for f in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+                try:
+                    f.close()
+                except (OSError, ValueError):
+                    pass
 
 
 # ---------------------------------------------------------------- the router
@@ -250,13 +260,19 @@ class Router:
             raise ChildError(f"{name}: still connecting (no answer to the connection within {timeout:.0f} s)")
         try:
             pool = [c for c in self.children.get(name, []) if c.alive()]
-            for c in pool:
+            for c in [c for c in pool if c.retire and not c.inflight]:
+                log(f"{name}: closing a server that runs {self.key} {c.serving} (installed: "
+                    f"{(self.status_cache.get(name, (0, {}))[1] or {}).get('version')}); the next one runs the installed release")
+                pool.remove(c)
+                c.close()
+            live = [c for c in pool if not c.retire]
+            for c in live:
                 if c.stuck_for() < STUCK_AFTER:
                     self.children[name] = pool
                     return c
-            if len(pool) < POOL:
-                if pool:
-                    log(f"{name}: its server has been busy for {pool[0].stuck_for():.0f} s: opening another connection")
+            if len(live) < POOL:
+                if live:
+                    log(f"{name}: its server has been busy for {live[0].stuck_for():.0f} s: opening another connection")
                 c = Child(self.host(name), self.key)
                 try:
                     c.start(self.init_params, timeout=max(3.0, timeout))
@@ -265,9 +281,10 @@ class Router:
                     raise
                 pool.append(c)
                 self.children[name] = pool
+                threading.Thread(target=self.probe_serving, args=(name, c), daemon=True).start()
                 return c
             self.children[name] = pool
-            return min(pool, key=lambda c: c.stuck_for())
+            return min(live or pool, key=lambda c: c.stuck_for())
         finally:
             lock.release()
 
@@ -311,7 +328,7 @@ class Router:
         script = (f"r={root_expr(h['root'])}; python3 \"$r/llmt\" status --json {self.key} 2>/dev/null; echo; echo @@LOAD; "
                   f"cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/null; "
                   f"nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null")
-        out = {"name": name, "reachable": False}
+        out = {"name": name, "reachable": False, "_asked": time.time()}
         try:
             r = remote_cmd(h, script, timeout=120)
             text, _, load = r.stdout.partition("@@LOAD")
@@ -342,7 +359,63 @@ class Router:
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
             out["error"] = str(exc)[:300]
         self.status_cache[name] = (time.time(), out)
+        for c in list(self.children.get(name, [])):
+            self.check_serving(name, c)
         return out
+
+    # ---- the version a server process runs (docs/ROUTER.md, "Servers that run an old release")
+    def probe_serving(self, name: str, c: Child, timeout: float = 20.0) -> str | None:
+        """Asks this server process which translator version it runs: "translator" in its jobs() answer (or its
+        study_format status). Then compares it with the installed version."""
+        if c.serving is None:
+            tools = {t.get("name") for t in self.tools}
+            for tool, args in (("jobs", {"limit": 1}), ("study_format", {}), ("goal_format", {})):
+                if tools and tool not in tools:
+                    continue
+                try:
+                    r = c.request("tools/call", {"name": tool, "arguments": args}, timeout=timeout)
+                except ChildError:
+                    continue
+                self.note_serving(c, self.parse(r))
+                if c.serving:
+                    break
+        self.check_serving(name, c)
+        return c.serving
+
+    @staticmethod
+    def note_serving(c: Child, data) -> None:
+        if isinstance(data, dict):
+            v = data.get("translator")
+            if not isinstance(v, str):
+                v = (data.get("status") or {}).get("translator") if isinstance(data.get("status"), dict) else None
+            if isinstance(v, str) and v:
+                c.serving = v
+
+    def check_serving(self, name: str, c: Child) -> None:
+        """A server process that runs another version than the one installed (it started before a deploy, and
+        is older than the stale-server rule, so it does not exit by itself) is retired: closed now if idle, else
+        as soon as its calls finish; the next call starts a server on the installed release. The installed
+        version must come from a status asked after this server started, else the status is asked again first."""
+        hit = self.status_cache.get(name)
+        if not c.serving or not hit or not hit[1].get("version"):
+            return
+        st = hit[1]
+        if c.serving == st["version"]:
+            c.retire = False
+            return
+        if st.get("_asked", 0) < c.started:
+            self.refresh(name)
+            return
+        if not c.retire:
+            log(f"{name}: the server in use runs {self.key} {c.serving}, the installed one is {st['version']} "
+                f"(release {st.get('release') or '-'}): replacing it " + ("now" if not c.inflight else "once idle"))
+        c.retire = True
+        if not c.inflight:
+            with self.child_lock:
+                pool = self.children.get(name, [])
+                if c in pool:
+                    pool.remove(c)
+            c.close()
 
     def forget(self, name: str) -> None:
         """After sending a machine work: its queue estimate is asked again at the next placement, and its status
@@ -554,6 +627,9 @@ class Router:
                         raise
                     continue
                 if attempt or not (r.get("isError") and self.stale_child(c, json.dumps(r.get("content", "")))):
+                    if not r.get("isError"):
+                        self.note_serving(c, self.parse(r))
+                        self.check_serving(name, c)
                     return r
             return r
         except ChildError as exc:
@@ -840,18 +916,42 @@ class Router:
             return self.text_result({"error": str(exc), "router": "llmt-router (machines() shows the machines)"}, True)
 
     def machines(self) -> dict:
-        sts = self.statuses([h["name"] for h in self.hosts], fresh=True, wait=35.0)
+        sts = self.statuses([h["name"] for h in self.hosts], fresh=True, wait=30.0)
+        # which version each machine's server process runs (connecting if needed), in parallel
+        ths = []
+        for h in self.hosts:
+            if sts.get(h["name"], {}).get("version"):
+                def one(n=h["name"]):
+                    try:
+                        c = self.child(n, timeout=15.0)
+                        self.probe_serving(n, c, timeout=12.0)
+                    except ChildError:
+                        pass
+                t = threading.Thread(target=one, daemon=True)
+                t.start()
+                ths.append(t)
+        end = time.time() + 15.0
+        for t in ths:
+            t.join(max(0.0, end - time.time()))
         out = []
         for h in self.hosts:
             st = sts.get(h["name"], {})
             row = {"machine": h["name"], "ssh": h.get("ssh") or "(this machine)", "root": h["root"],
                    "preferred": h["name"] in self.prefer, "excluded": h["name"] in self.exclude,
                    "speed": self.speed.get(h["name"], 1.0)}
-            row.update({k: v for k, v in st.items() if k not in ("name", "executor")})
+            row.update({k: v for k, v in st.items() if k not in ("name", "executor", "_asked")})
             ex = st.get("executor") or {}
             if ex:
                 row["executor"] = {k: ex.get(k) for k in ("kind", "procs", "time_limit_min", "caps") if k in ex}
             if st.get("reachable") and st.get("version"):
+                serv = sorted({c.serving or "?" for c in self.children.get(h["name"], []) if c.alive()})
+                row["serving"] = (serv[0] if len(serv) == 1 else serv) if serv else None
+                stale = [v for v in serv if v not in ("?", st.get("version"))]
+                if stale:
+                    row["server_stale"] = True
+                    row["note"] = (f"the server the router uses here runs {self.key} {', '.join(stale)}, but "
+                                   f"{st.get('version')} is installed (release {st.get('release') or '-'}): it is "
+                                   f"replaced once idle, and jobs it submitted run the old code")
                 ex = st.get("executor") or {}
                 start, why = self.expected_start(h["name"], st, int(ex.get("procs") or 1), 10, None)
                 row["typical_job_start_min"] = None if start is None else round(start, 1)
@@ -897,7 +997,8 @@ class Router:
 
     def tools_list(self) -> dict:
         own = {"name": "machines",
-               "description": "The machines this server can run on, as the router sees them: reachable, version, "
+               "description": "The machines this server can run on, as the router sees them: reachable, version "
+                              "(installed), serving (what the server in use runs; server_stale when they differ), "
                               "backends, executor (local or SLURM), CPUs and their use, this translator's queued and "
                               "running jobs, load, the expected start of a typical job, speed, preferred or excluded.",
                "inputSchema": {"type": "object", "properties": {}}}

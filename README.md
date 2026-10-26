@@ -27,7 +27,7 @@ Each translator's README has the details. This table describes the commits pinne
 
 That only works when they are installed in the same venv, which is why there is a single venv here.
 
-Version: 2026.10.22.3.
+Version: 2026.10.25.2.
 
 **Contents:**
 
@@ -280,6 +280,8 @@ llmt deploy [KEY...] [--test] [--bench] [--prefix P] [--python PY] [--no-switch]
 llmt releases                   the releases, which is current, which are in use
 llmt rollback [RELEASE]         point 'current' to the previous (or the named) release
 llmt gc [--keep N] [--yes]      remove old releases that nobody uses
+llmt servers [--stop]           the translator MCP servers running here, with their release; --stop ends those not on 'current'
+                                (deploy also compares each pin with its branch's newest commit: --no-pin-check, --yes)
 ```
 
 **`KEY`** is `b3dt`, `feat`, `cfdt`, `lmpt` or `omct`, or the repository name, a number from `llmt list`, or `all`.
@@ -411,6 +413,7 @@ llm-translators/
   config/setup.json     what was chosen here: installed translators, extras, MCP placement, alias (not tracked)
   BACKENDS.md           installing Gmsh, CalculiX, OpenFOAM, LAMMPS, OpenModelica, MPI, SLURM
   docs/                 EXECUTION.md, SHARED.md, create_new_translators.md
+  tests/                llm-translators' own tests: python3 -m unittest discover -s tests
   .venv/                the venv (not tracked)
   build123d-translator/ fea-translator/ cfd-translator/ lammps-translator/ openmodelica-translator/   submodules
 ```
