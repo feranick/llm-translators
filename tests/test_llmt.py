@@ -136,7 +136,12 @@ class RouterServing(unittest.TestCase):
         self.wait_serving(c1)
         (self.root / "INSTALLED").write_text("2026.10.25.6\n")
         r.fetch_status("m")                       # the status is newer than the server, which is idle
-        self.assertFalse(c1.alive())
+        end = time.time() + 5
+        while c1.alive() and time.time() < end:  # closed now, or as soon as a call in flight (a probe) ends
+            time.sleep(0.05)
+        st = r.status_cache["m"][1]
+        self.assertFalse(c1.alive(), f"retire={c1.retire} inflight={c1.inflight} serving={c1.serving} "
+                                     f"installed={st.get('version')} asked-started={st.get('_asked', 0) - c1.started:.3f}")
 
 
 class ServersList(unittest.TestCase):

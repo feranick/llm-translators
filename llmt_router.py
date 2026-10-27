@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.25.2
+Version: 2026.10.26.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -28,7 +28,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.25.2"
+__version__ = "2026.10.26.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -194,6 +194,8 @@ class Child:
             self.waiting.pop(rid, None)
             if not late:
                 self.inflight.pop(rid, None)
+            if self.retire and not self.inflight:   # an old-release server: closed as soon as its calls finish
+                threading.Thread(target=self.close, daemon=True).start()
 
     def stuck_for(self) -> float:
         """Seconds the oldest unanswered request has been waiting (0: none)."""
@@ -203,9 +205,16 @@ class Child:
         if self.alive():
             try:
                 self.proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+            try:
                 self.proc.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
+            except subprocess.TimeoutExpired:
                 self.proc.kill()
+                try:
+                    self.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
         if self.proc is not None:
             for f in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
                 try:
@@ -410,6 +419,10 @@ class Router:
             log(f"{name}: the server in use runs {self.key} {c.serving}, the installed one is {st['version']} "
                 f"(release {st.get('release') or '-'}): replacing it " + ("now" if not c.inflight else "once idle"))
         c.retire = True
+        with self.child_lock:
+            pool = self.children.get(name, [])
+            if c in pool and c.inflight:
+                return                                # closed by its last call (Child.request)
         if not c.inflight:
             with self.child_lock:
                 pool = self.children.get(name, [])
@@ -939,7 +952,9 @@ class Router:
             row = {"machine": h["name"], "ssh": h.get("ssh") or "(this machine)", "root": h["root"],
                    "preferred": h["name"] in self.prefer, "excluded": h["name"] in self.exclude,
                    "speed": self.speed.get(h["name"], 1.0)}
-            row.update({k: v for k, v in st.items() if k not in ("name", "executor", "_asked")})
+            row.update({k: v for k, v in st.items() if k not in ("name", "executor", "_asked", "release")})
+            # the shared install's bundle (docs/SHARED.md), not the translator's version: named so it can't be mistaken
+            row["llmt_release"] = st.get("release")
             ex = st.get("executor") or {}
             if ex:
                 row["executor"] = {k: ex.get(k) for k in ("kind", "procs", "time_limit_min", "caps") if k in ex}
@@ -950,7 +965,7 @@ class Router:
                 if stale:
                     row["server_stale"] = True
                     row["note"] = (f"the server the router uses here runs {self.key} {', '.join(stale)}, but "
-                                   f"{st.get('version')} is installed (release {st.get('release') or '-'}): it is "
+                                   f"{st.get('version')} is installed (llm-translators release {st.get('release') or '-'}): it is "
                                    f"replaced once idle, and jobs it submitted run the old code")
                 ex = st.get("executor") or {}
                 start, why = self.expected_start(h["name"], st, int(ex.get("procs") or 1), 10, None)
@@ -998,7 +1013,7 @@ class Router:
     def tools_list(self) -> dict:
         own = {"name": "machines",
                "description": "The machines this server can run on, as the router sees them: reachable, version "
-                              "(installed), serving (what the server in use runs; server_stale when they differ), "
+                              "(this translator's version installed; llmt_release is the llm-translators bundle, not it), serving (what the server in use runs; server_stale when they differ), "
                               "backends, executor (local or SLURM), CPUs and their use, this translator's queued and "
                               "running jobs, load, the expected start of a typical job, speed, preferred or excluded.",
                "inputSchema": {"type": "object", "properties": {}}}

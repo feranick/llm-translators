@@ -99,7 +99,7 @@ The results stay as the translator wrote them; their paths are real paths on the
 | `jobs(...)`, `list_geometry()` | all machines | asked in parallel and combined: `{"machines": {name: result}}` |
 | `add_geometry(...)` | all machines | sent to every machine, so a registered geometry works wherever a run goes |
 | `study_format`, `goal_format`, `get_case` / `get_inputs` / `get_model` and other calls | the preferred machine | the first one that answers |
-| `machines()` | the router itself | each machine: reachable, mode (release or checkout), `release`, `version` (installed), `serving` (what the server process the router uses runs; `server_stale` and a `note` when it differs), backends, executor, CPUs and their use, the translator's queued and running jobs, load, expected start of a typical job, speed, preferred or excluded |
+| `machines()` | the router itself | each machine: reachable, mode (release or checkout), `llmt_release` (the llm-translators bundle installed there, named like `2026.10.26.2`; not the translator's version), `version` (the translator's version installed), `serving` (what the server process the router uses runs; `server_stale` and a `note` when it differs), backends, executor, CPUs and their use, the translator's queued and running jobs, load, expected start of a typical job, speed, preferred or excluded |
 
 Answers from a single machine get `"machine": "<name>"` at the top.
 
