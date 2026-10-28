@@ -27,7 +27,7 @@
    "suggest": "here",
    "cli": "feat",
    "port": 8767,
-   "extras": ["mesh", "mcp". "remnder"],
+   "extras": ["mesh", "mcp", "remnder"],
    "test_extra": "test",
    "optional_extras": {"render": "3D images with VTK (quality high: lit, smooth); needs EGL, OSMesa or xvfb"},
    "uses": {"b3dt": "parts as build123d-translator goals"},
