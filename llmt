@@ -50,7 +50,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.10.25.2"
+__version__ = "2026.10.28.1"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -1042,6 +1042,7 @@ def status_data(keys: list[str] | None = None) -> dict:
     data = {"llmt": __version__, "root": str(ROOT), "venv": str(VENV) if VPY.exists() else None,
             "python": venv_python_version(), "translators": {},
             "mode": "release" if SHARED else "checkout", "release": release_info() if SHARED else None,
+            "commit": bundle_commit(),
             "settings": [str(f) for f in ([SYSTEM_ENV] if SYSTEM_ENV.exists() else []) + [ENV_FILE] if f.exists()]}
     si = slurm_info()
     if si:
@@ -1067,10 +1068,10 @@ def status_data(keys: list[str] | None = None) -> dict:
 def print_status(data: dict, verbose: bool) -> None:
     if data.get("mode") == "release":
         rel = data.get("release") or {}
-        say(f"llm-translators shared release {rel.get('release', '?')} ({data['root']}; llmt {data['llmt']}, "
-            f"built {rel.get('created', '?')} by {rel.get('built_by', '?')})")
+        say(f"llm-translators shared release {rel.get('release', '?')} = commit {data.get('commit') or '?'} "
+            f"({data['root']}; llmt {data['llmt']}, built {rel.get('created', '?')} by {rel.get('built_by', '?')})")
     else:
-        say(f"llm-translators {data['llmt']}  ({data['root']})")
+        say(f"llm-translators {data['llmt']}, commit {data.get('commit') or '?'}  ({data['root']})")
     if data.get("settings"):
         say("settings: " + ", then ".join(data["settings"]))
         for f in data["settings"]:
@@ -2103,6 +2104,17 @@ def cmd_deploy(a) -> None:
     say("  Undo: llmt rollback. Old releases: llmt gc.")
 
 
+def bundle_commit(path: Path | None = None) -> str | None:
+    """The umbrella commit an install was built from: RELEASE.json for a release (its name only counts the deploys
+    on that machine, so two machines can name the same content differently), git for a checkout."""
+    path = path or ROOT
+    info = release_info(path) if (path / "RELEASE.json").exists() else None
+    if info is not None:
+        return (info.get("umbrella") or "")[:7] or None
+    r = subprocess.run(["git", "-C", str(path), "rev-parse", "--short=7", "HEAD"], capture_output=True, text=True)
+    return (r.stdout.strip() or None) if r.returncode == 0 else None
+
+
 def cmd_releases(a) -> None:
     prefix = prefix_of(a)
     rels = releases_in(prefix)
@@ -2111,12 +2123,14 @@ def cmd_releases(a) -> None:
         return
     cur = current_release(prefix)
     used = releases_in_use(prefix)
-    say(f"  {prefix}")
+    say(f"  {prefix}   (name: this machine's deploys of the day; commit: the content, the same on every machine)")
+    say(f"  {'release':14} {'commit':8} {'':8} {'built':20} translators")
     for r in reversed(rels):
         info = release_info(r)
         mark = "current" if cur == r.resolve() else ""
         use = used.get(r.name, [])
-        say(f"  {r.name:14} {mark:8} {info.get('created', '?'):20} {','.join(info.get('keys', [])):28} "
+        say(f"  {r.name:14} {(info.get('umbrella') or '?')[:7]:8} {mark:8} {info.get('created', '?'):20} "
+            f"{','.join(info.get('keys', [])):28} "
             + (f"in use: {len(use)} ({', '.join(use[:3])}{'...' if len(use) > 3 else ''})" if use else ""))
 
 

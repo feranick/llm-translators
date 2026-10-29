@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.26.1
+Version: 2026.10.28.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -28,7 +28,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.26.1"
+__version__ = "2026.10.28.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -351,7 +351,10 @@ class Router:
                 ex = (st or {}).get("executor") or {}
                 sl = data.get("slurm") or {}
                 jobs = [j for j in sl.get("jobs", []) if j.get("key") == self.key]
-                out.update(reachable=True, mode=data.get("mode"), release=(data.get("release") or {}).get("release"),
+                rel = data.get("release") or {}
+                out.update(llmt_commit=data.get("commit") or (rel.get("umbrella") or "")[:7] or None,
+                           translator_commit=((rel.get("commits") or {}).get(self.t["repo"]) or "")[:7] or None)
+                out.update(reachable=True, mode=data.get("mode"), release=rel.get("release"),
                            version=d.get("version"), backends_missing=miss, executor=ex,
                            slurm={k: sl.get(k) for k in ("cpus", "cpus_allocated", "time_limit", "state", "nodes_usable",
                                                          "node", "cluster_nodes", "nodes", "shared_home",
@@ -955,6 +958,7 @@ class Router:
             row.update({k: v for k, v in st.items() if k not in ("name", "executor", "_asked", "release")})
             # the shared install's bundle (docs/SHARED.md), not the translator's version: named so it can't be mistaken
             row["llmt_release"] = st.get("release")
+            # the release's name counts deploys on that machine; the commit says what it contains (same everywhere)
             ex = st.get("executor") or {}
             if ex:
                 row["executor"] = {k: ex.get(k) for k in ("kind", "procs", "time_limit_min", "caps") if k in ex}
@@ -1013,7 +1017,8 @@ class Router:
     def tools_list(self) -> dict:
         own = {"name": "machines",
                "description": "The machines this server can run on, as the router sees them: reachable, version "
-                              "(this translator's version installed; llmt_release is the llm-translators bundle, not it), serving (what the server in use runs; server_stale when they differ), "
+                              "(this translator's version installed; llmt_release is the llm-translators bundle, not it, named per machine: "
+                              "llmt_commit tells whether two bundles are the same), serving (what the server in use runs; server_stale when they differ), "
                               "backends, executor (local or SLURM), CPUs and their use, this translator's queued and "
                               "running jobs, load, the expected start of a typical job, speed, preferred or excluded.",
                "inputSchema": {"type": "object", "properties": {}}}
