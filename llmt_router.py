@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.28.1
+Version: 2026.10.31.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
 The Claude app sees one server (e.g. cfdt) with the translator's own tools plus machines(). Behind it, the router
 keeps one connection per machine to the translator's real server (ssh HOST <root>/bin/mcp KEY, or locally), places
 runs on the machine where they should finish first, routes follow-up calls by the request's machine, and merges
-per-machine views. Python standard library only: it speaks MCP's stdio protocol (JSON-RPC, one message a line)
+per-machine views. Files on this computer named in a call (a STEP file in a study) are copied to the machine first
+and the call gets their path there ('staged'). Python standard library only: it speaks MCP's stdio protocol (JSON-RPC, one message a line)
 on both sides. Nothing but MCP messages goes to stdout; diagnostics go to stderr.
 """
 from __future__ import annotations
 
 import copy
 import datetime as _dt
+import hashlib
 import importlib.util
 import json
 import math
@@ -28,7 +30,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.28.1"
+__version__ = "2026.10.31.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -58,6 +60,10 @@ ALL_TOOLS = {"jobs", "list_geometry"}
 BROADCAST_TOOLS = {"add_geometry"}
 READ_ONLY = {"get_file", "get_image"}
 PATHS_FILE = L.CONFIG_DIR / "router_paths.json"
+MB = 1024 * 1024
+UPLOAD_MB = 500.0        # largest local file the router copies to a machine, unless <KEY>_MAX_UPLOAD_MB says otherwise
+STAGE_ALL_MB = 25.0      # placement copies local files to every candidate (to validate there) only up to this in total
+CHUNK = 1 << 20
 
 
 def log(msg: str) -> None:
@@ -223,6 +229,72 @@ class Child:
                     pass
 
 
+# ---------------------------------------------------------------- local input files, copied to a machine
+
+class Upload:
+    """One local file sent to one machine in the background. Resumable: it is appended to <dir>/.<name>.part from
+    the size already there, checked with sha256 on the machine, and only then renamed to <dir>/<name>. Plain ssh
+    (the shared ControlMaster connection), so neither rsync nor scp is needed at either end."""
+
+    def __init__(self, host: dict, local: str, remote: str, size: int, sha: str):
+        self.host, self.local, self.remote, self.size, self.sha = host, local, remote, size, sha
+        self.sent = 0
+        self.resumed_at = 0
+        self.started = time.time()
+        self.done = False
+        self.error: str | None = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def progress(self) -> dict:
+        rate = (self.sent - self.resumed_at) / max(0.5, time.time() - self.started)
+        left = (self.size - self.sent) / rate if rate > 0 else None
+        return {"to": self.remote, "mb": round(self.size / MB, 1), "sent_pct": int(100 * self.sent / max(1, self.size)),
+                "eta_s": None if left is None else int(left) + 1}
+
+    def _run(self) -> None:
+        q = shlex.quote
+        d, name = self.remote.rsplit("/", 1)
+        part = f"{d}/.{name}.part"
+        try:
+            r = remote_cmd(self.host, f"mkdir -p {q(d)} || exit 1; if [ -f {q(part)} ]; then wc -c < {q(part)}; "
+                                      f"else echo 0; fi", timeout=60)
+            if r.returncode != 0:
+                raise OSError(f"cannot create {d}: {(r.stderr or '').strip()[-200:]}")
+            try:
+                off = int(r.stdout.split()[-1])
+            except (ValueError, IndexError):
+                off = 0
+            if off > self.size:
+                off = 0
+            self.sent = self.resumed_at = off
+            cmd = ssh_base(self.host) + [f"cat {'>>' if off else '>'} {q(part)}"]
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                with open(self.local, "rb") as f:
+                    f.seek(off)
+                    for b in iter(lambda: f.read(CHUNK), b""):
+                        p.stdin.write(b)
+                        self.sent += len(b)
+                p.stdin.close()
+            except BrokenPipeError:
+                pass
+            err = p.stderr.read().decode(errors="replace")
+            if p.wait() != 0:
+                raise OSError(f"ssh ended with {p.returncode}: {err.strip()[-200:]}")
+            r = remote_cmd(self.host, f"p={q(part)}; s=$( (sha256sum \"$p\" 2>/dev/null || shasum -a 256 \"$p\") "
+                                      f"| cut -d' ' -f1); if [ \"$s\" = {self.sha} ]; then mv -f \"$p\" {q(self.remote)} "
+                                      f"&& echo @@OK; else rm -f \"$p\"; echo \"@@BAD $s\"; fi", timeout=900)
+            if "@@OK" not in r.stdout:
+                raise OSError(f"the copy on the machine differs (sha256 {r.stdout.strip()[-70:] or r.stderr.strip()[-100:]}); "
+                              f"it was removed: try again")
+            self.done = True
+            log(f"{self.host['name']}: copied {self.local} to {self.remote} ({self.size / MB:.1f} MB)")
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            self.error = str(exc)[:300]
+            log(f"{self.host['name']}: copying {self.local} failed: {self.error}")
+
+
 # ---------------------------------------------------------------- the router
 
 class Router:
@@ -250,6 +322,10 @@ class Router:
         self.tools: list = []
         self.paths = self._load_paths()
         self.paths_lock = threading.Lock()
+        self.uploads: dict = {}          # (machine, remote path) -> Upload
+        self.up_lock = threading.Lock()
+        self.hash_cache: dict = {}       # (path, size, mtime) -> sha256
+        self.unstaged: dict = {}         # a staged file's path on a machine -> the local file it came from
 
     # ---- machines
     def host(self, name: str) -> dict | None:
@@ -584,6 +660,189 @@ class Router:
                     return n
         return None
 
+    # ---- local input files (docs/ROUTER.md, "Files on this computer")
+    def upload_limit_mb(self) -> tuple:
+        """-> (limit in MB, variable): <KEY>_MAX_UPLOAD_MB from the router's environment or this install's settings."""
+        var = f"{self.key.upper()}_MAX_UPLOAD_MB"
+        v = os.environ.get(var)
+        if v is None:
+            try:
+                v = L.env_effective().get(var)
+            except Exception:  # noqa: BLE001
+                v = None
+        try:
+            return (float(v) if v not in (None, "") else UPLOAD_MB), var
+        except ValueError:
+            log(f"{var}={v!r} is not a number: using {UPLOAD_MB:g}")
+            return UPLOAD_MB, var
+
+    def local_files(self, args) -> dict:
+        """{string as written in the arguments: real local path} for every string naming a regular file under the home
+        folder of this computer, at any depth (a study's geometry.step, a list of objects). The top-level request /
+        file arguments (PATH_ARGS) name results on a machine and are left alone. A path given earlier as a staged
+        copy counts as the local file it came from, so it can go to another machine."""
+        home = str(Path.home()).rstrip("/") + "/"
+        found: dict = {}
+
+        def walk(o, top=False):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if not (top and k in PATH_ARGS):
+                        walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v)
+            elif isinstance(o, str) and 1 < len(o) < 4096 and "\n" not in o:
+                s = self.unstaged.get(o, o)
+                if s.startswith("~/"):
+                    s = os.path.expanduser(s)
+                if not s.startswith(home):
+                    return
+                try:
+                    if os.path.isfile(s):
+                        found[o] = os.path.realpath(s)
+                except (OSError, ValueError):
+                    pass
+        walk(args, True)
+        return found
+
+    def check_sizes(self, files: dict) -> int:
+        """Total bytes of the local files; a file over the limit is refused with what to do."""
+        lim, var = self.upload_limit_mb()
+        total = 0
+        for lp in set(files.values()):
+            size = os.path.getsize(lp)
+            total += size
+            if size > lim * MB:
+                raise ValueError(f"{lp} is {size / MB:.0f} MB, more than the router copies to a machine ({var}={lim:g} MB): "
+                                 f"copy it there yourself and give its path on that machine (with run.host), or raise {var}")
+        return total
+
+    def file_hash(self, path: str) -> tuple:
+        st = os.stat(path)
+        k = (path, st.st_size, st.st_mtime_ns)
+        if k not in self.hash_cache:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for b in iter(lambda: f.read(CHUNK), b""):
+                    h.update(b)
+            self.hash_cache[k] = h.hexdigest()
+        return st.st_size, self.hash_cache[k]
+
+    @staticmethod
+    def rewrite(obj, mapping: dict, top: bool = True):
+        if isinstance(obj, dict):
+            return {k: (v if top and k in PATH_ARGS else Router.rewrite(v, mapping, False)) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [Router.rewrite(v, mapping, False) for v in obj]
+        if isinstance(obj, str):
+            return mapping.get(obj, obj)
+        return obj
+
+    def uploading_to(self, files: dict) -> list:
+        """Machines that hold, or are receiving, every one of these local files."""
+        lps = set(files.values())
+        with self.up_lock:
+            have: dict = {}
+            for (m, _), u in self.uploads.items():
+                if not u.error:
+                    have.setdefault(m, set()).add(u.local)
+        return [m for m, s in have.items() if lps <= s]
+
+    def stage(self, name: str, tool: str, args: dict, deadline: float | None = None, margin: float = 5.0) -> tuple:
+        """Copies the local files named in args to the machine (unless the same path exists there with the same size:
+        a shared folder) to <KEY>_OUT/uploads/<sha256[:12]>/<name> there, or ~/.llmt/uploads/... without <KEY>_OUT.
+        A copy already there (same hash) is not sent again. Waits until deadline - margin.
+        -> (args with the paths on the machine, staged {local: remote}, uploading {local: progress} or None)."""
+        h = self.host(name)
+        if tool in READ_ONLY or not h or not h.get("ssh"):
+            return args, {}, None
+        files = self.local_files(args)
+        if not files:
+            return args, {}, None
+        self.check_sizes(files)
+        info: dict = {}
+        for lp in sorted(set(files.values())):
+            size, sha = self.file_hash(lp)
+            info[lp] = (size, sha, re.sub(r"[^A-Za-z0-9._+-]", "_", os.path.basename(lp)).lstrip(".") or "file")
+        lps = sorted(info)
+        q = shlex.quote
+        var = f"{self.key.upper()}_OUT"
+        lines = [f"_llmt_root={root_expr(h['root'])}",
+                 '[ -r "$_llmt_root/bin/llmt-env.sh" ] && . "$_llmt_root/bin/llmt-env.sh" >/dev/null 2>&1',
+                 f'if [ -n "${{{var}:-}}" ]; then b="${var}/uploads"; else b="$HOME/.llmt/uploads"; fi',
+                 'echo "@@BASE $b"']
+        for i, lp in enumerate(lps):
+            size, sha, nm = info[lp]
+            lines.append(f'if [ -f {q(lp)} ]; then echo "@@SAME {i} $(wc -c < {q(lp)})"; fi')
+            lines.append(f'd="$b/{sha[:12]}"; if [ -f "$d"/{q(nm)} ]; then echo "@@HAVE {i}"; else '
+                         f'o=$(ls "$d" 2>/dev/null | grep -v "^\\." | head -n 1); '
+                         f'if [ -n "$o" ]; then echo "@@OTHER {i} $o"; fi; fi')
+        try:
+            r = remote_cmd(h, "\n".join(lines), timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ChildError(f"{name}: cannot check its copies of the input files: {exc}")
+        base, same, have, other = None, {}, set(), {}
+        for line in r.stdout.splitlines():
+            p = line.split(" ", 2)
+            try:
+                if p[0] == "@@BASE":
+                    base = line[len("@@BASE "):].strip()
+                elif p[0] == "@@SAME":
+                    same[int(p[1])] = int(p[2].strip())
+                elif p[0] == "@@HAVE":
+                    have.add(int(p[1]))
+                elif p[0] == "@@OTHER":
+                    other[int(p[1])] = p[2].strip()
+            except (ValueError, IndexError):
+                pass
+        if not base or not base.startswith("/"):
+            raise ChildError(f"{name}: cannot find where to put the input files ({(r.stderr or '').strip()[-200:]})")
+        remote_of: dict = {}
+        todo, links = [], []
+        for i, lp in enumerate(lps):
+            size, sha, nm = info[lp]
+            if same.get(i) == size:
+                continue                           # the same path is there (a shared folder): left as it is
+            d = f"{base}/{sha[:12]}"
+            remote_of[lp] = f"{d}/{nm}"
+            if i in have:
+                continue
+            if i in other:                         # the same content under another name: linked, not sent again
+                links.append(f'd={q(d)}; ln -f "$d"/{q(other[i])} "$d"/{q(nm)} 2>/dev/null || '
+                             f'cp -p "$d"/{q(other[i])} "$d"/{q(nm)} || exit 1')
+                continue
+            todo.append(lp)
+        if links:
+            try:
+                rl = remote_cmd(h, "\n".join(links) + "\necho @@OK", timeout=120)
+                if "@@OK" not in rl.stdout:
+                    raise OSError((rl.stderr or "").strip()[-200:])
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ChildError(f"{name}: cannot link a copy of an input file: {exc}")
+        ups = []
+        with self.up_lock:
+            for lp in todo:
+                k = (name, remote_of[lp])
+                u = self.uploads.get(k)
+                if u is None or u.error or u.done:     # done but not there any more: sent again
+                    u = Upload(h, lp, remote_of[lp], info[lp][0], info[lp][1])
+                    self.uploads[k] = u
+                ups.append(u)
+        end = None if deadline is None else deadline - margin
+        while any(not u.done and not u.error for u in ups) and (end is None or time.time() < end):
+            time.sleep(0.1)
+        bad = [u for u in ups if u.error]
+        if bad:
+            raise ChildError(f"{name}: copying {bad[0].local} there failed: {bad[0].error}")
+        staged = dict(remote_of)
+        for lp, dest in staged.items():
+            self.unstaged[dest] = lp
+        pending = {u.local: u.progress() for u in ups if not u.done}
+        if pending:
+            return args, staged, pending
+        return self.rewrite(args, {o: remote_of[lp] for o, lp in files.items() if lp in remote_of}), staged, None
+
     # ---- answers
     @staticmethod
     def parse(result: dict):
@@ -620,6 +879,22 @@ class Router:
 
     # ---- calls
     def call(self, name: str, tool: str, args: dict, deadline: float | None = None) -> dict:
+        """Calls the tool on a machine, after copying the local files the arguments name there ('staged' in the
+        answer). A copy that does not finish in time goes on in the background, and the answer says to repeat the
+        call (status 'uploading'): nothing ran yet, and files already there are not sent again."""
+        args, staged, uploading = self.stage(name, tool, args, deadline,
+                                             margin=12.0 if tool in self.wait_defaults else 6.0)
+        if uploading:
+            eta = max([u.get("eta_s") or 30 for u in uploading.values()])
+            return self.text_result({
+                "status": "uploading", "machine": name, "uploading": uploading, "staged": staged,
+                "next": f"the input files are being copied to {name}; nothing ran yet. Call {tool} again with the same "
+                        f"arguments in about {eta} s: the copy goes on meanwhile, and files already there are not sent "
+                        f"again."})
+        r = self._call(name, tool, args, deadline)
+        return self.with_fields(r, {"staged": staged}) if staged else r
+
+    def _call(self, name: str, tool: str, args: dict, deadline: float | None = None) -> dict:
         """Calls the tool on a machine. With a deadline, the tool's own wait (wait_s) is shortened to fit, and the
         call gives up at the deadline (it may still finish there: the answer says how to check)."""
         timeout = CALL_TIMEOUT
@@ -682,6 +957,8 @@ class Router:
                 res[n] = data if data is not None else r
             except ChildError as exc:
                 res[n] = {"unreachable": str(exc)}
+            except ValueError as exc:
+                res[n] = {"error": str(exc)}
         ths = {n: threading.Thread(target=one, args=(n,), daemon=True) for n in names}
         for t in ths.values():
             t.start()
@@ -739,6 +1016,15 @@ class Router:
                 warnings.append(f"kept on {aff}: the studies refer to a request there")
             else:
                 warnings.append(f"the studies refer to a request on {aff}, which cannot take it now")
+        # files on this computer: small ones are copied to every candidate to validate there; large ones only to the
+        # chosen machine, and a call repeated while they copy stays on the machine receiving them
+        files = self.local_files({arg: studies}) if arg else {}
+        big = bool(files) and self.check_sizes(files) > STAGE_ALL_MB * MB
+        if big and not manual and not aff:
+            there = [n for n in cands if n in self.uploading_to(files)]
+            if there:
+                cands = there[:1]
+                warnings.append(f"kept on {there[0]}: the input files are copied there")
         if not cands:
             raise ValueError("no machine can run " + self.key + " now: " +
                              "; ".join(f"{n}: {s.get('error') or ('backends missing: ' + ', '.join(s.get('backends_missing') or [])) if s.get('reachable') else s.get('error', 'unreachable')}"
@@ -749,6 +1035,10 @@ class Router:
         # validation on each candidate: validity and estimates
         est: dict = {}
         vt = self.validate_tool() if arg else None
+        if big and len(cands) > 1:
+            vt = None
+            warnings.append(f"the input files ({self.check_sizes(files) / MB:.0f} MB) are copied only to the chosen "
+                            f"machine: placed by the queues, without validating on each machine first")
         if vt and studies:
             vres = self.call_all(cands, vt, {arg: studies}, deadline=min(p_end, time.time() + 15.0))
             ok = []
@@ -1009,7 +1299,10 @@ class Router:
         note = (f"\nMachines: this server runs {self.key} on several machines ({names}). Calls that start work are "
                 f"placed on the machine where they should finish first; answers say which ('machine', 'router'). "
                 f"Paths in answers work with every tool here. A study's \"run\": {{\"host\": name or [names]}} "
-                f"chooses the machine; machines() shows each one's load, queue and version.")
+                f"chooses the machine; machines() shows each one's load, queue and version. Files on this computer "
+                f"(e.g. a STEP file under the home folder) can be given by their local path: the router copies them "
+                f"to the machine and lists them in 'staged'; if it answers status 'uploading', repeat the same call "
+                f"when it says.")
         return {"protocolVersion": proto, "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": f"{self.key} (llmt-router)", "version": __version__},
                 "instructions": self.instructions + note}

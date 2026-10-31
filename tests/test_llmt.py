@@ -3,11 +3,14 @@
     - the router notices a server process that runs another version than the installed one (serving,
       server_stale) and replaces it once idle;
     - llmt servers: the process list, with a symlinked prefix, a shell mentioning a server path, a SLURM job;
-    - llmt deploy's pin check: a pin behind its branch's newest commit.
+    - llmt deploy's pin check: a pin behind its branch's newest commit;
+    - the router copies local input files to the machine (fake ssh, two machines): nested arguments, the copy's
+      place, no second copy, a link for the same content, the size limit, a shared path, a slow copy, resuming.
 """
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -224,6 +227,213 @@ class PinCheck(unittest.TestCase):
             self.assertIn("llmt pin cfdt --commit --push", err.getvalue())
         finally:
             L.pin_report, L.submodule_url, L.submodule_branch, L.git = saved
+
+
+FAKE_SSH = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    # ssh [options] HOST COMMAND...: runs COMMAND here with HOME=$FAKE_REMOTES/HOST. Paths under $FAKE_HIDE (the
+    # computer the router runs on) are made invisible to the command, as on a real other machine. Logs each command.
+    import json, os, sys, time
+    a = sys.argv[1:]
+    i = 0
+    while i < len(a) and a[i].startswith("-"):
+        i += 2 if a[i] in ("-o", "-p", "-i", "-l") else 1
+    host, cmd = a[i].split("@")[-1], " ".join(a[i + 1:])
+    if os.environ.get("FAKE_HIDE"):
+        cmd = cmd.replace(os.environ["FAKE_HIDE"], "/hidden-local")
+    with open(os.environ["FAKE_LOG"], "a") as f:
+        f.write(json.dumps({"host": host, "cmd": cmd}) + "\\n")
+    if cmd.startswith("cat >"):
+        time.sleep(float(os.environ.get("FAKE_SLOW") or 0))
+    home = os.path.join(os.environ["FAKE_REMOTES"], host)
+    os.execvpe("sh", ["sh", "-c", cmd], dict(os.environ, HOME=home, LLMT_SYSTEM_ENV=os.path.join(home, "sysenv")))
+''')
+
+FAKE_STAGE_SERVER = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    # A translator server that reports which of the paths in a study exist where it runs, with their sha256.
+    import hashlib, json, os, sys
+
+    def paths(o):
+        if isinstance(o, dict):
+            o = list(o.values())
+        if isinstance(o, list):
+            return [p for v in o for p in paths(v)]
+        return [o] if isinstance(o, str) and o.startswith("/") else []
+
+    def sha(p):
+        return hashlib.sha256(open(p, "rb").read()).hexdigest() if os.path.isfile(p) else None
+
+    for line in sys.stdin:
+        m = json.loads(line)
+        if "id" not in m:
+            continue
+        meth, p = m["method"], m.get("params") or {}
+        if meth == "initialize":
+            r = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                 "serverInfo": {"name": "fake", "version": "x"}, "instructions": "fake"}
+        elif meth == "tools/list":
+            obj = {"type": "object", "properties": {"studies": {"type": "object"}}}
+            r = {"tools": [{"name": "jobs", "description": "", "inputSchema": {"type": "object", "properties": {}}},
+                           {"name": "validate_studies", "description": "", "inputSchema": obj},
+                           {"name": "run_studies", "description": "", "inputSchema": {
+                               "type": "object", "properties": {"studies": {"type": "object"},
+                                                                "wait_s": {"type": "number", "default": 45}}}}]}
+        elif meth == "tools/call":
+            name, args = p["name"], p.get("arguments") or {}
+            st = args.get("studies") or {}
+            if name == "validate_studies":
+                out = {"studies": {k: {"ok": all(os.path.isfile(x) for x in paths(s)),
+                                       "estimate": {"minutes": 1, "procs": 1}} for k, s in st.items()}}
+            elif name == "run_studies":
+                out = {"translator": "1", "request": os.path.expanduser("~/out/run1"),
+                       "seen": {x: sha(x) for x in paths(st)}}
+            else:
+                out = {"translator": "1", "requests": []}
+            r = {"content": [{"type": "text", "text": json.dumps(out)}]}
+        else:
+            r = {}
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}) + "\\n")
+        sys.stdout.flush()
+''')
+
+FAKE_STAGE_LLMT = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    import json
+    print(json.dumps({"mode": "checkout", "translators": {"cfdt": {"version": "1", "backends": {},
+                      "status": {"executor": {"kind": "local", "procs": 1}}}}}))
+''')
+
+
+class Staging(unittest.TestCase):
+    """Router: files on the router's computer named in a call are copied to the machine that runs it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        self.t = t
+        self.mac = t / "mac"                                   # the router's computer: its home folder
+        (self.mac / "parts").mkdir(parents=True)
+        self.data = os.urandom(300_000)
+        (self.mac / "parts" / "a b.step").write_bytes(self.data)
+        (self.mac / "parts" / "copy.stp").write_bytes(self.data)
+        self.sha = hashlib.sha256(self.data).hexdigest()
+        root = t / "root"                                      # the install on the machines
+        (root / "bin").mkdir(parents=True)
+        for path, text in ((root / "bin" / "mcp", FAKE_STAGE_SERVER), (root / "llmt", FAKE_STAGE_LLMT),
+                           (t / "ssh", FAKE_SSH)):
+            path.write_text(text)
+            os.chmod(path, 0o755)
+        (root / "bin" / "llmt-env.sh").write_text((REPO / "bin" / "llmt-env.sh").read_text())
+        for m in ("m1", "m2"):
+            (t / "remotes" / m).mkdir(parents=True)
+        (t / "remotes" / "m1" / "sysenv").write_text(f"CFDT_OUT={t}/remotes/m1/out\n")   # m2: no CFDT_OUT
+        self.log = t / "ssh.log"
+        self.saved_env = {k: os.environ.get(k) for k in ("HOME", "FAKE_REMOTES", "FAKE_HIDE", "FAKE_LOG", "FAKE_SLOW",
+                                                         "CFDT_MAX_UPLOAD_MB")}
+        os.environ.update(HOME=str(self.mac), FAKE_REMOTES=str(t / "remotes"), FAKE_HIDE=str(self.mac),
+                          FAKE_LOG=str(self.log), FAKE_SLOW="0")
+        os.environ.pop("CFDT_MAX_UPLOAD_MB", None)
+        self.saved = (R.L.ssh_exe, R.PATHS_FILE)
+        R.L.ssh_exe = lambda: str(t / "ssh")
+        R.PATHS_FILE = t / "router_paths.json"
+        r = R.Router("cfdt")
+        r.hosts = [{"name": m, "ssh": f"u@{m}", "root": str(root)} for m in ("m1", "m2")]
+        r.prefer, r.exclude, r.speed, r.paths = [], set(), {}, {}
+        r.initialize({"protocolVersion": "2025-06-18"})
+        self.r = r
+
+    def tearDown(self):
+        self.r.close()
+        R.L.ssh_exe, R.PATHS_FILE = self.saved
+        for k, v in self.saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def copies(self) -> list:
+        return [json.loads(x)["cmd"] for x in self.log.read_text().splitlines() if json.loads(x)["cmd"].startswith("cat >")]
+
+    def run_call(self, studies: dict, tool: str = "run_studies") -> tuple:
+        res = self.r.tool_call(tool, {"studies": studies, "wait_s": 0})
+        return res, R.Router.parse(res)
+
+    def test_nested_placement_and_no_second_copy(self):
+        local = str(self.mac / "parts" / "a b.step")
+        studies = {"s": {"geometry": {"step": local}, "more": [{"objects": ["~/parts/copy.stp"]}], "other": "/not/here"}}
+        res, out = self.run_call(studies)
+        self.assertFalse(res.get("isError"), out)
+        m = out["machine"]
+        self.assertEqual(len(out["staged"]), 2, out)
+        base = {"m1": self.t / "remotes" / "m1" / "out" / "uploads",                 # CFDT_OUT/uploads
+                "m2": self.t / "remotes" / "m2" / ".llmt" / "uploads"}                 # no CFDT_OUT: ~/.llmt/uploads
+        want = base[m] / self.sha[:12] / "a_b.step"
+        self.assertEqual(out["staged"][local], str(want))
+        self.assertEqual(set(out["seen"].values()) - {None}, {self.sha})                # the server saw the copies
+        self.assertIsNone(out["seen"]["/not/here"])
+        self.assertNotIn(local, out["seen"])
+        self.assertFalse(any("not valid" in w for w in out["router"].get("warnings", [])), out["router"])
+        for b in base.values():                                       # small files: validated on both machines
+            self.assertEqual((b / self.sha[:12] / "a_b.step").read_bytes(), self.data)
+        n = len(self.copies())
+        res, out = self.run_call(studies)                              # again: nothing is sent
+        self.assertEqual(len(self.copies()), n)
+        self.assertEqual(set(out["seen"].values()) - {None}, {self.sha})
+        # the same content under a new name: linked there, not sent
+        (self.mac / "parts" / "new.step").write_bytes(self.data)
+        res, out = self.run_call({"s": {"geometry": {"step": str(self.mac / "parts" / "new.step")},
+                                        "run": {"host": "m1"}}})
+        self.assertEqual(out["machine"], "m1")
+        self.assertEqual(len(self.copies()), n)
+        self.assertTrue((base["m1"] / self.sha[:12] / "new.step").is_file())
+        # a staged path given back later counts as the local file (it can go to the other machine)
+        remote_m1 = out["staged"][str(self.mac / "parts" / "new.step")]
+        res, out = self.run_call({"s": {"geometry": {"step": remote_m1}, "run": {"host": "m2"}}})
+        self.assertEqual(out["seen"][str(base["m2"] / self.sha[:12] / "new.step")], self.sha)
+
+    def test_limit(self):
+        os.environ["CFDT_MAX_UPLOAD_MB"] = "0.1"
+        res, out = self.run_call({"s": {"geometry": {"step": str(self.mac / "parts" / "a b.step")}}})
+        self.assertTrue(res.get("isError"))
+        self.assertIn("CFDT_MAX_UPLOAD_MB", out["error"])
+        self.assertEqual(self.copies(), [])
+
+    def test_shared_path_left_alone(self):
+        os.environ["FAKE_HIDE"] = ""                                  # the machine sees the same path (shared folder)
+        local = str(self.mac / "parts" / "a b.step")
+        res, out = self.run_call({"s": {"geometry": {"step": local}}})
+        self.assertNotIn("staged", out)
+        self.assertEqual(out["seen"][local], self.sha)
+        self.assertEqual(self.copies(), [])
+
+    def test_slow_copy_then_resume(self):
+        os.environ["FAKE_SLOW"] = "2"
+        local = str(self.mac / "parts" / "a b.step")
+        args = {"studies": {"s": {"geometry": {"step": local}}}, "wait_s": 0}
+        out = R.Router.parse(self.r.call("m1", "run_studies", args, deadline=time.time() + 5))
+        self.assertEqual(out["status"], "uploading")
+        self.assertIn(local, out["uploading"])
+        self.assertIn("again", out["next"])
+        u = next(iter(self.r.uploads.values()))
+        u.thread.join(20)
+        self.assertTrue(u.done, u.error)
+        os.environ["FAKE_SLOW"] = "0"
+        out = R.Router.parse(self.r.call("m1", "run_studies", args, deadline=time.time() + 30))
+        self.assertEqual(out["seen"][out["staged"][local]], self.sha)
+        self.assertEqual(len(self.copies()), 1)
+        # resuming: half of another file is already there as .part; only the rest is appended
+        other = os.urandom(200_000)
+        (self.mac / "parts" / "c.step").write_bytes(other)
+        sha = hashlib.sha256(other).hexdigest()
+        d = self.t / "remotes" / "m2" / ".llmt" / "uploads" / sha[:12]
+        d.mkdir(parents=True)
+        (d / ".c.step.part").write_bytes(other[:120_000])
+        out = R.Router.parse(self.r.call("m2", "run_studies", {"studies": {"s": {"step": str(self.mac / "parts" / "c.step")}}},
+                                         deadline=time.time() + 30))
+        self.assertEqual(out["seen"][str(d / "c.step")], sha)
+        self.assertTrue(self.copies()[-1].startswith("cat >>"), self.copies())
 
 
 if __name__ == "__main__":

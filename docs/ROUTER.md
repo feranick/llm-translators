@@ -1,6 +1,6 @@
 # The router: one translator, several machines
 
-Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2.
+Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1.
 
 Until now, each MCP entry in the Claude app pointed to one machine (`ssh mochi .../bin/mcp cfdt`). With several machines able to run a translator (mochi, carbonio, a DGX Spark), choosing one by hand wastes the others, and one entry per machine (`cfdt-mochi`, `cfdt-carbonio`, ...) multiplies the tools in every chat.
 
@@ -102,6 +102,24 @@ The results stay as the translator wrote them; their paths are real paths on the
 | `machines()` | the router itself | each machine: reachable, mode (release or checkout), `llmt_release` (the llm-translators bundle installed there, named like `2026.10.26.2`; not the translator's version), `version` (the translator's version installed), `serving` (what the server process the router uses runs; `server_stale` and a `note` when it differs), backends, executor, CPUs and their use, the translator's queued and running jobs, load, expected start of a typical job, speed, preferred or excluded |
 
 Answers from a single machine get `"machine": "<name>"` at the top.
+
+## Files on this computer
+
+A study often names a file that exists only where the Claude app runs: a STEP file for cfdt's `geometry.step` or feat's part, p3dt's objects, a b3dt step input. The router copies such files to the machine that gets the call, and passes the call on with their path there.
+
+- **Which strings.** Any string in the arguments, at any depth (inside `studies`, lists, nested dicts), that names a regular file under the home folder of the router's computer (`~/...` works too). The top-level `request`, `bench`, `study_folder` and `path` arguments name results on a machine and are left alone, as are `get_file` and `get_image`.
+- **Already there.** If the same path exists on the machine with the same size (a shared folder), nothing is copied and the path is passed unchanged.
+- **Where.** `$<KEY>_OUT/uploads/<sha256[:12]>/<name>` on the machine, with `<KEY>_OUT` from the machine's settings files (docs/SHARED.md). Without one, `~/.llmt/uploads/<sha256[:12]>/<name>`. The name keeps letters, digits and `._+-`; other characters become `_`.
+- **Not twice.** A file whose hash is already there is not sent again. The same content under another name is hard-linked (or copied) there.
+- **How.** Over the ssh connection the router already shares with the machine, so neither rsync nor scp is needed at either end.
+  - The file is appended to `.<name>.part`, so an interrupted copy resumes where it stopped.
+  - The copy is checked with sha256 on the machine and only then renamed.
+- **The answer** lists what was copied: `"staged": {"<local path>": "<path on the machine>"}`. A path from `staged` given back in a later call still counts as the local file, so that call can go to another machine.
+- **Placement.**
+  - Up to 25 MB of files in total: they are copied to every candidate, so validation and estimates work there as usual.
+  - Larger files are copied to the chosen machine only, and placement uses the queues without validating on each machine.
+- **Time.** A copy that can't finish within the call's time budget goes on in the background. The answer is `"status": "uploading"`, with each file's progress and `eta_s`, and says to repeat the same call. Nothing ran yet. The repeated call stays on the machine receiving the files.
+- **Limit.** `<KEY>_MAX_UPLOAD_MB` (default 500 MB per file), from the router's environment or the settings of the llm-translators install it runs from (`config/env` on the Mac). A larger file is refused, with what to do: copy it yourself and use `run.host`, or raise the limit.
 
 ## Contract addition for the translators: estimates
 

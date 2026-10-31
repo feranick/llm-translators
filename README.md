@@ -358,6 +358,7 @@ When several machines can run a translator (mochi, carbonio, a DGX Spark), the r
   - Studies that refer to an earlier request stay on its machine.
   - Machines whose versions differ are used, with a warning.
 - **Follow-up calls** (`study_status`, `cancel`, `get_file`, `get_image`, ...) go to the machine that holds the request.
+- **Files on the Mac** named in a call (a STEP file in a study, under your home folder) are copied to the chosen machine first, and the call gets their path there (`"staged": {local: remote}`). A copy already there is not sent again. Limit: `<KEY>_MAX_UPLOAD_MB` (default 500).
 - **`jobs()`** combines all machines, and **`machines()`**, a tool the router adds, shows their load, queues and versions.
 - **Answers say where they ran:** `"machine": "mochi"`, plus `"router": {chose, why, candidates}` for placed runs.
 
