@@ -368,7 +368,7 @@ class Staging(unittest.TestCase):
         m = out["machine"]
         self.assertEqual(len(out["staged"]), 2, out)
         base = {"m1": self.t / "remotes" / "m1" / "out" / "uploads",                 # CFDT_OUT/uploads
-                "m2": self.t / "remotes" / "m2" / ".llmt" / "uploads"}                 # no CFDT_OUT: ~/.llmt/uploads
+                "m2": self.t / "remotes" / "m2" / "cfdt_runs" / "uploads"}             # no CFDT_OUT: cfdt's default
         want = base[m] / self.sha[:12] / "a_b.step"
         self.assertEqual(out["staged"][local], str(want))
         self.assertEqual(set(out["seen"].values()) - {None}, {self.sha})                # the server saw the copies
@@ -400,6 +400,15 @@ class Staging(unittest.TestCase):
         self.assertIn("CFDT_MAX_UPLOAD_MB", out["error"])
         self.assertEqual(self.copies(), [])
 
+    def test_no_default_output_folder(self):
+        self.assertEqual(self.r.default_out(), "cfdt_runs")
+        self.r.t = {**self.r.t, "env": {}}                          # a translator with no default listed
+        self.assertIsNone(self.r.default_out())
+        local = str(self.mac / "parts" / "a b.step")
+        res, out = self.run_call({"s": {"geometry": {"step": local}, "run": {"host": "m2"}}})
+        self.assertEqual(out["staged"][local],
+                         str(self.t / "remotes" / "m2" / ".llmt" / "uploads" / self.sha[:12] / "a_b.step"))
+
     def test_shared_path_left_alone(self):
         os.environ["FAKE_HIDE"] = ""                                  # the machine sees the same path (shared folder)
         local = str(self.mac / "parts" / "a b.step")
@@ -427,7 +436,7 @@ class Staging(unittest.TestCase):
         other = os.urandom(200_000)
         (self.mac / "parts" / "c.step").write_bytes(other)
         sha = hashlib.sha256(other).hexdigest()
-        d = self.t / "remotes" / "m2" / ".llmt" / "uploads" / sha[:12]
+        d = self.t / "remotes" / "m2" / "cfdt_runs" / "uploads" / sha[:12]
         d.mkdir(parents=True)
         (d / ".c.step.part").write_bytes(other[:120_000])
         out = R.Router.parse(self.r.call("m2", "run_studies", {"studies": {"s": {"step": str(self.mac / "parts" / "c.step")}}},

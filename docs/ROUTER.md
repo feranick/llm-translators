@@ -1,6 +1,6 @@
 # The router: one translator, several machines
 
-Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1.
+Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2).
 
 Until now, each MCP entry in the Claude app pointed to one machine (`ssh mochi .../bin/mcp cfdt`). With several machines able to run a translator (mochi, carbonio, a DGX Spark), choosing one by hand wastes the others, and one entry per machine (`cfdt-mochi`, `cfdt-carbonio`, ...) multiplies the tools in every chat.
 
@@ -109,7 +109,9 @@ A study often names a file that exists only where the Claude app runs: a STEP fi
 
 - **Which strings.** Any string in the arguments, at any depth (inside `studies`, lists, nested dicts), that names a regular file under the home folder of the router's computer (`~/...` works too). The top-level `request`, `bench`, `study_folder` and `path` arguments name results on a machine and are left alone, as are `get_file` and `get_image`.
 - **Already there.** If the same path exists on the machine with the same size (a shared folder), nothing is copied and the path is passed unchanged.
-- **Where.** `$<KEY>_OUT/uploads/<sha256[:12]>/<name>` on the machine, with `<KEY>_OUT` from the machine's settings files (docs/SHARED.md). Without one, `~/.llmt/uploads/<sha256[:12]>/<name>`. The name keeps letters, digits and `._+-`; other characters become `_`.
+- **Where.** `$<KEY>_OUT/uploads/<sha256[:12]>/<name>` on the machine, with `<KEY>_OUT` from the machine's settings files (docs/SHARED.md).
+  - Most machines don't set `<KEY>_OUT`. Then the translator's own default output folder is used, as `translators.json` describes it (`~/cfdt_runs/uploads/...`).
+  - Only a translator with no default listed there uses `~/.llmt/uploads/...`. The name keeps letters, digits and `._+-`; other characters become `_`.
 - **Not twice.** A file whose hash is already there is not sent again. The same content under another name is hard-linked (or copied) there.
 - **How.** Over the ssh connection the router already shares with the machine, so neither rsync nor scp is needed at either end.
   - The file is appended to `.<name>.part`, so an interrupted copy resumes where it stopped.

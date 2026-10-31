@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.31.1
+Version: 2026.10.31.2
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -30,7 +30,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.31.1"
+__version__ = "2026.10.31.2"
 
 HERE = Path(__file__).resolve().parent
 
@@ -718,6 +718,14 @@ class Router:
                                  f"copy it there yourself and give its path on that machine (with run.host), or raise {var}")
         return total
 
+    def default_out(self) -> str | None:
+        """The translator's own default output folder, relative to the home folder ('cfdt_runs'), from the registry's
+        description of <KEY>_OUT ("output folder (default ~/cfdt_runs)"): the code's default, which a machine uses
+        when its settings files don't set <KEY>_OUT."""
+        desc = str((self.t.get("env") or {}).get(f"{self.key.upper()}_OUT") or "")
+        m = re.search(r"default\s+~/([A-Za-z0-9._/-]+?)[)\s,;]", desc + " ")
+        return m.group(1).rstrip("/") if m and ".." not in m.group(1) else None
+
     def file_hash(self, path: str) -> tuple:
         st = os.stat(path)
         k = (path, st.st_size, st.st_mtime_ns)
@@ -751,7 +759,8 @@ class Router:
 
     def stage(self, name: str, tool: str, args: dict, deadline: float | None = None, margin: float = 5.0) -> tuple:
         """Copies the local files named in args to the machine (unless the same path exists there with the same size:
-        a shared folder) to <KEY>_OUT/uploads/<sha256[:12]>/<name> there, or ~/.llmt/uploads/... without <KEY>_OUT.
+        a shared folder) to <KEY>_OUT/uploads/<sha256[:12]>/<name> there; without <KEY>_OUT in its settings, the
+        translator's default output folder (~/cfdt_runs/uploads/...), or ~/.llmt/uploads/... when it has none.
         A copy already there (same hash) is not sent again. Waits until deadline - margin.
         -> (args with the paths on the machine, staged {local: remote}, uploading {local: progress} or None)."""
         h = self.host(name)
@@ -768,9 +777,11 @@ class Router:
         lps = sorted(info)
         q = shlex.quote
         var = f"{self.key.upper()}_OUT"
+        dflt = self.default_out()
+        fallback = f'"$HOME"/{q(dflt + "/uploads")}' if dflt else '"$HOME/.llmt/uploads"'
         lines = [f"_llmt_root={root_expr(h['root'])}",
                  '[ -r "$_llmt_root/bin/llmt-env.sh" ] && . "$_llmt_root/bin/llmt-env.sh" >/dev/null 2>&1',
-                 f'if [ -n "${{{var}:-}}" ]; then b="${var}/uploads"; else b="$HOME/.llmt/uploads"; fi',
+                 f'if [ -n "${{{var}:-}}" ]; then b="${var}/uploads"; else b={fallback}; fi',
                  'echo "@@BASE $b"']
         for i, lp in enumerate(lps):
             size, sha, nm = info[lp]
