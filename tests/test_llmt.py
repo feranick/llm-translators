@@ -4,6 +4,7 @@
       server_stale) and replaces it once idle;
     - llmt servers: the process list, with a symlinked prefix, a shell mentioning a server path, a SLURM job;
     - llmt deploy's pin check: a pin behind its branch's newest commit;
+    - llmt status: an editable install behind its checkout (version, missing dependencies) and the fix it names;
     - the router copies local input files to the machine (fake ssh, two machines): nested arguments, the copy's
       place, no second copy, a link for the same content, the size limit, a shared path, a slow copy, resuming.
 """
@@ -227,6 +228,81 @@ class PinCheck(unittest.TestCase):
             self.assertIn("llmt pin cfdt --commit --push", err.getvalue())
         finally:
             L.pin_report, L.submodule_url, L.submodule_branch, L.git = saved
+
+
+class Reinstall(unittest.TestCase):
+    """llmt status: an editable install whose checkout moved on (new version, new dependencies) without a reinstall."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        site, src = t / "site", t / "src"
+        (site / "pkgx").mkdir(parents=True)
+        src.mkdir()
+        # the code (the checkout) says 2026.10.28.1 and needs a new package; the installed metadata is older
+        (site / "pkgx" / "__init__.py").write_text('__version__ = "2026.10.28.1"\n')
+        di = site / "fake_translator-2026.10.21.1.dist-info"
+        di.mkdir()
+        (di / "METADATA").write_text("Metadata-Version: 2.1\nName: fake-translator\nVersion: 2026.10.21.1\n"
+                                     "Requires-Dist: pip\nRequires-Dist: old-gone-pkg-xyz; extra == \"unused\"\n"
+                                     "Requires-Dist: mcp-dep-xyz>=1; extra == \"mcp\"\n")
+        (src / "pyproject.toml").write_text(textwrap.dedent('''\
+            [project]
+            name = "fake-translator"
+            version = "2026.10.28.1"
+            dependencies = ["pip", "matplotlib-new-xyz>=3.7", "winonly-xyz; sys_platform == 'win32'"]
+            [project.optional-dependencies]
+            mcp = ["mcp-dep-xyz>=1"]
+            test = ["pytest-xyz"]
+            '''))
+        self.site, self.src = site, src
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def report(self, extras):
+        r = subprocess.run([sys.executable, "-c", L._VENV_REPORT,
+                            json.dumps({"x": ["pkgx", "fake-translator", extras, str(self.src)]})],
+                           capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(self.site)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)["x"]
+
+    def test_report(self):
+        rep = self.report(["mcp"])
+        self.assertEqual((rep["version"], rep["dist_version"], rep["stale"]), ("2026.10.28.1", "2026.10.21.1", True))
+        self.assertEqual(sorted(rep["missing"]), ["matplotlib-new-xyz>=3.7", "mcp-dep-xyz>=1"])
+        self.assertNotIn("pytest-xyz", rep["missing"])                 # the test extra was not chosen
+        rep = self.report([])
+        self.assertEqual(rep["missing"], ["matplotlib-new-xyz>=3.7"])
+
+    def test_hint_and_status_line(self):
+        rep = {"version": "2026.10.28.1", "dist_version": "2026.10.21.1", "stale": True, "missing": ["matplotlib>=3.7"]}
+        bad = L.reinstall_needed("b3dt", rep, "pinned")
+        self.assertEqual(bad["problem"], "installed as 2026.10.21.1, code 2026.10.28.1; missing matplotlib>=3.7")
+        self.assertEqual(bad["fix"], "llmt update b3dt --no-pull")
+        self.assertEqual(L.reinstall_needed("b3dt", rep, "moved")["fix"], "llmt install b3dt")   # keeps the checkout
+        self.assertEqual(L.reinstall_needed("b3dt", {"version": "2026.11.2.9", "dist_version": "2026.11.02.9",
+                                                     "stale": False, "missing": []}, "pinned"), {})
+        data = {"llmt": "x", "root": "/r", "commit": "abc", "venv": "/r/.venv", "python": "3.12", "settings": [],
+                "translators": {"b3dt": {"version": "2026.10.28.1", "commit": "abc1234", "submodule": "pinned",
+                                         "backends": {}, **bad}}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            L.print_status(data, False)
+        self.assertIn("b3dt: installed as 2026.10.21.1, code 2026.10.28.1; missing matplotlib>=3.7: "
+                      "run llmt update b3dt --no-pull", out.getvalue())
+
+    def test_mcp_test_entry(self):
+        saved = (L.venv_report, L.submodule_states)
+        try:
+            L.venv_report = lambda *a: {"b3dt": {"version": "2026.10.28.1", "dist_version": "2026.10.21.1",
+                                                 "stale": True, "missing": []}}
+            L.submodule_states = lambda: {"build123d-translator": ("pinned", "abc1234")}
+            bad = L.entry_health("b3dt", {"command": str(L.ROOT / "bin" / "mcp"), "args": ["b3dt"]})
+            self.assertEqual(bad["fix"], "llmt update b3dt --no-pull")
+            self.assertIsNone(L.entry_health("b3dt", {"command": str(L.ROOT / "bin" / "router"), "args": ["b3dt"]}))
+        finally:
+            L.venv_report, L.submodule_states = saved
 
 
 FAKE_SSH = textwrap.dedent('''\

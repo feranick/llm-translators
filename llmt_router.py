@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.10.31.2
+Version: 2026.11.02.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -30,7 +30,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.10.31.2"
+__version__ = "2026.11.02.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -430,6 +430,8 @@ class Router:
                 rel = data.get("release") or {}
                 out.update(llmt_commit=data.get("commit") or (rel.get("umbrella") or "")[:7] or None,
                            translator_commit=((rel.get("commits") or {}).get(self.t["repo"]) or "")[:7] or None)
+                if d.get("reinstall"):         # the install there lacks dependencies of its code (llmt status says)
+                    out["needs_reinstall"] = f"{d.get('problem')}: run {d.get('fix')} there"
                 out.update(reachable=True, mode=data.get("mode"), release=rel.get("release"),
                            version=d.get("version"), backends_missing=miss, executor=ex,
                            slurm={k: sl.get(k) for k in ("cpus", "cpus_allocated", "time_limit", "state", "nodes_usable",

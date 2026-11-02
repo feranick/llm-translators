@@ -477,6 +477,7 @@ To finish moving over:
 | Shared release: `permission denied` from `llmt` | Machine settings and releases belong to the admin: use `sudo`. Users change only their own settings (`llmt env --edit`). |
 | Shared release: a user still gets the old version | Their server started before the switch: reconnect. `llmt releases` shows which releases are still in use. |
 | `llmt gc` keeps an old release | A running server or a queued job still uses it. It goes once they finish. |
+| A tool fails with `ModuleNotFoundError` (e.g. matplotlib); `llmt status` says "installed as X, code Y; missing …" | A personal checkout's code moved (`git pull`, `git submodule update`, `llmt pin`) without a reinstall. An editable install runs the new code but gets new dependencies only when it is reinstalled. Run what `llmt status` says: `llmt update KEY --no-pull`, or `llmt install KEY` for a checkout moved past its pin (that keeps the checkout as it is). `llmt mcp test` fails with the same hint. Shared releases build a fresh venv each time and are not affected. |
 | Router: `llmt mcp test` says "the router reached no machine" | ssh to every machine failed. `llmt router status` shows each machine's error; check `ssh -o BatchMode=yes HOST true`. |
 | Router: "exists on mochi, carbonio (a shared filesystem?)" | The machines share a home folder, so the router can't tell from the path which one ran the request. Use `machine:/path` (e.g. `mochi:/home/...`). Requests the router placed itself are always known. |
 

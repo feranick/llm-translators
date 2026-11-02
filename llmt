@@ -50,7 +50,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.10.28.1"
+__version__ = "2026.11.02.1"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -218,19 +218,153 @@ def default_python() -> str:
     return sys.executable
 
 
-def installed_in_venv() -> dict[str, str]:
-    """key -> version for the translators importable from the venv."""
+# Runs in the venv's Python (3.10+). Per translator importable there: its code's __version__, the installed
+# distribution's version, and the requirements (installed metadata + the checkout's pyproject.toml, for the chosen
+# extras) that are neither installed nor importable. An editable install runs the checkout's code but gets its
+# dependencies only when it is (re)installed: a checkout moved without reinstalling may need packages the venv lacks.
+_VENV_REPORT = r'''
+import importlib, importlib.metadata as md, importlib.util, json, os, sys
+REG = json.loads(sys.argv[1])
+try:
+    from packaging.requirements import Requirement
+except Exception:
+    try:
+        from pip._vendor.packaging.requirements import Requirement
+    except Exception:
+        Requirement = None
+try:
+    import tomllib
+except ImportError:
+    try:
+        from pip._vendor import tomli as tomllib
+    except Exception:
+        tomllib = None
+
+def norm(v):
+    return tuple(int(x) if x.isdigit() else x for x in str(v).replace("-", ".").split("."))
+
+def dist_of(pkg, repo):
+    names = [repo]
+    try:
+        names += md.packages_distributions().get(pkg, [])
+    except Exception:
+        pass
+    for n in names:
+        try:
+            return md.distribution(n)
+        except md.PackageNotFoundError:
+            pass
+    return None
+
+def have(name):
+    for n in dict.fromkeys((name, name.replace("-", "_"), name.replace("_", "-"), name.lower())):
+        try:
+            return md.version(n)
+        except md.PackageNotFoundError:
+            pass
+    return None
+
+def importable(name):
+    try:
+        return importlib.util.find_spec(name.replace("-", "_").lower()) is not None
+    except Exception:
+        return False
+
+def source_reqs(src, extras):
+    if tomllib is None:
+        return []
+    try:
+        with open(os.path.join(src, "pyproject.toml"), encoding="utf-8") as f:   # loads(str): tomllib and every tomli
+            proj = tomllib.loads(f.read()).get("project", {})
+    except Exception:
+        return []
+    reqs = list(proj.get("dependencies", []))
+    for e in extras:
+        reqs += proj.get("optional-dependencies", {}).get(e, [])
+    return reqs
+
+out = {}
+for k, (pkg, repo, extras, src) in REG.items():
+    try:
+        m = importlib.import_module(pkg)
+    except Exception:
+        continue
+    r = {"version": getattr(m, "__version__", "?"), "missing": []}
+    d = dist_of(pkg, repo)
+    reqs = source_reqs(src, extras)
+    if d is not None:
+        r["dist"] = d.metadata["Name"]
+        r["dist_version"] = d.version
+        r["stale"] = r["version"] != "?" and norm(d.version) != norm(r["version"])
+        reqs += list(d.requires or [])
+    if Requirement is not None:
+        seen = set()
+        for s in reqs:
+            try:
+                q = Requirement(s)
+            except Exception:
+                continue
+            if q.marker is not None and not any(q.marker.evaluate({"extra": e}) for e in [""] + list(extras)):
+                continue
+            v = have(q.name)
+            if v is None:
+                miss = None if importable(q.name) else q.name + str(q.specifier)
+            elif q.specifier and not q.specifier.contains(v, prereleases=True):
+                miss = f"{q.name}{q.specifier} (installed {v})"
+            else:
+                miss = None
+            if miss and miss not in seen:
+                seen.add(miss)
+                r["missing"].append(miss)
+    out[k] = r
+print(json.dumps(out))
+'''
+
+
+def install_extras(key: str, setup: dict) -> list[str]:
+    """The extras a translator is installed with: its own, the test tools if chosen, the optional ones chosen
+    (a release: its own and the test tools)."""
+    t = REGISTRY[key]
+    test = t.get("test_extra") if (SHARED or setup.get("test", True)) else None
+    return list(t["extras"]) + ([test] if test else []) + \
+        ([] if SHARED else [e for e in setup.get("extras", {}).get(key, []) if e in t["optional_extras"]])
+
+
+def venv_report(setup: dict | None = None) -> dict[str, dict]:
+    """key -> {version (the code's), dist_version (installed), stale, missing [requirements]} for the translators
+    importable from the venv (one Python call for all)."""
     if not VPY.exists():
         return {}
-    code = ("import importlib, json\nout = {}\n"
-            f"for k, p in {json.dumps({k: t['package'] for k, t in REGISTRY.items()})}.items():\n"
-            "    try:\n        m = importlib.import_module(p); out[k] = getattr(m, '__version__', '?')\n"
-            "    except Exception:\n        pass\nprint(json.dumps(out))")
-    r = run([VPY, "-c", code], capture=True, check=False)
+    setup = load_setup() if setup is None else setup
+    reg = {k: [t["package"], t["repo"], install_extras(k, setup), str(ROOT / t["repo"])] for k, t in REGISTRY.items()}
+    r = run([VPY, "-c", _VENV_REPORT, json.dumps(reg)], capture=True, check=False)
     try:
         return json.loads(r.stdout)
     except json.JSONDecodeError:
         return {}
+
+
+def installed_in_venv() -> dict[str, str]:
+    """key -> version for the translators importable from the venv."""
+    return {k: r.get("version", "?") for k, r in venv_report().items()}
+
+
+def reinstall_needed(key: str, rep: dict, state: str) -> dict:
+    """{} when the installed translator matches its code, else {reinstall, problem, fix, missing}."""
+    parts = []
+    if rep.get("stale"):
+        parts.append(f"installed as {rep.get('dist_version')}, code {rep.get('version')}")
+    if rep.get("missing"):
+        parts.append("missing " + ", ".join(rep["missing"]))
+    if not parts:
+        return {}
+    if SHARED:
+        fix = "the admin rebuilds the release: sudo llmt deploy"
+    elif state == "moved":       # llmt update would put the pinned commit back; install keeps this checkout
+        fix = f"llmt install {key}"
+    else:
+        fix = f"llmt update {key} --no-pull"
+    return {"reinstall": True, "problem": "; ".join(parts), "fix": fix}
 
 
 _GIT_WARNED = False
@@ -454,10 +588,7 @@ def checkout(keys: list[str]) -> None:
 def pip_install(keys: list[str], setup: dict, upgrade: bool = False) -> None:
     specs = []
     for k in keys:
-        t = REGISTRY[k]
-        extras = list(t["extras"]) + ([t["test_extra"]] if setup.get("test", True) and t.get("test_extra") else [])
-        extras += [e for e in setup.get("extras", {}).get(k, []) if e in t["optional_extras"]]
-        specs += ["-e", f"{ROOT / t['repo']}[{','.join(extras)}]"]
+        specs += ["-e", f"{ROOT / REGISTRY[k]['repo']}[{','.join(install_extras(k, setup))}]"]
     cmd = [VPY, "-m", "pip", "install"] + (["--upgrade"] if upgrade else []) + specs
     run(cmd)
 
@@ -1036,7 +1167,8 @@ def backend_report(key: str, st: dict | None) -> list[tuple[str, bool, str, dict
 
 def status_data(keys: list[str] | None = None) -> dict:
     setup = load_setup()
-    inst = installed_in_venv()
+    rep = venv_report(setup)
+    inst = {k: r.get("version", "?") for k, r in rep.items()}
     subs = submodule_states()
     keys = keys or KEYS
     data = {"llmt": __version__, "root": str(ROOT), "venv": str(VENV) if VPY.exists() else None,
@@ -1053,6 +1185,10 @@ def status_data(keys: list[str] | None = None) -> dict:
         d = {"repo": t["repo"], "submodule": state, "commit": commit, "version": inst.get(k),
              "selected": k in setup.get("installed", [])}
         if k in inst:
+            d["installed_as"] = rep[k].get("dist_version")
+            d["missing"] = rep[k].get("missing", [])
+            d["reinstall"] = False
+            d.update(reinstall_needed(k, rep[k], state))
             st = tool_status(k)
             d["backends"] = {name: {"found": ok, "detail": what} for name, ok, what, _ in backend_report(k, st)}
             d["status"] = st
@@ -1089,6 +1225,8 @@ def print_status(data: dict, verbose: bool) -> None:
         bes = d.get("backends", {})
         parts = [f"{n}: {'ok' if v['found'] else 'MISSING'}" for n, v in bes.items()] or ["none needed"]
         say(f"  {k:5} {d['version']:14} {d['commit']:8} {d['submodule']:10} " + "; ".join(parts))
+        if d.get("reinstall"):
+            say(f"{'':8}! {k}: {d['problem']}: run {d['fix']}")
         for n, v in bes.items():
             if verbose or (not v["found"] and v["detail"] != "not found"):
                 say(f"{'':43}{n}: {v['detail']}")
@@ -1114,6 +1252,11 @@ def print_status(data: dict, verbose: bool) -> None:
     moved = [k for k, d in data["translators"].items() if d["submodule"] == "moved"]
     if moved:
         say(f"\nNot at the commit the umbrella pins: {', '.join(moved)} (llmt update to go back, or commit the new pins).")
+    redo = [k for k, d in data["translators"].items() if d.get("reinstall")]
+    if redo:
+        say(f"\nThe code of {', '.join(redo)} moved without a reinstall, so the venv may lack its dependencies "
+            f"(their tools can fail with ModuleNotFoundError). Fix: " +
+            "; ".join(sorted({data['translators'][k]['fix'] for k in redo})))
 
 
 # ---------------------------------------------------------------- MCP
@@ -1523,6 +1666,39 @@ def show_macos_warnings() -> None:
         warn(w)
 
 
+def entry_health(key: str, entry: dict) -> dict | None:
+    """For an entry running llm-translators' bin/mcp (here or over ssh): whether that install's translator matches
+    its code and has its dependencies ({reinstall, problem, fix[, host]}), else None. Router entries are skipped
+    (llmt router status / machines() show each machine)."""
+    cmd = str(entry.get("command", ""))
+    args = [str(x) for x in entry.get("args", [])]
+    if cmd.endswith("/bin/mcp") and not is_ssh(entry):
+        root = Path(cmd).parent.parent
+        if root.resolve() == ROOT.resolve():
+            rep = venv_report().get(key)
+            if not rep:
+                return None
+            return reinstall_needed(key, rep, submodule_states().get(REGISTRY[key]["repo"], ("?", ""))[0]) or None
+        host, root_s = None, str(root)
+    elif is_ssh(entry):
+        i = next((j for j, x in enumerate(args) if x.endswith("/bin/mcp")), None)
+        if not i:
+            return None
+        host, root_s = args[i - 1], args[i][: -len("/bin/mcp")]
+    else:
+        return None
+    base = ["python3", f"{root_s}/llmt", "status", "--json", key]
+    cmd_ = base if host is None else [ssh_exe(), *SSH_OPTS, "-o", "ConnectTimeout=10", host, *base]
+    try:
+        r = subprocess.run(cmd_, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
+        d = json.loads(r.stdout).get("translators", {}).get(key, {}) if r.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, AttributeError):
+        return None
+    if not d.get("reinstall"):
+        return None
+    return {**{k: d.get(k) for k in ("reinstall", "problem", "fix")}, "host": host}
+
+
 def mcp_test_one(key: str, entry: dict, timeout: float = 180) -> bool:
     """Starts the server the way the Claude app does (its command and args, a bare environment: the app
     does not read your shell's startup files), does the MCP handshake and lists the tools."""
@@ -1612,6 +1788,11 @@ def mcp_test_one(key: str, entry: dict, timeout: float = 180) -> bool:
         except subprocess.TimeoutExpired:
             p.kill()
         time.sleep(0.2)
+    bad = entry_health(key, entry)
+    if bad:
+        ok = False
+        say(f"    FAILED: {key}{' on ' + bad['host'] if bad.get('host') else ''}: {bad['problem']}: "
+            f"run {bad['fix']}{' there' if bad.get('host') else ''}")
     if not ok and err:
         say("    its stderr (last lines):")
         for line in err[-25:]:
@@ -2434,6 +2615,11 @@ def cmd_setup(a) -> None:
         dropped = [k for k in setup.get("installed", []) if k not in keys]
         if dropped:
             say(f"  Still installed from before: {', '.join(dropped)} (llmt remove {' '.join(dropped)} to uninstall)")
+        subs = submodule_states()
+        for k, rep in venv_report(setup).items():
+            bad = reinstall_needed(k, rep, subs.get(REGISTRY[k]["repo"], ("?", ""))[0])
+            if bad:
+                warn(f"{k}: {bad['problem']}: run {bad['fix']}")
 
         say(f"\nStep 3/4 — Backends (installed separately: {BACKENDS_MD})")
         missing_any = False
@@ -2642,6 +2828,8 @@ def cmd_pin(a) -> None:
     if not changed:
         say("  Nothing to pin.")
         return
+    inst = installed_in_venv()
+    moved_here = [k for k, p, _, _ in changed if k in inst and (ROOT / p / ".git").exists()]
     paths = [p for _, p, _, _ in changed]
     msg = "Pin " + ", ".join(f"{k} {t[:7]}" for k, _, _, t in changed)
     if a.commit:
@@ -2656,6 +2844,9 @@ def cmd_pin(a) -> None:
     else:
         say(f"\n  Staged. Record them with: git commit -m '{msg}'   (or rerun with --commit [--push])")
     say("  Then on each machine: llmt update   (pulls, checks out the new pins, reinstalls)")
+    if moved_here:
+        say(f"\n  Here the code of {', '.join(moved_here)} moved, but the venv still has the dependencies of the old")
+        say(f"  version (new ones would be missing). Reinstall: llmt update {' '.join(moved_here)} --no-pull")
 
 
 def cmd_test(a) -> None:
