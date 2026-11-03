@@ -190,6 +190,44 @@ class ServersList(unittest.TestCase):
             self.assertEqual((found[106]["release"], found[106]["old"]), (None, False))
 
 
+class Orphans(unittest.TestCase):
+    """llmt servers / gc: multiprocessing helpers left behind by a server that ended (parent pid 1)."""
+
+    def test_scan(self):
+        with tempfile.TemporaryDirectory() as t:
+            t = Path(t)
+            prefix = t / "opt"
+            for rel in ("2026.11.01.1", "2026.11.03.1"):
+                b = prefix / "releases" / rel / ".venv" / "bin"
+                b.mkdir(parents=True)
+                (b / "python").write_text("")
+            (prefix / "current").symlink_to(Path("releases") / "2026.11.03.1")
+            proc = t / "proc"
+            uid = os.getuid()
+
+            def p(pid, ppid, *argv):
+                d = proc / str(pid)
+                d.mkdir(parents=True)
+                (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+                (d / "status").write_text(f"Name:\tx\nPPid:\t{ppid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+            old = f"{prefix}/releases/2026.11.01.1/.venv/bin"
+            cur = f"{prefix}/current/.venv/bin"                       # through the 'current' symlink
+            tracker = "from multiprocessing.resource_tracker import main;main(13)"
+            spawn = "from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=14, pipe_handle=16)"
+            p(503598, 1, f"{old}/python", "-c", tracker)               # leftovers of an ended server
+            p(503599, 1, f"{old}/python", "-c", spawn, "--multiprocessing-fork")
+            p(700, 1, f"{cur}/python", f"{cur}/feat-mcp")              # a live server ...
+            p(701, 700, f"{cur}/python", "-c", tracker)                # ... and its helpers: left alone
+            p(702, 700, f"{cur}/python", "-c", spawn, "--multiprocessing-fork")
+            p(800, 1, "/usr/bin/python3", "-c", tracker)               # not a translator venv
+            p(801, 1, "bash", "-c", "from multiprocessing x")
+            found = {e["pid"]: e for e in L.scan_orphans(prefix, proc)}
+            self.assertEqual(sorted(found), [503598, 503599])
+            self.assertEqual((found[503598]["kind"], found[503598]["release"], found[503598]["current"]),
+                             ("resource tracker", "2026.11.01.1", False))
+            self.assertEqual(found[503599]["kind"], "worker")
+
+
 class PinCheck(unittest.TestCase):
     """Item 4: a pin behind the newest commit of its branch."""
 

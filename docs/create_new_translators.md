@@ -259,6 +259,9 @@ Implement [EXECUTION.md](EXECUTION.md) from the start, copying cfdt's `executor.
 - **Time.** The job's limit is the timeout + 10 min, so the translator stops itself first and writes a clean "timed out". With `<KEY>_SLURM_TIME=estimate`, short studies get short limits and SLURM can backfill them. So give every study a time estimate before it runs; it also feeds `eta_min_max` and `<KEY>_SLURM_MIN_MINUTES`.
 - **Measure scaling on the server** before choosing defaults. Run one study at about 6, 10 and 19 ranks, then two at 10 side by side. mochi turned out to be memory-bandwidth bound: for sweeps, run several studies side by side on about half the cores each, and give a single study all the cores.
 - **Cancellation and timeouts reach the whole solver.** Start the backend in its own process group (`start_new_session=True`) and kill the group, so mpirun and every rank stop. A `cancel` flag file in the study folder lets any process stop a local run within a second.
+- **Worker pools never outlive the server.** A spawned multiprocessing worker holds both ends of its own task queue, so it never sees its parent go. Left behind, it waits forever with its `resource_tracker` and keeps its release "in use" for `llmt gc` (feat, carbonio, November 2026).
+  - Terminate every pool (study pool, auxiliary pools, `ProcessPoolExecutor`s) before any `os._exit`. `os._exit` skips `atexit`.
+  - Give each pool an `initializer` that ends the worker when its parent dies, as a backstop for crashes and `kill -9`. On Linux use `prctl(PR_SET_PDEATHSIG, SIGTERM)` through ctypes, then check `os.getppid()` once for the race. Elsewhere use a daemon thread that exits when `os.getppid()` changes.
 
 ### Tests
 

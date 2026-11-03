@@ -50,7 +50,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.11.02.1"
+__version__ = "2026.11.03.1"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -2106,16 +2106,93 @@ def scan_servers(prefix: Path, proc: Path = Path("/proc"), skip: set | None = No
     return out
 
 
+def _proc_info(d: Path) -> tuple[list[str], int | None, str]:
+    """-> (argv, parent pid, user) of /proc/<pid>."""
+    argv = [x.decode(errors="replace") for x in (d / "cmdline").read_bytes().split(b"\0") if x]
+    ppid, user = None, "?"
+    try:
+        for line in (d / "status").read_text().splitlines():
+            if line.startswith("PPid:"):
+                ppid = int(line.split()[1])
+            elif line.startswith("Uid:"):
+                try:
+                    import pwd
+                    user = pwd.getpwuid(int(line.split()[1])).pw_name
+                except (ImportError, KeyError, ValueError):
+                    pass
+    except OSError:
+        pass
+    return argv, ppid, user
+
+
+def scan_orphans(prefix: Path, proc: Path = Path("/proc"), skip: set | None = None) -> list[dict]:
+    """Python multiprocessing helpers (pool workers, resource trackers) of a translator's venv whose parent is
+    gone: a server that exited without stopping its worker pools leaves them waiting forever, and they keep
+    their release 'in use' for llmt gc. A helper counts as orphaned when its parent is not a process of the same
+    venv (pid 1, or a subreaper such as systemd --user); helpers of a live server or SLURM job are left alone."""
+    real_prefix = os.path.realpath(str(prefix))
+    rel_dir = real_prefix.rstrip("/") + "/releases/"
+    cur_link = Path(real_prefix) / "current"
+    cur = os.path.realpath(str(cur_link)) if cur_link.exists() or cur_link.is_symlink() else None
+    out = []
+    for d in sorted(proc.iterdir(), key=lambda x: int(x.name) if x.name.isdigit() else 0):
+        if not d.name.isdigit() or (skip and int(d.name) in skip):
+            continue
+        try:
+            argv, ppid, user = _proc_info(d)
+        except OSError:
+            continue
+        if len(argv) < 3 or argv[1] != "-c" or not argv[2].startswith("from multiprocessing"):
+            continue
+        bindir = os.path.realpath(os.path.dirname(argv[0]))
+        if not bindir.endswith("/.venv/bin"):
+            continue
+        parent_dir = None
+        if ppid and ppid > 1:
+            try:
+                pargv = _proc_info(proc / str(ppid))[0]
+                parent_dir = os.path.realpath(os.path.dirname(pargv[0])) if pargv else None
+            except OSError:
+                parent_dir = None
+        if parent_dir == bindir:
+            continue                                   # its server (or job) is alive
+        root = bindir[: -len("/.venv/bin")]
+        release = root[len(rel_dir):] if root.startswith(rel_dir) and "/" not in root[len(rel_dir):] else None
+        out.append({"pid": int(d.name), "ppid": ppid, "user": user, "root": root, "release": release,
+                    "current": release is not None and root == cur,
+                    "kind": "resource tracker" if "resource_tracker" in argv[2] else "worker"})
+    return out
+
+
 def cmd_servers(a) -> None:
     proc = Path("/proc")
     if not proc.is_dir():
         die("llmt servers reads /proc: Linux only")
     prefix = prefix_of(a)
-    found = scan_servers(prefix, proc, own_ancestors(proc))
+    mine = own_ancestors(proc)
+    found = scan_servers(prefix, proc, mine)
+    orphans = scan_orphans(prefix, proc, mine)
     cur = current_release(prefix)
     say(f"Translator MCP servers on this machine (shared prefix {prefix}, current: {cur.name if cur else '-'})")
+    if orphans:
+        say("\nLeftover worker processes (their server has ended; they only hold their release):")
+        for e in orphans:
+            where = f"release {e['release']}" if e["release"] else f"checkout {e['root']}"
+            say(f"  {e['pid']:>8}  {e['user']:12} {e['kind']:16} {where}")
+        if a.stop:
+            for e in orphans:
+                try:
+                    os.kill(e["pid"], signal.SIGTERM)
+                    say(f"  stopped {e['pid']} ({e['user']}, {e['kind']})")
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    warn(f"{e['pid']} belongs to {e['user']}: run as root (sudo) to stop it")
+        else:
+            say("  'llmt servers --stop' ends them.")
+        say("")
     if not found:
-        say("  none running")
+        say("  no servers running")
         return
     for e in found:
         where = (f"release {e['release']}" + (" (current)" if e["current"] else "  OLD: not current")) \
@@ -2340,9 +2417,15 @@ def cmd_gc(a) -> None:
     complete = [r for r in rels if (r / "RELEASE.json").exists()]
     keep = set(complete[-max(a.keep, 1):]) | ({cur} if cur else set())
     drop = [r for r in rels if r not in keep and r.resolve() != cur and r.name not in used]
+    orphan_pids = set()
+    if Path("/proc").is_dir():
+        orphan_pids = {f"process {e['pid']}" for e in scan_orphans(prefix)}
     for r in rels:
         if r.name in used and r not in keep:
-            say(f"  keeping {r.name}: in use ({', '.join(used[r.name][:3])})")
+            held = used[r.name]
+            only_leftovers = all(h.split(" (")[0] in orphan_pids for h in held)
+            say(f"  keeping {r.name}: in use ({', '.join(held[:3])}{', ...' if len(held) > 3 else ''})" +
+                ("  -- only leftover workers of an ended server: llmt servers --stop ends them" if only_leftovers else ""))
     if not drop:
         say("  nothing to remove")
         return
@@ -3058,8 +3141,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--allow-dirty", action="store_true", help="deploy the committed state despite local changes")
     p.add_argument("--no-pin-check", action="store_true", help="do not compare the pins with the newest commits")
     p.add_argument("--yes", action="store_true", help="do not ask (a pin behind is only warned about)")
-    p = sub.add_parser("servers", help="admin: the translator MCP servers running here; --stop ends old-release ones")
-    p.add_argument("--stop", action="store_true", help="SIGTERM to servers of a release that is not current")
+    p = sub.add_parser("servers", help="the translator MCP servers running here (and leftover workers of ended ones); "
+                                       "--stop ends old-release servers and leftovers")
+    p.add_argument("--stop", action="store_true", help="SIGTERM to servers of a release that is not current, and to "
+                                                       "leftover worker processes whose server has ended")
     p.add_argument("--prefix")
     p = sub.add_parser("releases", help="the shared releases, which is current, which are in use")
     p.add_argument("--prefix")

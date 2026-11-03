@@ -147,6 +147,7 @@ A running server keeps the release it started from (`bin/mcp` resolves `current`
   - **`--stop`** sends SIGTERM to those only. It never touches SLURM jobs (`<key> run-study`), personal checkouts, or its own command line, so `ssh host 'sudo .../llmt servers --stop'` is safe.
 
   Jobs already running keep their code. Only new submissions use the new release.
+  - **Leftover workers** (llmt 2026.11.03.1). It also lists multiprocessing helpers (pool workers, `resource_tracker`) of a translator venv whose parent is no longer a process of that venv: workers of a server that exited without stopping its pools. They hold their release, so `llmt gc` keeps it "in use" and says when only such leftovers hold it. `--stop` ends them too, whatever their release. Helpers of a live server or SLURM job are left alone.
 - **`llmt deploy`'s pin check.** Before building, it shows each translator's pinned commit and version against the newest commit on its tracked branch. When a pin is behind, it warns, and asks in interactive use. This catches a deploy made before `llmt pin` was committed and pulled, which is how the old cfdt reached spark2.
   - `--yes` only warns.
   - `--no-pin-check` skips the check, e.g. without network access.
