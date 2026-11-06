@@ -54,7 +54,7 @@ FAKE_SERVER = textwrap.dedent('''\
             r = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
                  "serverInfo": {"name": "fake", "version": "x"}, "instructions": "fake"}
         elif meth == "tools/list":
-            r = {"tools": [{"name": n, "description": n, "inputSchema": {"type": "object", "properties": {}}}
+            r = {"tools": [{"name": n, "description": n + " " + VERSION, "inputSchema": {"type": "object", "properties": {}}}
                            for n in ("jobs", "study_status")]}
         elif meth == "tools/call":
             r = {"content": [{"type": "text", "text": json.dumps({"translator": VERSION, "requests": []})}]}
@@ -146,6 +146,199 @@ class RouterServing(unittest.TestCase):
         st = r.status_cache["m"][1]
         self.assertFalse(c1.alive(), f"retire={c1.retire} inflight={c1.inflight} serving={c1.serving} "
                                      f"installed={st.get('version')} asked-started={st.get('_asked', 0) - c1.started:.3f}")
+
+
+    def test_tools_follow_version(self):
+        r = self.r
+        self.assertEqual(r.tools_version, "2026.10.22.10")
+        self.assertIn("2026.10.22.10", r.tools[0]["description"])
+        told = []
+        r.notify = lambda: told.append(1)
+        (self.root / "INSTALLED").write_text("2026.10.25.6\n")       # a deploy: the definitions may have changed
+        r.fetch_status("m")
+        end = time.time() + 15
+        while r.tools_version != "2026.10.25.6" and time.time() < end:
+            time.sleep(0.1)
+        self.assertEqual(r.tools_version, "2026.10.25.6")
+        self.assertIn("2026.10.25.6", r.tools[0]["description"])
+        self.assertEqual(told, [1])
+        r.fetch_status("m")                                          # same version again: nothing to do
+        time.sleep(0.5)
+        self.assertEqual(told, [1])
+
+
+class NewestTools(unittest.TestCase):
+    """initialize: the tool definitions come from the machine with the newest version, whatever the order."""
+
+    def test_newest(self):
+        with tempfile.TemporaryDirectory() as t:
+            hosts = []
+            for name, v in (("old", "2026.10.22.10"), ("new", "2026.10.25.6")):
+                root = Path(t) / name
+                (root / "bin").mkdir(parents=True)
+                (root / "bin" / "mcp").write_text(FAKE_SERVER)
+                (root / "llmt").write_text(FAKE_LLMT)
+                os.chmod(root / "bin" / "mcp", 0o755)
+                (root / "INSTALLED").write_text(v + "\n")
+                hosts.append({"name": name, "ssh": "", "root": str(root)})
+            r = R.Router("lmpt")
+            r.hosts, r.prefer, r.exclude = hosts, [], set()
+            try:
+                res = r.initialize({"protocolVersion": "2025-06-18"})
+                self.assertTrue(res["capabilities"]["tools"]["listChanged"])
+                self.assertEqual(r.tools_version, "2026.10.25.6")
+                self.assertIn("2026.10.25.6", r.tools[0]["description"])
+            finally:
+                r.close()
+
+    def test_vkey(self):
+        self.assertEqual(R.vkey("2026.11.02.1"), R.vkey("2026.11.2.1"))
+        self.assertLess(R.vkey("2026.11.9.1"), R.vkey("2026.11.10.1"))
+
+
+FAKE_NODE_LLMT = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    # spark1 of a two-node cluster: its translator jobs are pinned to spark-5da5; spark2's run on spark-0808
+    import json
+    jobs = [{"key": "cfdt", "state": "RUNNING", "reason": "spark-0808"},                    # older llmt: no 'nodes'
+            {"key": "cfdt", "state": "RUNNING", "nodes": "spark-5da5", "reason": "spark-5da5"},
+            {"key": "cfdt", "state": "PENDING", "req_nodes": "spark-5da5", "reason": "Resources"},
+            {"key": "cfdt", "state": "PENDING", "req_nodes": "spark-0808", "reason": "Resources"},
+            {"key": "lmpt", "state": "RUNNING", "nodes": "spark-5da5"}]
+    print(json.dumps({"mode": "release", "release": {"release": "r1"},
+                      "slurm": {"cpus": 20, "cpus_allocated": 10, "node": "spark-5da5", "cluster_nodes": 2,
+                                "nodes_usable": 1, "jobs": jobs},
+                      "translators": {"cfdt": {"version": "1", "backends": {}, "status": {"executor": {
+                          "kind": "slurm", "procs": 10, "node": {"setting": "local", "nodelist": "spark-5da5"}}}}}}))
+''')
+
+FAKE_SLURM = {
+    "sinfo": '#!/bin/sh\necho "$FAKE_C"\n',
+    "squeue": '#!/bin/sh\n[ -n "$FAKE_PD" ] && echo "$FAKE_PD"\nexit 0\n',
+    "sbatch": '#!/bin/sh\ntouch "$FAKE_MARK"\n'
+              'echo "sbatch: Job 3 to start at $(date -d \'+90 min\' +%Y-%m-%dT%H:%M:%S) using 10 processors"\n',
+}
+
+
+class NodeQueue(unittest.TestCase):
+    """A machine that is one node of a cluster: its own queue, and 'starts now' when its node is idle."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        (t / "root").mkdir()
+        (t / "root" / "llmt").write_text(FAKE_NODE_LLMT)
+        (t / "bin").mkdir()
+        for n, text in FAKE_SLURM.items():
+            (t / "bin" / n).write_text(text)
+            os.chmod(t / "bin" / n, 0o755)
+        self.t = t
+        self.saved = {k: os.environ.get(k) for k in ("PATH", "FAKE_C", "FAKE_PD", "FAKE_MARK")}
+        os.environ.update(PATH=f"{t / 'bin'}:{os.environ['PATH']}", FAKE_MARK=str(t / "sbatch-ran"))
+        self.r = R.Router("cfdt")
+        self.r.hosts = [{"name": "spark1", "ssh": "", "root": str(t / "root")}]
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def test_queue_per_node(self):
+        st = self.r.fetch_status("spark1")
+        self.assertEqual(st["queue"], {"running": 1, "waiting": 1})                 # spark-5da5's cfdt jobs
+        self.assertEqual(st["cluster_queue"], {"running": 2, "waiting": 2})
+        self.assertEqual(st["pending_for_node"], 1)
+        self.assertTrue(st["out_dir"].endswith("/cfdt_runs"))
+
+    def start(self, c, pd=""):
+        os.environ.update(FAKE_C=c, FAKE_PD=pd)
+        (self.t / "sbatch-ran").unlink(missing_ok=True)
+        self.r.start_cache.clear()
+        st = {"executor": {"kind": "slurm", "node": {"setting": "local", "nodelist": "spark-5da5"}},
+              "slurm": {"cpus": 20, "cpus_allocated": 0, "cluster_nodes": 2, "node": "spark-5da5", "nodes_usable": 1}}
+        return self.r.expected_start("spark1", st, 10, 10, None), (self.t / "sbatch-ran").exists()
+
+    def test_starts_now(self):
+        (start, why), ran = self.start("0/20/0/20")
+        self.assertEqual(start, 0.0)
+        self.assertIn("all 20 CPUs idle on node spark-5da5", why)
+        self.assertFalse(ran)                                       # no sbatch --test-only
+        (start, why), ran = self.start("18/2/0/20")                # busy: SLURM's estimate
+        self.assertTrue(ran)
+        self.assertAlmostEqual(start, 90, delta=2)
+        (start, why), ran = self.start("0/20/0/20", pd="spark-5da5")   # idle, but a job waits for the node
+        self.assertTrue(ran)
+
+
+FAKE_SLOW_SERVER = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    # cfdt with request_name: run_studies takes longer than the router's time; it records what it received
+    import json, os, sys, time
+    from pathlib import Path
+    ROOT = Path(__file__).resolve().parents[1]
+    for line in sys.stdin:
+        m = json.loads(line)
+        if "id" not in m:
+            continue
+        meth, p = m["method"], m.get("params") or {}
+        if meth == "initialize":
+            r = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                 "serverInfo": {"name": "fake", "version": "x"}, "instructions": "fake"}
+        elif meth == "tools/list":
+            obj = {"type": "object", "properties": {"studies": {"type": "object"}}}
+            run = {"type": "object", "properties": {"studies": {"type": "object"}, "request_name": {"type": "string"},
+                                                    "wait_s": {"type": "number", "default": 45}}}
+            r = {"tools": [{"name": "jobs", "description": "", "inputSchema": {"type": "object", "properties": {}}},
+                           {"name": "validate_studies", "description": "", "inputSchema": obj},
+                           {"name": "run_studies", "description": "", "inputSchema": run}]}
+        elif meth == "tools/call":
+            name, args = p["name"], p.get("arguments") or {}
+            if name == "run_studies":
+                (ROOT / "received.json").write_text(json.dumps(args))
+                time.sleep(8)
+                out = {"translator": "1", "request": "x"}
+            elif name == "validate_studies":
+                out = {"studies": {k: {"ok": True} for k in args.get("studies", {})}}
+            else:
+                out = {"translator": "1", "requests": []}
+            r = {"content": [{"type": "text", "text": json.dumps(out)}]}
+        else:
+            r = {}
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}) + "\\n")
+        sys.stdout.flush()
+''')
+
+
+class RequestName(unittest.TestCase):
+    """run_studies gets a request name; when the machine does not answer in time the answer says where to look."""
+
+    def test_submitted_unconfirmed(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t) / "m"
+            (root / "bin").mkdir(parents=True)
+            (root / "bin" / "mcp").write_text(FAKE_SLOW_SERVER)
+            os.chmod(root / "bin" / "mcp", 0o755)
+            (root / "llmt").write_text(FAKE_STAGE_LLMT)
+            saved = (R.BUDGET, R.PATHS_FILE)
+            R.BUDGET, R.PATHS_FILE = 8.0, Path(t) / "paths.json"
+            r = R.Router("cfdt")
+            r.hosts, r.prefer, r.exclude, r.paths = [{"name": "m", "ssh": "", "root": str(root)}], [], set(), {}
+            try:
+                r.initialize({"protocolVersion": "2025-06-18"})
+                out = R.Router.parse(r.tool_call("run_studies", {"studies": {"s": {}}}))
+                self.assertEqual(out["status"], "submitted_unconfirmed", out)
+                self.assertRegex(out["request_name"], r"^run_\d{8}_\d{6}_[0-9a-f]{6}$")
+                self.assertTrue(out["request"].endswith("/cfdt_runs/" + out["request_name"]), out["request"])
+                self.assertEqual(r.owner(out["request"]), "m")              # study_status goes there
+                self.assertIn("do not submit again", out["next"])
+                got = json.loads((root / "received.json").read_text())
+                self.assertEqual(got["request_name"], out["request_name"])
+            finally:
+                R.BUDGET, R.PATHS_FILE = saved
+                r.close()
 
 
 class ServersList(unittest.TestCase):
@@ -402,6 +595,8 @@ FAKE_STAGE_SERVER = textwrap.dedent('''\
             elif name == "run_studies":
                 out = {"translator": "1", "request": os.path.expanduser("~/out/run1"),
                        "seen": {x: sha(x) for x in paths(st)}}
+            elif name == "add_geometry":
+                out = {"translator": "1", "seen": {x: sha(x) for x in paths(args)}}
             else:
                 out = {"translator": "1", "requests": []}
             r = {"content": [{"type": "text", "text": json.dumps(out)}]}
@@ -506,6 +701,19 @@ class Staging(unittest.TestCase):
         remote_m1 = out["staged"][str(self.mac / "parts" / "new.step")]
         res, out = self.run_call({"s": {"geometry": {"step": remote_m1}, "run": {"host": "m2"}}})
         self.assertEqual(out["seen"][str(base["m2"] / self.sha[:12] / "new.step")], self.sha)
+
+    def test_add_geometry_top_level_paths(self):
+        # add_geometry(stl=<local path>, groups=<local path>) goes to every machine, each with its own copy
+        (self.mac / "parts" / "groups.json").write_text('{"wheels": [1, 2]}')
+        args = {"name": "rogue", "stl": str(self.mac / "parts" / "a b.step"),
+                "groups": str(self.mac / "parts" / "groups.json"), "scale": 0.001}
+        out = R.Router.parse(self.r.tool_call("add_geometry", args))
+        for m in ("m1", "m2"):
+            res = out["machines"][m]
+            self.assertEqual(len(res["staged"]), 2, res)
+            remote = res["staged"][args["stl"]]
+            self.assertIn(f"/remotes/{m}/", remote)
+            self.assertEqual(res["seen"][remote], self.sha)
 
     def test_limit(self):
         os.environ["CFDT_MAX_UPLOAD_MB"] = "0.1"

@@ -1,6 +1,6 @@
 # The router: one translator, several machines
 
-Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2).
+Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2); tool definitions that follow deploys, per-node queues, request names 2026.11.06.1.
 
 Until now, each MCP entry in the Claude app pointed to one machine (`ssh mochi .../bin/mcp cfdt`). With several machines able to run a translator (mochi, carbonio, a DGX Spark), choosing one by hand wastes the others, and one entry per machine (`cfdt-mochi`, `cfdt-carbonio`, ...) multiplies the tools in every chat.
 
@@ -23,7 +23,11 @@ Claude app ── stdio ──> bin/router cfdt  (on the Mac; Python standard li
 
 - **A protocol relay.** The router speaks MCP's stdio protocol (JSON-RPC, one message per line) both ways. It is written with the Python standard library, so it doesn't depend on the MCP SDK version, and it can run where the venv has no `mcp` package.
 - **Connections.** The connection to each machine opens on first use and stays open. If a machine drops, its next call reconnects. The router's other ssh calls (status, queue estimates) share one connection per host through ssh's ControlMaster, so they cost milliseconds.
-- **Tools and instructions** come from the first machine that answers, and the router adds `machines()`. The instructions get one more paragraph about the machines.
+- **Tools and instructions.** The router adds `machines()` to the tools, and one paragraph about the machines to the instructions.
+  - **The tool definitions come from the machine with the newest version.** At start, the router asks every machine for its status and reads `tools/list` from one with the newest translator version.
+  - **They follow deploys.** A client drops every argument its definitions lack, so stale definitions break new features (on 2026-11-06, `add_geometry(stl=...)` arrived with no geometry). Whenever a status or a server shows a newer version, the router reads `tools/list` again from a new server on that machine. If the definitions changed, it sends `notifications/tools/list_changed`; the router declares `listChanged: true`. Clients that support the notification fetch the list again; others need a reconnect.
+  - **The instructions** stay as they were when the client connected.
+  - **Arguments pass through** as the client sends them, whatever the stored definitions say.
 
 ## Machines and what the router learns about them
 
@@ -86,6 +90,8 @@ The DGX Sparks are one cluster of two nodes. Each one is still a machine of its 
 
 - **Separate nodes, separate machines.** Without a shared home folder, a job must run on the node holding its run folder, so each machine's jobs stay on its own node (`P_SLURM_NODE=local`, docs/EXECUTION.md).
 - **Estimates per node.** The router's start estimate asks SLURM about that node (`sbatch --test-only --nodelist=<node>`), and `machines()` shows that node's CPUs.
+  - SLURM's estimate counts every running job's whole time limit, those on the other node included: spark1 once said "a start in 545 min" for a job that started at once. So when all of the node's CPUs are idle (`sinfo -n <node> -o %C`) and no pending job asks for the node, the router says "starts now" without asking `sbatch --test-only`.
+- **Queue per node.** `queue` counts the machine's own node only: running jobs on it, and pending jobs whose `--nodelist` names it. `cluster_queue` counts the whole cluster, and `pending_for_node` the pending jobs for the node. It needs llmt 2026.11.06.1 on the machine for pending jobs (`squeue %n`). With an older llmt, only running jobs are counted per node.
 - **The result.** The router picks the spark whose own node frees up first.
 - **With shared homes (`any`)** both machines report the cluster's estimate, and SLURM chooses the node: in effect, one machine.
 
@@ -107,7 +113,7 @@ Answers from a single machine get `"machine": "<name>"` at the top.
 
 A study often names a file that exists only where the Claude app runs: a STEP file for cfdt's `geometry.step` or feat's part, p3dt's objects, a b3dt step input. The router copies such files to the machine that gets the call, and passes the call on with their path there.
 
-- **Which strings.** Any string in the arguments, at any depth (inside `studies`, lists, nested dicts), that names a regular file under the home folder of the router's computer (`~/...` works too). The top-level `request`, `bench`, `study_folder` and `path` arguments name results on a machine and are left alone, as are `get_file` and `get_image`.
+- **Which strings.** Any string in the arguments, at any depth (inside `studies`, lists, nested dicts), that names a regular file under the home folder of the router's computer (`~/...` works too). That includes top-level arguments such as cfdt's `add_geometry(stl=..., groups=..., goal=...)`; `add_geometry` goes to every machine, and each gets its own copy. The top-level `request`, `bench`, `study_folder` and `path` arguments name results on a machine and are left alone, as are `get_file` and `get_image`.
 - **Already there.** If the same path exists on the machine with the same size (a shared folder), nothing is copied and the path is passed unchanged.
 - **Where.** `$<KEY>_OUT/uploads/<sha256[:12]>/<name>` on the machine, with `<KEY>_OUT` from the machine's settings files (docs/SHARED.md).
   - Most machines don't set `<KEY>_OUT`. Then the translator's own default output folder is used, as `translators.json` describes it (`~/cfdt_runs/uploads/...`).
@@ -184,6 +190,11 @@ The Claude app gives up on a tool call after about a minute, and then closes the
 - **Status is fetched in the background.** It's fetched when the router starts, and again in the background once it's older than a minute; meanwhile the older answer is used. After the router sends a machine work, that machine's queue estimate is asked again at the next placement.
 - **Connections are opened ahead.** The router connects to every machine when it starts, so a first call doesn't pay for ssh and the server start.
 - **A machine that doesn't answer in time** gets an error saying the call may still be working there, and to look with `jobs()` or `study_status` before running it again. The router itself keeps running.
+- **Requests named by the router.** When a tool that starts work declares `request_name` (cfdt's `run_studies`, 2026.11.06.1), the router names each call `run_<YYYYmmdd_HHMMSS>_<6 hex>`, unless the call names it. It records `<the machine's <KEY>_OUT>/<name>` as that machine's request before calling.
+  - If the machine doesn't answer in time, the answer is not an error. It is `status: "submitted_unconfirmed"`, with `request`, `machine` and `next`: "study_status(request) in a minute; do not submit again".
+  - Repeating the call with the same `request_name` is safe: the translator returns that request's status and doesn't submit twice.
+  - The output folder comes from the machine's settings (`<KEY>_OUT`), else the translator's default (`~/cfdt_runs`).
+- **Status calls on a busy machine.** When the router's connection to a machine already has a call in flight, `study_status` and `bench_status` wait at most 20 s there, so they end well within the minute.
 
 ## Limits, and what comes later
 

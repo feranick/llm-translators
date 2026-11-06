@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.02.1
+Version: 2026.11.06.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -22,6 +22,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -30,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.02.1"
+__version__ = "2026.11.06.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -64,10 +65,24 @@ MB = 1024 * 1024
 UPLOAD_MB = 500.0        # largest local file the router copies to a machine, unless <KEY>_MAX_UPLOAD_MB says otherwise
 STAGE_ALL_MB = 25.0      # placement copies local files to every candidate (to validate there) only up to this in total
 CHUNK = 1 << 20
+BUSY_STATUS_WAIT = 20.0  # study_status / bench_status wait at most this on a machine whose server is busy
 
 
 def log(msg: str) -> None:
     print(f"[router] {msg}", file=sys.stderr, flush=True)
+
+
+def vkey(v) -> tuple:
+    """A version for comparison: 2026.11.02.1 == 2026.11.2.1 < 2026.11.10.1."""
+    return tuple((0, int(x)) if x.isdigit() else (1, x) for x in re.split(r"[.\-+]", str(v or "")) if x)
+
+
+def on_node(job: dict, nodes: set) -> bool:
+    """A translator job of llmt's slurm_jobs() is on (running) or asked for (pending) one of these nodes. A running
+    job's node is 'nodes' (%N; older llmt: 'reason', which is %R = the node list for a running job); a pending
+    job's is the --nodelist it asked for ('req_nodes', %n)."""
+    s = (job.get("nodes") or job.get("reason") or "") if job.get("state") == "RUNNING" else (job.get("req_nodes") or "")
+    return bool(nodes & {x for x in re.split(r"[,\s]+", str(s).strip()) if x})
 
 
 def ssh_base(host: dict) -> list:
@@ -320,6 +335,11 @@ class Router:
         self.init_params: dict = {}
         self.instructions = ""
         self.tools: list = []
+        self.tools_version: str | None = None    # the translator version the tool definitions come from
+        self.tools_refreshing = False
+        self.tools_lock = threading.Lock()
+        self.notify = None                        # set by serve(): tells the client the tool list changed
+        self.ready = False                        # initialize() has answered
         self.paths = self._load_paths()
         self.paths_lock = threading.Lock()
         self.uploads: dict = {}          # (machine, remote path) -> Upload
@@ -410,13 +430,20 @@ class Router:
 
     def fetch_status(self, name: str) -> dict:
         h = self.host(name)
+        var = f"{self.key.upper()}_OUT"
+        dflt = self.default_out() or f"{self.key}_runs"
         script = (f"r={root_expr(h['root'])}; python3 \"$r/llmt\" status --json {self.key} 2>/dev/null; echo; echo @@LOAD; "
                   f"cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/null; "
-                  f"nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null")
+                  f"nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null; "
+                  f"( _llmt_root=\"$r\"; [ -r \"$r/bin/llmt-env.sh\" ] && . \"$r/bin/llmt-env.sh\" >/dev/null 2>&1; "
+                  f"echo \"@@OUT ${{{var}:-$HOME/{dflt}}}\" )")
         out = {"name": name, "reachable": False, "_asked": time.time()}
         try:
             r = remote_cmd(h, script, timeout=120)
             text, _, load = r.stdout.partition("@@LOAD")
+            load, _, outdir = load.partition("@@OUT")
+            if outdir.strip().startswith("/"):
+                out["out_dir"] = outdir.strip().splitlines()[0].rstrip("/")
             data = json.loads(text.strip()) if text.strip() else None
             if data is None:
                 out["error"] = (r.stderr or "no answer").strip()[-300:]
@@ -438,8 +465,14 @@ class Router:
                                                          "node", "cluster_nodes", "nodes", "shared_home",
                                                          "cluster_cpus", "cluster_cpus_allocated")}
                            if sl else None,
-                           queue={"running": sum(1 for j in jobs if j.get("state") == "RUNNING"),
-                                  "waiting": sum(1 for j in jobs if j.get("state") != "RUNNING")} if sl else None)
+                           queue=self.count_jobs(jobs) if sl else None)
+                # a node of a cluster of several (the sparks): its own jobs; the whole cluster's apart
+                node = self.nodelist({"executor": ex, "slurm": sl}) if sl else None
+                if node and (sl.get("cluster_nodes") or 1) > 1:
+                    nodes = {x for x in node.split(",") if x}
+                    out["queue"] = self.count_jobs([j for j in jobs if on_node(j, nodes)])
+                    out["cluster_queue"] = self.count_jobs(jobs)
+                    out["pending_for_node"] = out["queue"]["waiting"]
             nums = [x for x in re.split(r"[\s{}]+", load) if x]
             try:
                 out["load"] = float(nums[0])
@@ -451,7 +484,62 @@ class Router:
         self.status_cache[name] = (time.time(), out)
         for c in list(self.children.get(name, [])):
             self.check_serving(name, c)
+        if out.get("version"):
+            self.maybe_refresh_tools(name, out["version"])
         return out
+
+    @staticmethod
+    def count_jobs(jobs: list) -> dict:
+        return {"running": sum(1 for j in jobs if j.get("state") == "RUNNING"),
+                "waiting": sum(1 for j in jobs if j.get("state") != "RUNNING")}
+
+    # ---- the tool definitions follow the newest version (a deploy adds arguments; clients drop unknown ones)
+    def set_tools(self, tools: list) -> None:
+        self.tools = tools
+        self.wait_defaults = {}
+        for t in tools:
+            props = ((t.get("inputSchema") or {}).get("properties") or {})
+            if "wait_s" in props:
+                self.wait_defaults[t["name"]] = props["wait_s"].get("default", 45)
+
+    def maybe_refresh_tools(self, name: str, version: str | None) -> None:
+        """A machine runs a newer version than the one the tool definitions come from: read them again there, in
+        the background."""
+        if not self.ready or not version or \
+                (self.tools and self.tools_version and vkey(version) <= vkey(self.tools_version)):
+            return
+        with self.tools_lock:
+            if self.tools_refreshing:
+                return
+            self.tools_refreshing = True
+        threading.Thread(target=self.refresh_tools, args=(name, version), daemon=True).start()
+
+    def refresh_tools(self, name: str, version: str) -> bool:
+        """tools/list from a new server process on the machine (it runs the installed release, not an older one
+        kept by a connection); when the definitions change, the client is told (notifications/tools/list_changed).
+        -> whether they changed."""
+        changed = False
+        c = Child(self.host(name), self.key)
+        try:
+            c.start(self.init_params, timeout=90.0)
+            tools = c.request("tools/list", {}, timeout=60.0).get("tools", [])
+            if tools:
+                changed = tools != self.tools
+                if changed:
+                    self.set_tools(tools)
+                self.tools_version = version
+                log(f"{name}: tool definitions of {self.key} {version}" + (" (changed: the client is told)" if changed else ""))
+        except ChildError as exc:
+            log(f"{name}: could not read the tool definitions of {self.key} {version}: {exc}")
+        finally:
+            c.close()
+            self.tools_refreshing = False
+        if changed and self.notify:
+            try:
+                self.notify()
+            except Exception as exc:  # noqa: BLE001
+                log(f"tools/list_changed not sent: {exc}")
+        return changed
 
     # ---- the version a server process runs (docs/ROUTER.md, "Servers that run an old release")
     def probe_serving(self, name: str, c: Child, timeout: float = 20.0) -> str | None:
@@ -470,6 +558,7 @@ class Router:
                 if c.serving:
                     break
         self.check_serving(name, c)
+        self.maybe_refresh_tools(name, c.serving)
         return c.serving
 
     @staticmethod
@@ -584,10 +673,27 @@ class Router:
             script = (f'd=$(sbatch --test-only {size} -t {mins}{mem} --wrap=true 2>&1); echo "$d"; '
                       f's=$(echo "$d" | sed -n "s/.*to start at \\([^ ]*\\).*/\\1/p" | head -1); '
                       f'[ -n "$s" ] && echo "@@START $(date -d "$s" +%s 2>/dev/null) $(date +%s)"')
+            if nl:
+                # a node of a cluster: SLURM's estimate counts every running job's whole time limit, those on the
+                # other nodes included. All CPUs of the node idle and nothing pending for it: it starts now.
+                nodes = [x for x in nl.split(",") if x]
+                checks = " ".join(f'$(sinfo -h -n {shlex.quote(n)} -o %C 2>/dev/null | head -n 1)' for n in nodes)
+                pend = "|".join(re.escape(n) for n in nodes)
+                script = (f'c="{checks}"; p=$(squeue -h -t PD -o %n 2>/dev/null | grep -cE "(^|,)({pend})(,|$)"); '
+                          f'echo "@@IDLE $p $c"; ok=1; [ "$p" = 0 ] || ok=0; [ -n "$c" ] || ok=0; '
+                          f'for x in $c; do a=${{x%%/*}}; t=${{x##*/}}; y=${{x#*/}}; i=${{y%%/*}}; '
+                          f'{{ [ "$a" = 0 ] && [ "$i" = "$t" ]; }} || ok=0; done; '
+                          f'if [ "$ok" = 0 ]; then {script}; fi')
             try:
                 r = remote_cmd(self.host(name), script, timeout=60)
                 m = re.search(r"@@START (\d+) (\d+)", r.stdout)
-                if m:
+                mi = re.search(r"@@IDLE (\d+)((?: \d+/\d+/\d+/\d+)+)", r.stdout)
+                idle_all = bool(mi) and mi.group(1) == "0" and all(
+                    a == "0" and i == t for a, i, _, t in (x.split("/") for x in mi.group(2).split()))
+                if idle_all:
+                    tot = sum(int(x.split("/")[3]) for x in mi.group(2).split())
+                    res = (0.0, f"starts now (all {tot} CPUs idle on node {nl}, nothing pending for it)")
+                elif m:
                     wait = max(0.0, (int(m.group(1)) - int(m.group(2))) / 60.0)
                     sl = st["slurm"]
                     free = (sl.get("cpus") or 0) - (sl.get("cpus_allocated") or 0)
@@ -919,6 +1025,8 @@ class Router:
                     want = float(want)
                 except (TypeError, ValueError):
                     want = 0.0
+                if tool in ("study_status", "bench_status") and any(c.inflight for c in self.children.get(name, [])):
+                    want = min(want, BUSY_STATUS_WAIT)  # a busy machine answers slowly: end well inside the minute
                 args = dict(args, wait_s=max(0.0, min(want, rem - 8.0)))
             timeout = max(3.0, rem)
         try:
@@ -980,6 +1088,11 @@ class Router:
         for n in names:
             res.setdefault(n, {"unreachable": f"{n}: no answer in time"})
         return res
+
+    def tool_args(self, tool: str) -> dict:
+        """The arguments a tool declares (its input schema's properties), from the current definitions."""
+        t = next((t for t in self.tools if t.get("name") == tool), None)
+        return ((t or {}).get("inputSchema") or {}).get("properties") or {}
 
     def validate_tool(self) -> str | None:
         names = {t["name"] for t in self.tools}
@@ -1203,8 +1316,30 @@ class Router:
             starts_work = tool == "run_benchmarks" or (not tool.startswith(("validate_", "get_")) and
                                                         any(isinstance(args.get(a), dict) for a in PLACE_ARGS))
             if starts_work:
+                # a request name chosen here: if the machine does not answer in time, the call may still have
+                # submitted, and the answer can say where to look (repeating the name never submits twice)
+                rname = args.get("request_name")
+                if rname is None and "request_name" in self.tool_args(tool):
+                    rname = f"run_{_dt.datetime.now():%Y%m%d_%H%M%S}_{secrets.token_hex(3)}"
+                    args = dict(args, request_name=rname)
                 name, send, info = self.place(tool, args, deadline)
-                r = self.call(name, tool, send, deadline)
+                req = None
+                if isinstance(rname, str):
+                    out = (self.status_cache.get(name, (0, {}))[1] or {}).get("out_dir") or \
+                        f"~/{self.default_out() or self.key + '_runs'}"
+                    req = f"{out}/{rname}"
+                    self.remember(req, name)
+                try:
+                    r = self.call(name, tool, send, deadline)
+                except ChildError as exc:
+                    if not req or "in time" not in str(exc):
+                        raise
+                    return self.text_result({
+                        "status": "submitted_unconfirmed", "machine": name, "request": req, "request_name": rname,
+                        "router": info,
+                        "next": f"{name} did not answer within the call's time; the studies may have been submitted. "
+                                f"Call study_status(request='{req}') in a minute; do not submit again (repeating "
+                                f"run_studies with request_name='{rname}' is safe: it returns the status)."})
                 self.forget(name)                     # it has new work: the next placement asks it again
                 self.learn(self.parse(r), name)
                 return self.with_fields(r, {"machine": name, "router": info})
@@ -1288,15 +1423,19 @@ class Router:
         self.init_params = params or {}
         errors = []
         t_end = time.time() + 40.0
-        for h in self.ordered() or self.hosts:
+        # the tool definitions come from a machine with the newest version installed (a new server there runs it):
+        # a client drops arguments its definitions lack, so an older machine's list would hide new ones
+        order = self.ordered() or self.hosts
+        sts = self.statuses([h["name"] for h in order], wait=15.0)
+        order = sorted(order, reverse=True,                  # stable: preference order among equal versions
+                       key=lambda h: vkey((sts.get(h["name"]) or {}).get("version"))
+                       if (sts.get(h["name"]) or {}).get("reachable") else ())
+        for h in order:
             try:
                 c = self.child(h["name"], timeout=max(3.0, min(30.0, t_end - time.time())))
                 self.instructions = (c.init_result or {}).get("instructions") or ""
-                self.tools = c.request("tools/list", {}).get("tools", [])
-                for t in self.tools:
-                    props = ((t.get("inputSchema") or {}).get("properties") or {})
-                    if "wait_s" in props:
-                        self.wait_defaults[t["name"]] = props["wait_s"].get("default", 45)
+                self.set_tools(c.request("tools/list", {}).get("tools", []))
+                self.tools_version = (sts.get(h["name"]) or {}).get("version")
                 proto = (c.init_result or {}).get("protocolVersion") or params.get("protocolVersion")
                 break
             except ChildError as exc:
@@ -1305,8 +1444,10 @@ class Router:
             proto = params.get("protocolVersion", "2025-06-18")
             self.instructions = (f"llm-translators router for {self.key}: no machine answered ({'; '.join(errors)}). "
                                  f"Call machines() to see why.")
-        for h in self.ordered():           # warm the status cache and the connections, so the first calls don't wait
-            self.refresh(h["name"])
+        self.ready = True
+        for h in self.ordered():           # warm the connections (and statuses not asked yet), so first calls don't wait
+            if h["name"] not in self.status_cache:
+                self.refresh(h["name"])
             self.warm(h["name"])
         names = ", ".join(h["name"] for h in self.hosts)
         note = (f"\nMachines: this server runs {self.key} on several machines ({names}). Calls that start work are "
@@ -1316,7 +1457,7 @@ class Router:
                 f"(e.g. a STEP file under the home folder) can be given by their local path: the router copies them "
                 f"to the machine and lists them in 'staged'; if it answers status 'uploading', repeat the same call "
                 f"when it says.")
-        return {"protocolVersion": proto, "capabilities": {"tools": {"listChanged": False}},
+        return {"protocolVersion": proto, "capabilities": {"tools": {"listChanged": True}},
                 "serverInfo": {"name": f"{self.key} (llmt-router)", "version": __version__},
                 "instructions": self.instructions + note}
 
@@ -1401,6 +1542,7 @@ def serve(key: str) -> None:
             continue                                   # notifications (initialized, cancelled, ...)
         if msg["method"] == "initialize":
             handle(msg)                                # before anything else
+            router.notify = lambda: send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
         else:
             threading.Thread(target=handle, args=(msg,), daemon=True).start()
     router.close()

@@ -50,7 +50,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.11.03.1"
+__version__ = "2026.11.06.1"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -805,19 +805,20 @@ def slurm_jobs() -> list[dict]:
     """The user's queued and running translator jobs (job names '<cli>:<request>:<study>', docs/EXECUTION.md)."""
     clis = {t["cli"]: k for k, t in REGISTRY.items()}
     try:
-        r = subprocess.run(["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i|%j|%T|%M|%l|%C|%R|%S"],
+        r = subprocess.run(["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i|%j|%T|%M|%l|%C|%R|%S|%N|%n"],
                            capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         return []
     out = []
     for line in r.stdout.splitlines():
-        f = (line.split("|") + [""] * 8)[:8]
+        f = (line.split("|") + [""] * 10)[:10]
         cli, _, rest = f[1].partition(":")
         if cli not in clis:
             continue
         req, _, study = rest.partition(":")
+        # nodes: where it runs (%N); req_nodes: the --nodelist it asked for (%n), which the router counts per node
         out.append({"id": f[0], "key": clis[cli], "request": req, "study": study, "state": f[2], "elapsed": f[3],
-                    "limit": f[4], "cpus": f[5], "reason": f[6], "start": f[7]})
+                    "limit": f[4], "cpus": f[5], "reason": f[6], "start": f[7], "nodes": f[8], "req_nodes": f[9]})
     return out
 
 
