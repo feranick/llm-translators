@@ -58,6 +58,12 @@ Claude app ── stdio ──> bin/router cfdt  (on the Mac; Python standard li
 Placement applies to calls that start work: those with a `studies` or `goals` argument (`run_studies`, `build_parts`), and `run_benchmarks`. The steps:
 
 1. **A manual choice wins.** A study may say `"run": {"host": "mochi"}`, or a list in order of preference. The router removes `host` before passing the study on. All studies of one call go to one machine; if their choices conflict, the call is refused and the router says why.
+
+   **Memory comes next** (2026.11.07.1). The largest `run.mem` among the studies, read as SLURM reads `--mem` (K, M, G, T; M without a suffix; `"auto"` and unset are ignored), is compared with each machine's largest job memory: `executor.caps.mem_mb` in its status, else `caps.mem` parsed.
+   - A machine below it is left out, before anything is validated or copied there. The answer says so: "mochi left out: run.mem 90G > its 62G".
+   - A machine that reports no limit stays a candidate (an older version, or memory unknown).
+   - If no allowed machine is left, the call fails before any upload, listing each machine's limit.
+   - `machines()` shows the limit as `max_job_mem`. cfdt 2026.11.07.1 reports it from the SLURM nodes' memory (or `CFDT_MAX_MEM` if lower); the other translators report it when their `*_MAX_MEM` is set.
 2. **Data stays where it is.** A study that mentions an earlier request folder, such as a geometry `{"ref": "<request>/<study>"}` or a chained path, goes to the machine holding that folder. The router knows where each request folder lives (below).
 3. **Validation on every candidate machine,** in parallel. `validate_studies` / `validate_goals` is static and fast. A machine whose version rejects the request (a newer feature, say) is dropped, if another one accepts it. The validation also returns each study's **estimate**, where the translator provides one: `{"minutes", "procs", "mem_mb"}` (see "Contract", below).
 4. **A score for each candidate,** in minutes; the lowest wins:

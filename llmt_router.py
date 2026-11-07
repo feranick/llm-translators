@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.06.1
+Version: 2026.11.07.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.06.1"
+__version__ = "2026.11.07.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -75,6 +75,26 @@ def log(msg: str) -> None:
 def vkey(v) -> tuple:
     """A version for comparison: 2026.11.02.1 == 2026.11.2.1 < 2026.11.10.1."""
     return tuple((0, int(x)) if x.isdigit() else (1, x) for x in re.split(r"[.\-+]", str(v or "")) if x)
+
+
+def parse_mem_mb(v) -> float | None:
+    """A memory size as SLURM reads --mem, in MB: a number with K, M, G or T (M without one; 'GB', 'Gi' too).
+    None for unset, 'auto' and what is not a size."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) if v > 0 else None
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:I?B)?\s*", str(v), re.I)
+    if not m:
+        return None
+    mb = float(m.group(1)) * {"K": 1 / 1024, "": 1, "M": 1, "G": 1024, "T": 1024 * 1024}[m.group(2).upper()]
+    return mb if mb > 0 else None
+
+
+def fmt_mb(mb: float | None) -> str:
+    if mb is None:
+        return "?"
+    return f"{round(mb / 1024, 1):g}G" if mb >= 1024 else f"{mb:.0f}M"
 
 
 def on_node(job: dict, nodes: set) -> bool:
@@ -1094,6 +1114,28 @@ class Router:
         t = next((t for t in self.tools if t.get("name") == tool), None)
         return ((t or {}).get("inputSchema") or {}).get("properties") or {}
 
+    @staticmethod
+    def request_mem(studies: dict) -> tuple:
+        """-> (MB, as written) of the largest run.mem among the studies; (None, None) when none sets one."""
+        best = (None, None)
+        for s in (studies or {}).values():
+            run = s.get("run") if isinstance(s, dict) else None
+            v = run.get("mem") if isinstance(run, dict) else None
+            mb = parse_mem_mb(v)
+            if mb and (best[0] is None or mb > best[0]):
+                best = (mb, str(v))
+        return best
+
+    @staticmethod
+    def mem_cap_mb(st: dict) -> float | None:
+        """The most memory one job can get on the machine: executor.caps.mem_mb, else caps.mem parsed. None:
+        unknown (an older version, or no limit reported)."""
+        caps = ((st.get("executor") or {}).get("caps") or {})
+        v = caps.get("mem_mb")
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            return float(v)
+        return parse_mem_mb(caps.get("mem"))
+
     def validate_tool(self) -> str | None:
         names = {t["name"] for t in self.tools}
         return next((n for n in ("validate_studies", "validate_goals") if n in names), None)
@@ -1135,6 +1177,20 @@ class Router:
                                  "; ".join(f"{m}: {sts.get(m, {}).get('error') or 'translator or backends missing'}"
                                            for m in manual))
             cands = usable
+        # memory: a machine whose largest job memory (executor.caps) is below the request's run.mem is left out,
+        # before anything is validated or copied there
+        need, need_txt = self.request_mem(studies) if arg else (None, None)
+        if need:
+            fit, short = [], []
+            for n in cands:
+                cap = self.mem_cap_mb(sts.get(n) or {})
+                (short if cap is not None and cap < need else fit).append((n, cap))
+            if short and not fit:
+                raise ValueError(f"no machine can give run.mem {need_txt}: " + ", ".join(
+                    f"{n} {fmt_mb(c)}" for n, c in short) + ". Lower run.mem, or split the study.")
+            for n, cap in short:
+                warnings.append(f"{n} left out: run.mem {need_txt} > its {fmt_mb(cap)}")
+            cands = [n for n, _ in fit]
         aff = self.affinity(studies) if arg else None
         if aff and not manual:
             if aff in cands:
@@ -1400,6 +1456,9 @@ class Router:
             ex = st.get("executor") or {}
             if ex:
                 row["executor"] = {k: ex.get(k) for k in ("kind", "procs", "time_limit_min", "caps") if k in ex}
+                cap = self.mem_cap_mb(st)
+                if cap:                       # the most one job can get: a larger run.mem is placed elsewhere
+                    row["max_job_mem"] = fmt_mb(cap)
             if st.get("reachable") and st.get("version"):
                 serv = sorted({c.serving or "?" for c in self.children.get(h["name"], []) if c.alive()})
                 row["serving"] = (serv[0] if len(serv) == 1 else serv) if serv else None

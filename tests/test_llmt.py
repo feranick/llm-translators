@@ -341,6 +341,65 @@ class RequestName(unittest.TestCase):
                 r.close()
 
 
+class MemoryPlacement(unittest.TestCase):
+    """run.mem against each machine's largest job memory (executor.caps), before validating or copying anything."""
+
+    def router(self):
+        r = R.Router("cfdt")
+        r.hosts = [{"name": n, "ssh": f"u@{n}", "root": "/x"} for n in ("mochi", "spark1", "spark2", "carbonio")]
+        r.prefer, r.exclude, r.speed, r.tools = [], set(), {}, []
+
+        def st(caps):
+            return {"reachable": True, "version": "1", "backends_missing": [], "load": 0.0, "cores": 20,
+                    "executor": {"kind": "local", "procs": 2, "caps": caps}}
+        sts = {"mochi": st({"mem": "62G", "mem_mb": 63488}), "spark1": st({"mem": "117G"}),
+               "spark2": st({"mem_mb": 120000}), "carbonio": st({})}            # carbonio: memory unknown
+        r.statuses = lambda names, fresh=False, wait=0: {n: sts[n] for n in names}
+        r.validate_tool = lambda: None
+        r.local_files = lambda args: (_ for _ in ()).throw(AssertionError("files looked at"))  # must not get here
+        return r
+
+    def test_parse(self):
+        self.assertEqual(R.parse_mem_mb("90G"), 92160)
+        self.assertEqual(R.parse_mem_mb("2048"), 2048)
+        self.assertEqual(R.parse_mem_mb(4000), 4000)
+        self.assertEqual(R.parse_mem_mb("512K"), 0.5)
+        self.assertEqual(R.parse_mem_mb("1T"), 1048576)
+        self.assertEqual(R.parse_mem_mb("16GB"), 16384)
+        for v in ("auto", None, "", "lots", True, 0):
+            self.assertIsNone(R.parse_mem_mb(v))
+        self.assertEqual(R.fmt_mb(63488), "62G")
+
+    def test_left_out(self):
+        r = self.router()
+        r.local_files = lambda args: {}
+        name, send, info = r.place("run_studies", {"studies": {
+            "a": {"run": {"mem": "8G"}},
+            "b": {"run": {"mem": "90G", "host": ["mochi", "spark1", "spark2"]}},
+            "c": {"run": {"host": ["mochi", "spark1", "spark2"]}}}})
+        self.assertIn(name, ("spark1", "spark2"))
+        self.assertIn("mochi left out: run.mem 90G > its 62G", info["warnings"])
+        self.assertNotIn("mochi", [c["machine"] for c in info["candidates"]])
+        self.assertEqual(send["studies"]["b"]["run"], {"mem": "90G"})          # run.host removed, mem kept
+        # no host chosen: carbonio, whose limit is unknown, stays a candidate
+        name, send, info = r.place("run_studies", {"studies": {"b": {"run": {"mem": "200G"}}}})
+        self.assertEqual(name, "carbonio")
+        self.assertEqual(sorted(w.split()[0] for w in info["warnings"]), ["mochi", "spark1", "spark2"])
+
+    def test_none_left_errors_before_files(self):
+        r = self.router()
+        with self.assertRaises(ValueError) as cm:
+            r.place("run_studies", {"studies": {"b": {"run": {"mem": "90G", "host": ["mochi"]}}}})
+        self.assertIn("no machine can give run.mem 90G: mochi 62G", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            r.place("run_studies", {"studies": {"b": {"run": {"mem": "1T", "host": ["mochi", "spark1", "spark2"]}}}})
+        self.assertIn("mochi 62G, spark1 117G, spark2 117.2G", str(cm.exception))
+        # 'auto' or no run.mem: no filter
+        r.local_files = lambda args: {}
+        self.assertEqual(r.place("run_studies", {"studies": {"b": {"run": {"mem": "auto", "host": "mochi"}}}})[0],
+                         "mochi")
+
+
 class ServersList(unittest.TestCase):
     """Item 3: the process list; a symlinked prefix; no match for shells or jobs; own process skipped."""
 
