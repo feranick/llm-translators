@@ -1,6 +1,8 @@
 # Running studies through SLURM: the contract for the translators
 
-Status: specification, 2026-10-18 (run record added the same day). llm-translators configures it (`llmt setup`, `llmt tune`, `config/env`) and shows it (`llmt status`, `llmt jobs`); each translator implements it. It applies to cfd-translator (cfdt), lammps-translator (lmpt) and fea-translator (feat). build123d-translator builds in milliseconds and does not need it.
+Status: specification, 2026-10-18 (run record added the same day). llm-translators configures it (`llmt setup`, `llmt tune`, `config/env`) and shows it (`llmt status`, `llmt jobs`). It applies to cfd-translator (cfdt), lammps-translator (lmpt), fea-translator (feat) and openmodelica-translator (omct). build123d-translator builds in milliseconds and does not need it.
+
+**Implemented once, in llmt-runtime** (2026-11-09): the settings, the machine, caps, time limits, `job.sh`/`job.json`, states, `jobs`/`cancel`/`extend`, workers, out of memory, requests and stale servers are the package `llmt_runtime` (repository llmt-runtime, a submodule of llm-translators; docs/SHARED.md, "The runtime"). Each translator configures it with its prefix and hooks (sizing, time per study, out-of-memory advice) and moves onto it one at a time; the "Implemented: ..." notes below record where each piece came from. Its README lists every behaviour it changed on the way.
 
 ## Why
 
@@ -25,7 +27,7 @@ The machines (mochi, carbonio) have SLURM on a single node. Submitting each long
 | `P_TIMEOUT` | seconds | Per study, as today. With SLURM it also sets the job's time limit (below). |
 | `P_WORKERS` | integer (2) | Local pool only. With SLURM, the queue decides how many run at once. |
 | `P_SLURM_MEM` | `auto` \| a size \| `none` (`auto`) | The job's `--mem`. `auto`: from the study (lmpt: 1 GB + 256 MB per rank + 4 kB per atom, at least 2 GB). `none`: SLURM's default. A `--mem…` in `P_SLURM_ARGS` wins. Implemented by lmpt, omct and feat; cfdt 2026.10.25.5 (`CFDT_SLURM_MEM`: auto = 2 GB + 4 GB per million estimated cells, 8G when unknown; validation warns when the mesh needs more than a `--mem` in `CFDT_SLURM_ARGS`). |
-| `P_SLURM_TIME` | `timeout` \| `estimate` (`timeout`) | The job's `--time`. `estimate`: max(`P_SLURM_TIME_MIN` (20), ceil(`P_SLURM_TIME_FACTOR` (3) × the study's estimate) + 10) minutes, at most the `timeout` value; the study's own timeout is 10 minutes less. Implemented by lmpt; proposed for all (below, "Time limits and backfill"). |
+| `P_SLURM_TIME` | `max` \| `timeout` \| `estimate` \| minutes (per translator: feat `max`, the others `timeout`) | The job's `--time`. `timeout`: the runs' timeouts + 10 min. `estimate`: max(`P_SLURM_TIME_MIN` (20), ceil(`P_SLURM_TIME_FACTOR` (3) × the study's estimate) + 10) minutes, at most `timeout`; each run's own timeout fits in it (`job.json` `timeout_s`). `max`: the partition's own limit (`UNLIMITED` where it has none), because SLURM lets only an admin raise a running job's limit (mochi job 3177), so `extend` needs no admin; the price: SLURM cannot plan a start behind an `UNLIMITED` job holding a node's memory, and the router then sees that machine as busy indefinitely. Minutes: that many, at least `timeout`. One set of meanings in llmt-runtime (feat's former `estimate` is `timeout`). |
 
 A study can also say `"queue": true` (always SLURM) or `"queue": false` (always local). That overrides `P_SLURM_MIN_MINUTES` but not `P_EXECUTOR=local`.
 
@@ -110,6 +112,8 @@ Threaded translators (feat) put threads in `procs_requested`/`procs_used` and le
 | `failed` | sacct says FAILED / NODE_FAIL, or the job is gone without a result | the last 30 lines of `job.log` |
 
 - **A finished state is a result.** `timed_out`, `out_of_memory`, `cancelled` and `failed` end the study: it moves from `pending` into `studies` with `{"ok": false, "state": ..., "why": ...}`.
+- **Out of memory in `job.log`.** SLURM writes `Detected 2 oom_kill events in StepId=5807.batch` (carbonio job 5807), older versions `oom-kill event(s)`: match `oom[-_ ]kill|out of memory` (case-insensitive) whatever sacct says (it may account such a job as FAILED). Matching only `oom-kill` turned these jobs into `failed` (cfdt, omct before llmt-runtime).
+- **Ended jobs still in squeue.** `squeue -j` lists a job that ended for MinJobAge (300 s by default) in its final state (COMPLETED, FAILED, TIMEOUT, OUT_OF_MEMORY, CANCELLED, ...). Only PENDING-like states are `queued` and RUNNING, COMPLETING, STOPPED, SIGNALING, STAGE_OUT, RESIZING are `running`; any other is an ended job (its state, when sacct has none).
 - **Without accounting.** On single-node installs `sacct` often has no accounting storage. If sacct fails or knows nothing, use this rule: a job that is not in `squeue` and left no `<name>.json` is `failed`, with the tail of `job.log` (SLURM writes "DUE TO TIME LIMIT" or "CANCELLED" there, so match those to `timed_out` and `cancelled`).
 - **Speed.** Make one `squeue` call per `study_status` for all the request's job ids (`-j id1,id2,...`), not one per study.
 
@@ -186,6 +190,8 @@ What llm-translators does:
 ```
 
 `llmt status` reads this key to show the executor and to tell that a translator supports this contract. If `P_EXECUTOR` is set but the key is missing, it warns that the installed version ignores the setting.
+
+With llmt-runtime the key also has `"runtime": "<llmt-runtime version>"`, `node_cores`, and `slurm_time` beside `time` (both give `P_SLURM_TIME`); `machines()` shows `runtime` and the release's `runtime_commit`, and `llmt status` flags a translator that reports another runtime than the venv's.
 
 ## Per-study run settings (`run`)
 

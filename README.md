@@ -396,6 +396,7 @@ The umbrella pins one commit of each translator, so a given umbrella commit is a
 - **`llmt update --latest`** tries each translator's latest `main` on one machine without moving the pins. After testing (`llmt test`, `llmt bench`), record it with `llmt pin KEY --commit`.
 - **Developing inside the umbrella.** Submodules with uncommitted changes are left alone by `update`. To work on a translator here, run `git checkout main` in its folder (submodules are checked out on a detached HEAD). It is installed in editable mode, so changes take effect at once.
 - **Submodule states:** `llmt status` shows each one as `pinned`, `moved` (checked out at another commit than the pin), `absent`, or `release` (a shared release).
+- **llmt-runtime,** the code the translators share (SLURM executor, workers, out of memory, requests, stale servers), is a submodule too, pinned like a translator and installed first in the same pip command. Each translator declares a floor (`llmt-runtime>=X`); `install`, `update` and `deploy` stop when a floor is above the pinned runtime. When a translator needs a newer runtime: push llmt-runtime, `llmt pin runtime --commit --push`, then pin the translator. `llmt status` shows it as the `rt` row; `llmt test runtime` runs its tests. Details: [docs/SHARED.md](docs/SHARED.md#the-runtime-llmt-runtime).
 
 ---
 

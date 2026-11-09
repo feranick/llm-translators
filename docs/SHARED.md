@@ -1,6 +1,6 @@
 # A shared install for all users
 
-Status: design and implementation, llmt 2026.10.22.1; old servers and pin check 2026.10.25.2.
+Status: design and implementation, llmt 2026.10.22.1; old servers and pin check 2026.10.25.2; llmt-runtime 2026.11.09.1.
 
 Today each user who runs the translators on a server (mochi, carbonio, a DGX Spark) has a personal llm-translators checkout with its own venv, and has to keep it up to date. This design adds a **shared install**:
 
@@ -111,6 +111,18 @@ sudo ./llmt deploy --test
 ```
 
 To pin a client to one release, for a project that must not change mid-way, use that release's path instead of `current`.
+
+## The runtime (llmt-runtime)
+
+The translators share their executor code (SLURM, workers, out of memory, requests, stale servers) through one package, `llmt_runtime` (repository llmt-runtime). It is a submodule of llm-translators, pinned like the translators (`"runtime"` in `translators.json`), and it is not a translator: it has no MCP server and no key.
+
+- **Floors only.** A translator declares `llmt-runtime>=<version>` in its `pyproject.toml`, never an upper bound, and the runtime stays backward compatible (it only adds names, keys and hooks). A change that breaks its API needs a new floor in every translator that uses it, all in the same release.
+- **One runtime per venv, installed first.** `llmt install`, `llmt update` and `llmt deploy` install it in the same pip command as the translators, ahead of them: `pip install -e <runtime> -e <feat>[...] -e <cfdt>[...]`. pip satisfies every floor with that copy and never looks online. A release records it in `RELEASE.json` (`commits["llmt-runtime"]`, `runtime: {version, commit, floors}`).
+- **The floors must agree.** Before installing, llmt reads each translator's floor and compares it with the pinned runtime's version as pip does (`2026.11.09.2` is `2026.11.9.2`). A floor above the pin stops `install` and `update`, and `deploy` refuses to build (even with `--allow-dirty`): `feat needs llmt-runtime>=X, but the umbrella pins Y: llmt pin runtime --commit`.
+- **Order of pins.** Push the runtime, `llmt pin runtime --commit` (with no keys, `llmt pin` moves the runtime first), then pin the translators that need the new floor. `llmt pin` warns when a translator's floor is above the runtime as checked out.
+- **Seeing it.** `llmt status` shows a `rt` row (version installed, pin, which translators need it, problems) and flags a translator that reports another runtime than the venv's (`tool_status().executor.runtime`); `machines()` shows `runtime` and `runtime_commit`. `llmt test runtime` runs its suite; `llmt deploy --test` runs it with the translators'.
+- **Stale servers.** A server also counts as stale when llmt-runtime's version on disk changed (a checkout updated in place); in a release, switching `current` covers both.
+- **Standalone translators** (outside the umbrella): `pip install -e ../llmt-runtime && pip install -e .[test]`, or a translator's `requirements-standalone.txt` (llmt-runtime from its git URL).
 
 ## How llmt tells which kind of install it is
 

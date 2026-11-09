@@ -200,7 +200,7 @@ Every command prints JSON, and `-` reads the studies from stdin.
 
 ### mcp_server.py
 
-Copy cfd-translator's file. It works with the MCP Python SDK 1.x and 2.x (both `MCPServer`/`FastMCP` and `Image`), and has `--http PORT [--host H]`. Rules:
+Copy cfd-translator's file, with `llmt_runtime.server.Server` for the stale-install handling and the tool wrapper (`@guard.tool(ToolError)`). It works with the MCP Python SDK 1.x and 2.x (both `MCPServer`/`FastMCP` and `Image`), and has `--http PORT [--host H]`. Rules:
 
 - **Tool names:**
 
@@ -247,7 +247,7 @@ These are read from the environment only, never from shell startup files. A tran
 
 ### Long runs and SLURM
 
-Implement [EXECUTION.md](EXECUTION.md) from the start, copying cfdt's `executor.py`:
+Implement [EXECUTION.md](EXECUTION.md) from the start with **llmt-runtime**, not a copy of another translator's `executor.py`: declare `llmt-runtime>=<current version>` in `pyproject.toml`, build one `Runtime(prefix=..., cli=..., package=..., version=__version__, kind="mpi" | "threads", hooks=Hooks(...))` and give it what is yours through hooks (the job's procs and memory from the study's size, the time per study, the advice after an out-of-memory kill). `llmt_runtime.server.Server` gives `mcp_server.py` the tool wrapper and stale-install handling, `llmt_runtime.workers` the pools' parent watch, and `llmt_runtime.testing.fake_slurm` the fake SLURM for the tests. Its README lists the API and hooks. What the runtime implements, for reference:
 
 - **Executors.** A local pool, or one SLURM job per study:
   - `job.sh` asks for `--ntasks`, or `--cpus-per-task` for threads, plus `--ntasks-per-core=1`, because OpenMPI 5 refuses more ranks than cores.

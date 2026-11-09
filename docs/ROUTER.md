@@ -64,6 +64,7 @@ Placement applies to calls that start work: those with a `studies` or `goals` ar
    - A machine that reports no limit stays a candidate (an older version, or memory unknown).
    - If no allowed machine is left, the call fails before any upload, listing each machine's limit.
    - `machines()` shows the limit as `max_job_mem`. cfdt 2026.11.07.1 reports it from the SLURM nodes' memory (or `CFDT_MAX_MEM` if lower); the other translators report it when their `*_MAX_MEM` is set.
+   - With llmt-runtime the node's memory is given exactly: `caps.mem` is `64000M` rather than `62G` (a whole number of GB only when it is one), so a `run.mem` of 64000M is no longer refused; `caps.mem_mb` is the same number. `machines()` also shows the translator's `runtime` (llmt-runtime version) and the release's `runtime_commit`.
 2. **Data stays where it is.** A study that mentions an earlier request folder, such as a geometry `{"ref": "<request>/<study>"}` or a chained path, goes to the machine holding that folder. The router knows where each request folder lives (below).
 3. **Validation on every candidate machine,** in parallel. `validate_studies` / `validate_goals` is static and fast. A machine whose version rejects the request (a newer feature, say) is dropped, if another one accepts it. The validation also returns each study's **estimate**, where the translator provides one: `{"minutes", "procs", "mem_mb"}` (see "Contract", below).
 4. **A score for each candidate,** in minutes; the lowest wins:

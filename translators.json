@@ -1,4 +1,6 @@
 {
+ "runtime": {"repo": "llmt-runtime", "package": "llmt_runtime",
+             "summary": "the code the translators share: SLURM executor, workers, out of memory, requests, stale servers (docs/SHARED.md)"},
  "translators": {
   "b3dt": {
    "repo": "build123d-translator",

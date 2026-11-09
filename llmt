@@ -8,8 +8,8 @@
     llmt status [-v] [--json]       versions, submodule commits, backends found
     llmt update [--latest]          pull, check out the pinned (or latest) commits, reinstall; fill config/env
                                     settings not set yet from llmt tune (--no-tune: leave it)
-    llmt pin [KEY...] [--commit [--push]]   move the pins to each translator's latest pushed commit
-    llmt test [KEY...]              each translator's pytest suite
+    llmt pin [KEY...] [--commit [--push]]   move the pins to each translator's (and llmt-runtime's) latest pushed commit
+    llmt test [KEY...]              each translator's pytest suite ('runtime': llmt-runtime's)
     llmt bench KEY [NAMES...]       a translator's benchmarks
     llmt alias [--name N] [--rc F]  shell alias that activates the venv (default llmt-venv; old ones commented out)
     llmt tune [KEY...] [--print | --apply]   SLURM use, MPI ranks and timeouts for this machine, from its cores
@@ -25,6 +25,10 @@ Shared install for all users (docs/SHARED.md), admin commands run from a checkou
     llmt mcp config [--print | --claude-code | --file F]   write or print the MCP client entries
     llmt mcp test [KEY...]          start each server as the Claude app does; handshake, list tools
     llmt mcp serve [KEY...] [--host H]   serve MCP over streamable HTTP on each translator's port
+
+llmt-runtime (the translators' shared executor code) is a submodule too: installed first in the same pip command,
+pinned like a translator (llmt pin runtime); each translator's floor (llmt-runtime>=X) must be at or below the pin, or
+install, update and deploy stop (docs/SHARED.md, "The runtime").
 
 Backends (OpenFOAM, CalculiX, LAMMPS, Gmsh) are never installed by this tool: it reports what
 is missing and points to BACKENDS.md.
@@ -50,7 +54,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.11.06.1"
+__version__ = "2026.11.09.1"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -89,7 +93,11 @@ def release_info(path: Path | None = None) -> dict:
         return json.loads(((path or ROOT) / "RELEASE.json").read_text())
     except (OSError, json.JSONDecodeError):
         return {}
-REGISTRY = json.loads((ROOT / "translators.json").read_text())["translators"]
+_TRANSLATORS_JSON = json.loads((ROOT / "translators.json").read_text())
+REGISTRY = _TRANSLATORS_JSON["translators"]
+# llmt-runtime: the code the translators share (executor, workers, memory, requests, stale servers). A submodule pinned
+# like the translators and installed in the same pip command, first; not a translator key. None: not registered.
+RUNTIME = _TRANSLATORS_JSON.get("runtime")
 KEYS = list(REGISTRY)
 BACKENDS_MD = "BACKENDS.md"
 
@@ -397,8 +405,12 @@ def submodule_states() -> dict[str, tuple[str, str]]:
     """repo path -> (state, commit); state: pinned | moved | absent | conflict (a release: release | absent)."""
     if SHARED:
         info = release_info()
-        return {t["repo"]: (("release", info.get("commits", {}).get(t["repo"], "")[:7]) if k in info.get("keys", [])
-                            else ("absent", "")) for k, t in REGISTRY.items()}
+        out = {t["repo"]: (("release", info.get("commits", {}).get(t["repo"], "")[:7]) if k in info.get("keys", [])
+                           else ("absent", "")) for k, t in REGISTRY.items()}
+        if RUNTIME:
+            c = info.get("commits", {}).get(RUNTIME["repo"], "")
+            out[RUNTIME["repo"]] = ("release", c[:7]) if c else ("absent", "")
+        return out
     r = git("submodule", "status", check=False)
     if r.returncode != 0:
         git_trouble(r.stderr)
@@ -410,6 +422,112 @@ def submodule_states() -> dict[str, tuple[str, str]]:
         state = {" ": "pinned", "+": "moved", "-": "absent", "U": "conflict"}.get(flag, "?")
         out[rest[1]] = (state, rest[0][:7])
     return out
+
+
+# ---------------------------------------------------------------- llmt-runtime (docs/SHARED.md, "The runtime")
+# Floors only: a translator declares llmt-runtime>=X (no upper bound) and the runtime stays backward compatible. One
+# runtime per venv, at the umbrella's pin; every translator's floor must be at or below it, else install, update and
+# deploy stop (a translator's new floor needs the runtime's pin moved first: llmt pin runtime).
+
+RUNTIME_DEP = re.compile(r"""["']\s*llmt[-_]runtime\s*>=\s*([0-9][0-9A-Za-z.]*)""", re.I)
+VERSION_LINE = re.compile(r"""^__version__\s*=\s*["']([^"']+)""", re.M)
+
+
+def vnorm(v: str) -> tuple:
+    """A version as pip compares it: 2026.11.09.2 == 2026.11.9.2 < 2026.11.10.1 (numeric parts as numbers)."""
+    return tuple(int(x) if x.isdigit() else -1 for x in re.split(r"[.+-]", str(v).strip()) if x != "")
+
+
+def runtime_repo() -> str | None:
+    return RUNTIME["repo"] if RUNTIME else None
+
+
+def runtime_floor(src: Path) -> str | None:
+    """The llmt-runtime floor a translator's pyproject.toml declares (llmt-runtime>=X), or None."""
+    try:
+        m = RUNTIME_DEP.search((Path(src) / "pyproject.toml").read_text())
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def runtime_version_at(root: Path = ROOT) -> str | None:
+    """The version of the llmt-runtime checked out (or exported) under root; None when it is not there."""
+    if not RUNTIME:
+        return None
+    try:
+        m = VERSION_LINE.search((Path(root) / RUNTIME["repo"] / RUNTIME["package"] / "__init__.py").read_text())
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def runtime_floors(keys: list[str], root: Path = ROOT) -> dict[str, str]:
+    """{key: floor} of the translators (checked out under root) that need llmt-runtime."""
+    out = {}
+    for k in keys:
+        f = runtime_floor(Path(root) / REGISTRY[k]["repo"])
+        if f:
+            out[k] = f
+    return out
+
+
+def runtime_problems(keys: list[str], root: Path = ROOT) -> list[str]:
+    """Why these translators cannot be installed with the runtime under root: it is not there, or a floor is above
+    it (compared as pip does). [] when they agree, or none of them needs it."""
+    floors = runtime_floors(keys, root)
+    if not floors:
+        return []
+    need = ", ".join(f"{k} (>={f})" for k, f in floors.items())
+    if not RUNTIME:
+        return [f"{need} need llmt-runtime, but translators.json has no 'runtime' entry"]
+    rv = runtime_version_at(root)
+    if rv is None:
+        return [f"{need} need llmt-runtime, which is not checked out: git submodule update --init {RUNTIME['repo']}"]
+    return [f"{k} needs llmt-runtime>={f}, but the umbrella pins {rv}: llmt pin runtime --commit (after pushing "
+            f"llmt-runtime {f} or later), or pin {k} back" for k, f in floors.items() if vnorm(rv) < vnorm(f)]
+
+
+def runtime_specs(root: Path = ROOT) -> list[str]:
+    """pip arguments installing the runtime under root (first, so pip satisfies every floor with this copy and
+    never looks online); [] when it is not there."""
+    if not RUNTIME or not (Path(root) / RUNTIME["repo"] / "pyproject.toml").exists():
+        return []
+    return ["-e", str(Path(root) / RUNTIME["repo"])]
+
+
+def runtime_registered() -> bool:
+    """llmt-runtime is a submodule of this checkout (.gitmodules)."""
+    if not RUNTIME or SHARED:
+        return False
+    r = git("config", "-f", ".gitmodules", "--get", f"submodule.{RUNTIME['repo']}.path", check=False)
+    return bool(r.stdout.strip())
+
+
+def split_runtime(items) -> tuple[bool, list[str]]:
+    """('runtime' or the runtime's repo among the arguments, the other arguments)."""
+    items = items.replace(",", " ").split() if isinstance(items, str) else list(items or [])
+    names = {"runtime"} | ({RUNTIME["repo"]} if RUNTIME else set())
+    return any(i in names for i in items), [i for i in items if i not in names]
+
+
+def runtime_status(keys: list[str]) -> dict | None:
+    """llmt status: the runtime's pin, the version on disk and in the venv, the floors, and problems."""
+    if not RUNTIME:
+        return None
+    repo = RUNTIME["repo"]
+    if SHARED:
+        r_ = release_info().get("runtime") or {}
+        state, commit = ("release", (r_.get("commit") or "")[:7]) if r_ else ("absent", "")
+    else:
+        state, commit = submodule_states().get(repo, ("absent", ""))
+    installed = None
+    if VPY.exists():
+        r = run([VPY, "-c", "import llmt_runtime; print(llmt_runtime.__version__)"], capture=True, check=False)
+        installed = r.stdout.strip() or None if r.returncode == 0 else None
+    here = [k for k in keys if (ROOT / REGISTRY[k]["repo"] / "pyproject.toml").exists()]
+    return {"repo": repo, "submodule": state, "commit": commit, "version": runtime_version_at(),
+            "installed": installed, "floors": runtime_floors(here), "problems": runtime_problems(here)}
 
 
 def with_uses(keys: list[str], interactive: bool, assume_yes: bool) -> list[str]:
@@ -583,10 +701,19 @@ def checkout(keys: list[str]) -> None:
     for p in paths:
         if not (ROOT / p / "pyproject.toml").exists():
             die(f"{p} is not checked out (git submodule update --init {p})")
+    # the runtime, when a translator needs it and it is not checked out yet
+    rt = runtime_repo()
+    if rt and runtime_floors(keys) and states.get(rt, ("absent",))[0] == "absent" and runtime_registered():
+        git("submodule", "update", "--init", "--", rt, capture=False)
 
 
 def pip_install(keys: list[str], setup: dict, upgrade: bool = False) -> None:
-    specs = []
+    """The translators, with llmt-runtime first in the same pip command (pip satisfies each translator's floor with
+    the local copy). Stops when a floor is above the runtime's pin."""
+    probs = runtime_problems(keys)
+    if probs:
+        die("llmt-runtime does not fit:\n  " + "\n  ".join(probs))
+    specs = runtime_specs()
     for k in keys:
         specs += ["-e", f"{ROOT / REGISTRY[k]['repo']}[{','.join(install_extras(k, setup))}]"]
     cmd = [VPY, "-m", "pip", "install"] + (["--upgrade"] if upgrade else []) + specs
@@ -1199,6 +1326,7 @@ def status_data(keys: list[str] | None = None) -> dict:
                 d["executor"] = {"setting": want, "supported": isinstance(st, dict) and "executor" in st,
                                  "reported": (st or {}).get("executor") if isinstance(st, dict) else None}
         data["translators"][k] = d
+    data["runtime"] = runtime_status(keys)
     return data
 
 
@@ -1239,6 +1367,20 @@ def print_status(data: dict, verbose: bool) -> None:
                 say(f"{'':43}runs: {ex['setting']}" + (" (SLURM jobs)" if ex["setting"] == "slurm" else ""))
         if verbose and d.get("status"):
             say("  " + json.dumps(d["status"], indent=1).replace("\n", "\n  "))
+    rt = data.get("runtime")
+    if rt and (rt["submodule"] != "absent" or rt["floors"]):
+        ver = rt.get("installed") or rt.get("version") or "-"
+        need = ", ".join(f"{k} >={f}" for k, f in rt["floors"].items()) or "no translator yet"
+        say(f"  {'rt':5} {ver:14} {rt['commit'] or '-':8} {rt['submodule']:10} llmt-runtime; needed by: {need}")
+        if rt.get("installed") and rt.get("version") and vnorm(rt["installed"]) != vnorm(rt["version"]):
+            say(f"{'':8}! llmt-runtime: the venv has {rt['installed']}, the checkout {rt['version']}: llmt update --no-pull")
+        used = {k: ((d.get("status") or {}).get("executor") or {}).get("runtime")
+                for k, d in data["translators"].items() if isinstance(d.get("status"), dict)}
+        for k, v in used.items():
+            if v and rt.get("installed") and vnorm(v) != vnorm(rt["installed"]):
+                say(f"{'':8}! {k} reports llmt-runtime {v}, the venv has {rt['installed']}")
+        for p_ in rt.get("problems", []):
+            say(f"{'':8}! {p_}")
     sl = data.get("slurm")
     if sl:
         jobs = sl.get("jobs", [])
@@ -2032,9 +2174,12 @@ def check_pins(keys: list[str], interactive: bool) -> None:
     was not re-pinned (llmt pin) before this deploy, so the release would carry the older translator."""
     say("Pins against each translator's newest commit (on its tracked branch):")
     behind = []
-    for k in keys:
-        repo = REGISTRY[k]["repo"]
-        rep_ = pin_report(ROOT / repo, submodule_url(repo), submodule_branch(repo), REGISTRY[k]["package"])
+    rt = runtime_repo()
+    rows = [(k, REGISTRY[k]["repo"], REGISTRY[k]["package"]) for k in keys]
+    if rt and (ROOT / rt / "pyproject.toml").exists():
+        rows = [("runtime", rt, RUNTIME["package"])] + rows
+    for k, repo, package in rows:
+        rep_ = pin_report(ROOT / repo, submodule_url(repo), submodule_branch(repo), package)
         if "error" in rep_:
             say(f"  {k:5} pinned {git('-C', repo, 'rev-parse', '--short', 'HEAD', check=False).stdout.strip()}: "
                 f"could not read the newest commit ({rep_['error']})")
@@ -2239,6 +2384,18 @@ def cmd_deploy(a) -> None:
             problems.append(f"{repo} has uncommitted changes (they would not be deployed)")
     if git("status", "--porcelain", "--ignore-submodules=all", check=False).stdout.strip():
         problems.append("the umbrella has uncommitted changes (they would not be deployed)")
+    rt = runtime_repo()
+    with_rt = bool(rt and (ROOT / rt / "pyproject.toml").exists())
+    if with_rt:
+        st = subs.get(rt, ("absent", ""))[0]
+        if st not in ("pinned", "absent"):
+            problems.append(f"{rt} is not at the umbrella's pin ({st}): git submodule update {rt}")
+        elif git("-C", rt, "status", "--porcelain", check=False).stdout.strip():
+            problems.append(f"{rt} has uncommitted changes (they would not be deployed)")
+    # floors only: never built when a translator needs a newer runtime than the pinned one (not even --allow-dirty)
+    bad_rt = runtime_problems(keys)
+    if bad_rt:
+        die("llmt-runtime does not fit; not deployed:\n  " + "\n  ".join(bad_rt))
     if problems:
         for p_ in problems:
             warn(p_)
@@ -2266,6 +2423,8 @@ def cmd_deploy(a) -> None:
         export_tree(ROOT, rel)
         for k in keys:
             export_tree(ROOT / REGISTRY[k]["repo"], rel / REGISTRY[k]["repo"])
+        if with_rt:
+            export_tree(ROOT / rt, rel / rt)
         for f in ["llmt", "llmt_router.py", "bin/run", "bin/mcp", "bin/router"]:   # executable whatever git recorded
             if (rel / f).exists():
                 os.chmod(rel / f, 0o755)
@@ -2286,12 +2445,12 @@ def cmd_deploy(a) -> None:
             if k_ not in REGISTRY or e_ not in REGISTRY[k_]["optional_extras"]:
                 die(f"--extra {spec}: expected KEY:EXTRA")
             extra_opt.setdefault(k_, []).append(e_)
-        specs = []
+        specs = ["-e", f"{rel / rt}[test]"] if with_rt else []
         for k in keys:
             t = REGISTRY[k]
             ex = list(t["extras"]) + ([t["test_extra"]] if t.get("test_extra") else []) + extra_opt.get(k, [])
             specs += ["-e", f"{rel / t['repo']}[{','.join(ex)}]"]
-        run([vpy, "-m", "pip", "install", *specs])
+        run([vpy, "-m", "pip", "install", *specs])      # the runtime first: every floor met by the release's copy
         if needs_gmsh and run([vpy, "-c", "import gmsh"], capture=True, check=False).returncode != 0:
             sysmod = Path("/usr/lib/python3/dist-packages/gmsh.py")
             site = vdir / "lib" / f"python{v[0]}.{v[1]}" / "site-packages"
@@ -2302,11 +2461,16 @@ def cmd_deploy(a) -> None:
                 warn(f"Gmsh is not importable in the release's venv: see {BACKENDS_MD}#gmsh")
         run([vpy, "-m", "compileall", "-q", "-j", "0", str(rel)], check=False)
         commits = {REGISTRY[k]["repo"]: git("-C", REGISTRY[k]["repo"], "rev-parse", "HEAD").stdout.strip() for k in keys}
+        if with_rt:
+            commits[rt] = git("-C", rt, "rev-parse", "HEAD").stdout.strip()
         import getpass
         info = {"release": name, "llmt": __version__, "created": _dt.datetime.now().isoformat(timespec="seconds"),
                 "built_by": getpass.getuser(), "python": f"{py} ({'.'.join(map(str, v))})", "keys": keys,
                 "umbrella": git("rev-parse", "HEAD").stdout.strip(), "commits": commits, "source": str(ROOT),
                 "dirty": bool(problems)}
+        if with_rt:
+            info["runtime"] = {"version": runtime_version_at(rel), "commit": commits[rt],
+                               "floors": runtime_floors(keys, rel)}
         (rel / "RELEASE.json").write_text(json.dumps(info, indent=1) + "\n")
         make_readonly(rel)
         # the machine's settings file: created once, then only new settings described
@@ -2340,7 +2504,7 @@ def cmd_deploy(a) -> None:
         if bad:
             die(f"not importable in the new release: {', '.join(bad)}")
         if a.test:
-            r = subprocess.run([sys.executable, str(rel / "llmt"), "test", *keys])
+            r = subprocess.run([sys.executable, str(rel / "llmt"), "test", *(["runtime"] if with_rt else []), *keys])
             if r.returncode != 0:
                 die("tests failed: the release is kept but not switched to (llmt rollback / gc)")
         if a.bench:
@@ -2821,6 +2985,13 @@ def cmd_update(a) -> None:
             warn(f"{p} has uncommitted changes: left as it is")
         else:
             paths.append(p)
+    rt = runtime_repo()
+    if rt and runtime_registered():      # the runtime follows the umbrella's pin (or --latest) like the translators
+        dirty = git("-C", rt, "status", "--porcelain", check=False).stdout.strip() if (ROOT / rt / ".git").exists() else ""
+        if dirty:
+            warn(f"{rt} has uncommitted changes: left as it is")
+        else:
+            paths.append(rt)
     if paths:
         if a.latest:
             say("Checking out the latest commits of each translator's branch (main)")
@@ -2862,14 +3033,19 @@ def submodule_branch(path: str) -> str:
 def cmd_pin(a) -> None:
     """Moves the umbrella's pins to each translator's latest pushed commit (or --to COMMIT)."""
     refuse_in_release("pinning")
-    keys = parse_keys(a.keys) if a.keys else KEYS
+    want_rt, rest = split_runtime(a.keys)
+    keys = parse_keys(rest) if rest else ([] if want_rt else KEYS)
+    if (want_rt or not a.keys) and runtime_registered():
+        keys = ["runtime"] + keys          # first: a translator's new floor may need the runtime's new pin
+    elif want_rt:
+        die("llmt-runtime is not a submodule here (git submodule add -b main ../llmt-runtime.git llmt-runtime)")
     if a.to and len(keys) != 1:
         die("--to needs exactly one translator")
     staged_before = set(git("diff", "--cached", "--name-only").stdout.split())
     subs = submodule_states()
     changed = []
     for k in keys:
-        path = REGISTRY[k]["repo"]
+        path = RUNTIME["repo"] if k == "runtime" else REGISTRY[k]["repo"]
         pinned = git("ls-files", "-s", "--", path).stdout.split()[1]   # the index: includes pins not yet committed
         branch = submodule_branch(path)
         url = submodule_url(path)
@@ -2912,6 +3088,9 @@ def cmd_pin(a) -> None:
     if not changed:
         say("  Nothing to pin.")
         return
+    probs = runtime_problems([k for k in KEYS if (ROOT / REGISTRY[k]["repo"] / "pyproject.toml").exists()])
+    for p_ in probs:       # the pins as checked out here: install, update and deploy would stop on these
+        warn(p_)
     inst = installed_in_venv()
     moved_here = [k for k, p, _, _ in changed if k in inst and (ROOT / p / ".git").exists()]
     paths = [p for _, p, _, _ in changed]
@@ -2935,7 +3114,10 @@ def cmd_pin(a) -> None:
 
 def cmd_test(a) -> None:
     setup = load_setup()
-    keys = parse_keys(a.keys) if a.keys else setup.get("installed", [])
+    want_rt, rest = split_runtime(a.keys)
+    keys = parse_keys(rest) if rest else ([] if want_rt else setup.get("installed", []))
+    if want_rt:          # llmt test runtime: llmt-runtime's own suite
+        keys = ["runtime"] + keys
     results = {}
     for k in keys:
         say(f"\n=== {k}: pytest")
@@ -2948,7 +3130,8 @@ def cmd_test(a) -> None:
         os.unlink(junit)
         try:
             r = subprocess.run([str(ROOT / "bin" / "run"), "python", "-m", "pytest", "-q", *extra,
-                                f"--junit-xml={junit}", *a.pytest_args], cwd=ROOT / REGISTRY[k]["repo"], env=env)
+                                f"--junit-xml={junit}", *a.pytest_args],
+                               cwd=ROOT / (RUNTIME["repo"] if k == "runtime" else REGISTRY[k]["repo"]), env=env)
             rc = r.returncode
             if rc == 0 and not os.path.exists(junit):
                 warn(f"{k}: pytest exited with 0 but did not finish (no report): counted as a failure")
@@ -3101,12 +3284,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--no-pull", action="store_true", help="do not git pull llm-translators itself")
     p.add_argument("--no-tune", action="store_true", help="leave config/env as it is (no llmt tune suggestions)")
     p = sub.add_parser("pin", help="move the pins to each translator's latest pushed commit")
-    p.add_argument("keys", nargs="*", help="default: all")
+    p.add_argument("keys", nargs="*", help="default: all and llmt-runtime; 'runtime' for llmt-runtime")
     p.add_argument("--to", metavar="COMMIT", help="pin one translator to this commit instead")
     p.add_argument("--commit", action="store_true", help="commit the new pins")
     p.add_argument("--push", action="store_true", help="with --commit: push")
     p = sub.add_parser("test", help="pytest in each translator")
-    p.add_argument("keys", nargs="*")
+    p.add_argument("keys", nargs="*", help="'runtime': llmt-runtime's suite")
     p.add_argument("--pytest-args", nargs=argparse.REMAINDER, default=[], help="passed to pytest")
     p = sub.add_parser("bench", help="a translator's benchmarks")
     p.add_argument("key")

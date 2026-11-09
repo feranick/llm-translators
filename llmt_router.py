@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.07.1
+Version: 2026.11.09.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.07.1"
+__version__ = "2026.11.09.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -476,7 +476,11 @@ class Router:
                 jobs = [j for j in sl.get("jobs", []) if j.get("key") == self.key]
                 rel = data.get("release") or {}
                 out.update(llmt_commit=data.get("commit") or (rel.get("umbrella") or "")[:7] or None,
-                           translator_commit=((rel.get("commits") or {}).get(self.t["repo"]) or "")[:7] or None)
+                           translator_commit=((rel.get("commits") or {}).get(self.t["repo"]) or "")[:7] or None,
+                           # llmt-runtime: the version the translator reports, and the release's commit of it
+                           runtime=(((d.get("status") or {}).get("executor") or {}).get("runtime")
+                                    if isinstance(d.get("status"), dict) else None),
+                           runtime_commit=((rel.get("runtime") or {}).get("commit") or "")[:7] or None)
                 if d.get("reinstall"):         # the install there lacks dependencies of its code (llmt status says)
                     out["needs_reinstall"] = f"{d.get('problem')}: run {d.get('fix')} there"
                 out.update(reachable=True, mode=data.get("mode"), release=rel.get("release"),
@@ -1455,7 +1459,7 @@ class Router:
             # the release's name counts deploys on that machine; the commit says what it contains (same everywhere)
             ex = st.get("executor") or {}
             if ex:
-                row["executor"] = {k: ex.get(k) for k in ("kind", "procs", "time_limit_min", "caps") if k in ex}
+                row["executor"] = {k: ex.get(k) for k in ("kind", "procs", "time_limit_min", "caps", "runtime") if k in ex}
                 cap = self.mem_cap_mb(st)
                 if cap:                       # the most one job can get: a larger run.mem is placed elsewhere
                     row["max_job_mem"] = fmt_mb(cap)

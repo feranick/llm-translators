@@ -4,6 +4,8 @@
       server_stale) and replaces it once idle;
     - llmt servers: the process list, with a symlinked prefix, a shell mentioning a server path, a SLURM job;
     - llmt deploy's pin check: a pin behind its branch's newest commit;
+    - llmt-runtime: floors against the pinned runtime (as pip compares versions), the runtime first in pip's command,
+      the status line, 'runtime' among the keys;
     - llmt status: an editable install behind its checkout (version, missing dependencies) and the fix it names;
     - the router copies local input files to the machine (fake ssh, two machines): nested arguments, the copy's
       place, no second copy, a link for the same content, the size limit, a shared path, a slow copy, resuming.
@@ -505,8 +507,9 @@ class PinCheck(unittest.TestCase):
             self.assertEqual((rep["pinned_version"], rep["newest_version"]), ("2026.10.22.10", "2026.10.25.6"))
 
     def test_warning_when_behind(self):
-        saved = (L.pin_report, L.submodule_url, L.submodule_branch, L.git)
+        saved = (L.pin_report, L.submodule_url, L.submodule_branch, L.git, L.runtime_repo)
         try:
+            L.runtime_repo = lambda: None                                   # the translators' rows only
             L.pin_report = lambda *a: {"pinned": "aaaaaaa", "pinned_version": "2026.10.22.10", "newest": "bbbbbbb",
                                        "newest_version": "2026.10.25.6", "behind": 3, "ahead": 0}
             L.submodule_url = lambda repo: ""
@@ -517,7 +520,7 @@ class PinCheck(unittest.TestCase):
             self.assertIn("BEHIND by 3", out.getvalue())
             self.assertIn("llmt pin cfdt --commit --push", err.getvalue())
         finally:
-            L.pin_report, L.submodule_url, L.submodule_branch, L.git = saved
+            L.pin_report, L.submodule_url, L.submodule_branch, L.git, L.runtime_repo = saved
 
 
 class Reinstall(unittest.TestCase):
@@ -824,6 +827,83 @@ class Staging(unittest.TestCase):
                                          deadline=time.time() + 30))
         self.assertEqual(out["seen"][str(d / "c.step")], sha)
         self.assertTrue(self.copies()[-1].startswith("cat >>"), self.copies())
+
+
+class Runtime(unittest.TestCase):
+    """llmt-runtime: floors only. A translator's llmt-runtime>=X must be at or below the pinned runtime."""
+
+    def tree(self, t, runtime="2026.11.09.1", floors=None):
+        root = Path(t)
+        if runtime:
+            (root / "llmt-runtime" / "llmt_runtime").mkdir(parents=True)
+            (root / "llmt-runtime" / "llmt_runtime" / "__init__.py").write_text(f'__version__ = "{runtime}"\n')
+            (root / "llmt-runtime" / "pyproject.toml").write_text('[project]\nname = "llmt-runtime"\n')
+        for k, f in (floors or {}).items():
+            d = root / L.REGISTRY[k]["repo"]
+            d.mkdir(parents=True)
+            dep = f'"llmt-runtime>={f}", ' if f else ""
+            (d / "pyproject.toml").write_text(f'[project]\ndependencies = [{dep}"numpy>=1.22"]\n')
+        return root
+
+    def test_vnorm_as_pip(self):
+        self.assertEqual(L.vnorm("2026.11.09.2"), L.vnorm("2026.11.9.2"))
+        self.assertLess(L.vnorm("2026.11.09.2"), L.vnorm("2026.11.10.1"))
+        self.assertLess(L.vnorm("2026.11.9.10"), L.vnorm("2026.11.10.1"))
+
+    def test_floors_and_problems(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = self.tree(t, floors={"feat": "2026.11.9.1", "cfdt": None, "lmpt": "2026.11.10.1"})
+            self.assertEqual(L.runtime_floors(["feat", "cfdt", "lmpt"], root),
+                             {"feat": "2026.11.9.1", "lmpt": "2026.11.10.1"})
+            self.assertEqual(L.runtime_problems(["feat", "cfdt"], root), [])        # 2026.11.9.1 == 2026.11.09.1
+            probs = L.runtime_problems(["feat", "lmpt"], root)
+            self.assertEqual(len(probs), 1)
+            self.assertIn("lmpt needs llmt-runtime>=2026.11.10.1, but the umbrella pins 2026.11.09.1", probs[0])
+            self.assertEqual(L.runtime_problems(["cfdt"], root), [])               # nobody needs it
+            self.assertEqual(L.runtime_specs(root), ["-e", str(root / "llmt-runtime")])
+
+    def test_not_checked_out(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = self.tree(t, runtime=None, floors={"feat": "2026.11.09.1"})
+            probs = L.runtime_problems(["feat"], root)
+            self.assertIn("not checked out: git submodule update --init llmt-runtime", probs[0])
+            self.assertEqual(L.runtime_specs(root), [])
+
+    def test_pip_runtime_first_or_stop(self):
+        saved = (L.run, L.runtime_specs, L.runtime_problems, L.install_extras)
+        cmds = []
+        try:
+            L.run = lambda cmd, **kw: cmds.append(cmd)
+            L.runtime_specs = lambda root=None: ["-e", "/x/llmt-runtime"]
+            L.runtime_problems = lambda keys, root=None: []
+            L.install_extras = lambda k, setup: ["mcp"]
+            L.pip_install(["feat"], {})
+            self.assertEqual(cmds[0][4:], ["-e", "/x/llmt-runtime", "-e", f"{L.ROOT / 'fea-translator'}[mcp]"])
+            L.runtime_problems = lambda keys, root=None: ["feat needs llmt-runtime>=9"]
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                L.pip_install(["feat"], {})
+            self.assertIn("feat needs llmt-runtime>=9", err.getvalue())
+            self.assertEqual(len(cmds), 1)                                        # nothing installed
+        finally:
+            L.run, L.runtime_specs, L.runtime_problems, L.install_extras = saved
+
+    def test_split_runtime(self):
+        self.assertEqual(L.split_runtime("runtime feat"), (True, ["feat"]))
+        self.assertEqual(L.split_runtime(["llmt-runtime"]), (True, []))
+        self.assertEqual(L.split_runtime(None), (False, []))
+
+    def test_status_line(self):
+        data = {"llmt": "x", "root": "/r", "commit": "abc", "settings": [], "venv": None, "python": None,
+                "translators": {"feat": {"version": None, "commit": "", "submodule": "absent"}},
+                "runtime": {"repo": "llmt-runtime", "submodule": "pinned", "commit": "1234567",
+                            "version": "2026.11.09.1", "installed": "2026.11.09.1", "floors": {"feat": "2026.11.09.1"},
+                            "problems": ["lmpt needs llmt-runtime>=2026.11.10.1"]}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            L.print_status(data, False)
+        self.assertIn("llmt-runtime; needed by: feat >=2026.11.09.1", out.getvalue())
+        self.assertIn("! lmpt needs llmt-runtime>=2026.11.10.1", out.getvalue())
 
 
 if __name__ == "__main__":

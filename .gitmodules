@@ -18,3 +18,7 @@
 	path = openmodelica-translator
 	url = ../openmodelica-translator.git
 	branch = main
+[submodule "llmt-runtime"]
+	path = llmt-runtime
+	url = ../llmt-runtime.git
+	branch = main
