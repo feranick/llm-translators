@@ -218,7 +218,7 @@ FAKE_SLURM = {
     "sinfo": '#!/bin/sh\necho "$FAKE_C"\n',
     "squeue": '#!/bin/sh\n[ -n "$FAKE_PD" ] && echo "$FAKE_PD"\nexit 0\n',
     "sbatch": '#!/bin/sh\ntouch "$FAKE_MARK"\n'
-              'echo "sbatch: Job 3 to start at $(date -d \'+90 min\' +%Y-%m-%dT%H:%M:%S) using 10 processors"\n',
+              'echo "sbatch: Job 3 to start at $(date -d "+${FAKE_START_IN:-90 min}" +%Y-%m-%dT%H:%M:%S) using 10 processors"\n',
 }
 
 
@@ -235,7 +235,7 @@ class NodeQueue(unittest.TestCase):
             (t / "bin" / n).write_text(text)
             os.chmod(t / "bin" / n, 0o755)
         self.t = t
-        self.saved = {k: os.environ.get(k) for k in ("PATH", "FAKE_C", "FAKE_PD", "FAKE_MARK")}
+        self.saved = {k: os.environ.get(k) for k in ("PATH", "FAKE_C", "FAKE_PD", "FAKE_MARK", "FAKE_START_IN")}
         os.environ.update(PATH=f"{t / 'bin'}:{os.environ['PATH']}", FAKE_MARK=str(t / "sbatch-ran"))
         self.r = R.Router("cfdt")
         self.r.hosts = [{"name": "spark1", "ssh": "", "root": str(t / "root")}]
@@ -273,6 +273,17 @@ class NodeQueue(unittest.TestCase):
         self.assertAlmostEqual(start, 90, delta=2)
         (start, why), ran = self.start("0/20/0/20", pd="spark-5da5")   # idle, but a job waits for the node
         self.assertTrue(ran)
+
+    def test_one_year_start_is_no_start(self):
+        # SLURM puts a start it cannot plan a year ahead (behind a job with no time limit: carbonio 2026-11-10)
+        os.environ["FAKE_START_IN"] = "365 days"
+        (start, why), ran = self.start("18/2/0/20")
+        self.assertTrue(ran)
+        self.assertIsNone(start)
+        self.assertEqual(why, R.NO_START_WHY)
+        os.environ["FAKE_START_IN"] = "299 days"                    # far, but SLURM's own estimate
+        (start, why), _ = self.start("18/2/0/20")
+        self.assertAlmostEqual(start, 299 * 1440, delta=5)
 
 
 FAKE_SLOW_SERVER = textwrap.dedent('''\

@@ -73,7 +73,7 @@ Placement applies to calls that start work: those with a `studies` or `goals` ar
    score = expected start + estimated minutes × speed(host) − 0.5 × (preference bonus)
    ```
 
-   - **Expected start, with SLURM:** SLURM's own answer for a job of that size: `sbatch --test-only -n <procs> -t <minutes> --mem <mem>`. Threaded translators ask for `-c <procs>` instead. This counts everything ahead in the queue, other users' jobs included, and backfill.
+   - **Expected start, with SLURM:** SLURM's own answer for a job of that size: `sbatch --test-only -n <procs> -t <minutes> --mem <mem>`. Threaded translators ask for `-c <procs>` instead. This counts everything ahead in the queue, other users' jobs included, and backfill. A start 300 days or more ahead is SLURM's placeholder when it cannot plan the job (behind a job with no time limit, queued or running on the node: carbonio on 2026-11-10 gave 2027-11-09). The router reads it as no start time: "SLURM gives no start time: a job ahead of it (or running on the node) has no time limit; it starts when that one ends". The machine is then a last resort, and `machines()` shows `typical_job_start_min: null` (router 2026.11.10.1).
    - **Expected start, without SLURM:** the load. `(load / cores − 0.7) × 30` minutes when the load is above 70 % of the cores, else 0.
    - **Estimated minutes:** from the study's estimate. Without one, only the start counts.
    - **Small jobs** (estimate below `small_minutes`, default 5) count only the start: they go where they can start now.

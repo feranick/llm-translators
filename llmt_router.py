@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.09.1
+Version: 2026.11.10.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -53,6 +53,8 @@ STATUS_MAX_AGE = 1800.0  # older than this: not used (asked again, waiting for t
 STATUS_WAIT = 12.0       # how long a placement waits for machines it has no answer from yet
 BUDGET = 50.0            # every tool call is answered within this: the Claude app gives up after about 60 s
 START_TTL = 30.0
+NO_START_MIN = 300 * 1440   # SLURM puts a start it cannot plan a year ahead (behind a job with no time limit): no start
+NO_START_WHY = "a job ahead of it (or running on the node) has no time limit; it starts when that one ends"
 CALL_TIMEOUT = 600.0
 STALE_MARK = "STALE_SERVER"    # a translator server refusing a call because a newer release is installed (it exits)
 PLACE_ARGS = ("studies", "goals")
@@ -717,6 +719,8 @@ class Router:
                 if idle_all:
                     tot = sum(int(x.split("/")[3]) for x in mi.group(2).split())
                     res = (0.0, f"starts now (all {tot} CPUs idle on node {nl}, nothing pending for it)")
+                elif m and (int(m.group(1)) - int(m.group(2))) / 60.0 >= NO_START_MIN:
+                    res = (None, NO_START_WHY)                  # SLURM's one-year placeholder: no start time
                 elif m:
                     wait = max(0.0, (int(m.group(1)) - int(m.group(2))) / 60.0)
                     sl = st["slurm"]
