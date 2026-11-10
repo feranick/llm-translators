@@ -261,7 +261,7 @@ Implement [EXECUTION.md](EXECUTION.md) from the start with **llmt-runtime**, not
 - **Cancellation and timeouts reach the whole solver.** Start the backend in its own process group (`start_new_session=True`) and kill the group, so mpirun and every rank stop. A `cancel` flag file in the study folder lets any process stop a local run within a second.
 - **Worker pools never outlive the server.** A spawned multiprocessing worker holds both ends of its own task queue, so it never sees its parent go. Left behind, it waits forever with its `resource_tracker` and keeps its release "in use" for `llmt gc` (feat, carbonio, November 2026).
   - Terminate every pool (study pool, auxiliary pools, `ProcessPoolExecutor`s) before any `os._exit`. `os._exit` skips `atexit`.
-  - Give each pool an `initializer` that ends the worker when its parent dies, as a backstop for crashes and `kill -9`. On Linux use `prctl(PR_SET_PDEATHSIG, SIGTERM)` through ctypes, then check `os.getppid()` once for the race. Elsewhere use a daemon thread that exits when `os.getppid()` changes.
+  - Give each pool an `initializer` that ends the worker when its parent dies, as a backstop for crashes and `kill -9`: use llmt-runtime's `llmt_runtime.workers.watch_parent`, and its pool stopping. Don't use `PR_SET_PDEATHSIG`: on Linux it fires when the *thread* that created the child exits, not the process.
 
 ### Tests
 

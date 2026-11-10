@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.09.1"
+__version__ = "2026.11.10.1"
 
 HERE = Path(__file__).resolve().parent
 
