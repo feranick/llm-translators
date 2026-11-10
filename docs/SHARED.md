@@ -139,16 +139,15 @@ Nothing new, but a shared release makes it a requirement: a translator writes on
 - omct's build cache is `OMCT_CACHE`, under `~/omct_runs`.
 - omct's job scripts put the package's folder on `PYTHONPATH`. That is the release's copy, which is correct.
 
-A running server keeps the release it started from (`bin/mcp` resolves `current` once), and the router keeps its servers for hours. So after a deploy a translator's server should notice that `<prefix>/current` now points to another release and, while idle, refuse a call with a message containing `STALE_SERVER` and exit. The router (2026.10.23.5) then drops that server and repeats the call once on a new one. Implemented by all four (2026-10-25):
+A running server keeps the release it started from (`bin/mcp` resolves `current` once), and the router keeps its servers for hours. So after a deploy a translator's server should notice that `<prefix>/current` now points to another release and, while idle, refuse a call with a message containing `STALE_SERVER` and exit. The router (2026.10.23.5) then drops that server and repeats the call once on a new one.
 
-- **omct** 2026.10.23.3. An idle stale server also exits within 20 s by itself. Since 2026.10.25.1, only a running server refuses calls or exits; tests and `run-study` run normally in a release that is not yet current.
-- **cfdt** 2026.10.25.4 (`CFDT_EXIT_WHEN_STALE`; only a server started by `main()` refuses or exits).
-- **lmpt** 2026.10.25.1 (`stale.py`, as cfdt; `LMPT_EXIT_WHEN_STALE`, `LMPT_STALE_CHECK_S` 20 s).
-  - A busy server (a call in progress, or a study in its local worker pool) still answers, adds a `server_stale` note, and exits once idle.
-  - In a checkout, a changed `__init__.py` version also counts as stale.
-- **feat** 2026.10.25.1 (`FEAT_EXIT_WHEN_STALE`; only a server started by `main()` refuses or exits).
+**One implementation for all four:** `llmt_runtime.server.Server` (llmt-runtime 2026.11.09.6; feat 2026.11.09.10, cfdt 2026.11.09.6, lmpt 2026.11.09.4, omct 2026.11.09.3). Each translator's `mcp_server.py` makes one `GUARD = Server(RT, ...)` and wraps every tool with `GUARD.tool(ToolError)`; `main()` calls `GUARD.serve()`. Before, each had its own copy (omct 2026.10.23.3, cfdt 2026.10.25.4, lmpt 2026.10.25.1 in `stale.py`, feat 2026.10.25.1), with different periods (feat 10 s, the others 20 s) and, except feat, no call deadline.
 
-`<KEY>_EXIT_WHEN_STALE`: `1` always, `0` never; by default only servers from a shared release exit.
+- **Stale.** A release: `<prefix>/current` points to another release. A checkout: the translator's `__init__.py` on disk carries another version, or llmt-runtime's does.
+- **Refused, then exit.** A stale server that is idle refuses a call with `STALE_SERVER: <why>. This server is exiting so that the next one runs the installed version: call again.`, writes `<cli>: STALE_SERVER: exiting to pick up the new code: <why>` on stderr, stops its workers (at most 10 s, then exits whatever happens) and exits. An idle stale server also exits by itself: it checks every 10 s (`<KEY>_STALE_CHECK_S`).
+- **Busy.** A call in flight, a study in its local worker pool, or background work (lmpt's submissions after a call returned, its fea-translator chain) keeps it: it answers with the old code and a `server_stale` note, and exits once idle.
+- **Who exits.** Only a server started by `main()`: tests, scripts and `run-study` in a release that is not yet current run normally. `<KEY>_EXIT_WHEN_STALE`: `1` always, `0` never; by default only servers from a shared release exit.
+- **The same wrapper also** runs each tool in a worker thread under a 48 s deadline (SLURM commands and submissions keep to it; waits end about 3 s before it), returns errors as the SDK's ToolError with their text, writes a server log in `<KEY>_OUT/.server/` (the newest 20; calls, failures with tracebacks, refusals, signals, the exit), and stops the workers on SIGTERM/SIGHUP/SIGINT (`llmt servers --stop`).
 
 **Backstops** (llmt 2026.10.25.2):
 
