@@ -23,6 +23,8 @@ The machines (mochi, carbonio) have SLURM on a single node. Submitting each long
 | `P_SLURM_MIN_MINUTES` | number (cfdt 0, lmpt 1, feat 5) | Studies whose own time estimate is below this run locally even with `slurm`, because queueing would cost more than it saves. A study with no estimate goes to SLURM. |
 | `P_SLURM_ARGS` | text (empty) | Extra `sbatch` arguments, split like a shell does (`shlex.split`), e.g. `--mem=64G --nice=100`. A `--mem` in it wins over `P_SLURM_MEM`, a `--nodelist`/`-w` over `P_SLURM_NODE`. Implemented: feat 2026.10.25.1 (shlex-split words; `--mem` and `--nodelist`/`-w` detected from them), lmpt 2026.10.25.1 (tested with two options in one value, plus a quoted argument). In a settings file, a value with spaces needs quotes: `CFDT_SLURM_ARGS="--mem=8G --nodelist=spark-5da5"` (`llmt status` flags lines without them). |
 | `P_SLURM_NODE` | `local` \| `any` \| a node list (`local`) | Where jobs may run when the SLURM cluster has several nodes; see "Clusters of several nodes". A `--nodelist`/`-w` in `P_SLURM_ARGS` wins. |
+| `P_SLURM_NODES` | integer (1) | The most nodes one MPI job may use; see "Jobs over several nodes". Always 1 for threaded translators (feat, omct) and for those built with `one_node`. It needs `P_SLURM_NODE=any` (or a node list): `local` pins one node. llmt-runtime 2026.11.11.1. |
+| `P_JOB_SETUP` | text (empty) | Shell lines written into `job.sh` before the command, so jobs don't depend on the submitting shell's environment: module loads, the OpenFOAM bashrc. Newlines or a literal `\n` separate them: `CFDT_JOB_SETUP="module load cray-mpich\nsource $HOME/OpenFOAM-14/etc/bashrc"`. llmt-runtime 2026.11.11.1. |
 | `P_PROCS` | integer (1) | MPI ranks per study (cfdt, lmpt) or threads (feat, CalculiX), as today. A study's own `procs` overrides it. |
 | `P_TIMEOUT` | seconds | Per study, as today. With SLURM it also sets the job's time limit (below). |
 | `P_WORKERS` | integer (2) | Local pool only. With SLURM, the queue decides how many run at once. |
@@ -179,6 +181,17 @@ What llm-translators does:
 - **`llmt status`** reports SLURM for this node in a cluster (`node`, its `cpus`, `cpus_allocated`, `state`), plus `cluster_nodes`, `cluster_cpus` and whether the home folder is on a network filesystem (`shared_home`).
 - **`llmt tune`** suggests `P_SLURM_NODE=local`, or `any` when the home folder is shared. For a translator that doesn't report `executor.node` yet, it also suggests `--nodelist=<this node>` in `P_SLURM_ARGS` as a stopgap.
 - **The router** keeps two nodes of one cluster as two machines, each judged by its own node. With `any` and shared homes, they behave as one cluster: the same estimate, and SLURM chooses the node.
+
+### Jobs over several nodes
+
+On a supercomputer (NERSC Perlmutter: 128-core CPU nodes; cfdt's S50 sliding mesh at 512 ranks), one MPI job can span nodes. `P_SLURM_NODES` sets the most it may use (llmt-runtime 2026.11.11.1).
+
+- **`job.sh`.** Ranks that fit on one node's cores get `--nodes=1`. More get `--nodes=ceil(ranks / cores)` and a balanced `--ntasks-per-node` (512 on 128-core nodes: 4 × 128; 300: 3 × 100), keeping `--ntasks-per-core=1`. Ranks above cores × nodes are capped there. With the default 1, `job.sh` is as before.
+- **Caps.** When jobs may span nodes, `caps.procs` is cores × nodes, with `procs_from` saying so, plus `caps.nodes` and `caps.mem_per: "node"`; `run.procs` above that fails validation. `tool_status().executor.max_nodes` gives the setting in effect.
+- **Memory.** SLURM's `--mem` is per node. `P_SLURM_MEM=auto` splits the study's estimated total over the job's nodes and caps it at a node's memory; `job.json` records `nodes`, `ntasks_per_node` and `mem_total`. `run.mem` and a fixed `P_SLURM_MEM` are taken as per node.
+- **Which nodes count.** On a cluster with several kinds of node, only those matching `P_SLURM_ARGS`' `--partition` and plain `--constraint` features size a job (cores, how many nodes, memory). Perlmutter's `-C cpu` picks the 128-core CPU nodes, not the 64-core GPU ones. A constraint expression (`cpu|gpu`), or one no node matches, counts every node.
+- **One node per translator.** A translator built with `one_node=True`, and the threaded ones, keep every job on one node whatever the setting.
+- **Implemented:** llmt-runtime 2026.11.11.1. cfdt uses it once it drops `one_node` and caps ranks with the runtime's `max_job_procs`. Its `other/supercomputers/clusters.md` has the settings for Perlmutter and MIT Engaging (`CFDT_LAUNCH`, `CFDT_SLURM_ARGS`, `CFDT_SLURM_NODE=any`, scratch, time limits).
 
 ## Status for llm-translators
 
