@@ -2,7 +2,8 @@
 """llmt — set up and manage the llm-translators (one venv, one MCP server per translator).
 
     llmt setup                      guided setup: what to install here, venv, backends, MCP servers
-    llmt list                       the translators, what they need, what is installed here
+    llmt gui                        a window: setup, settings, and the machines (needs tkinter; llmt_gui.py)
+    llmt list                      the translators, what they need, what is installed here
     llmt install KEY... [options]   install translators into the shared venv (and what they use)
     llmt remove KEY...              uninstall translators from the venv
     llmt status [-v] [--json]       versions, submodule commits, backends found
@@ -54,7 +55,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.11.09.1"
+__version__ = "2026.11.12.1"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -3216,6 +3217,19 @@ def use_system_env(a) -> None:
         ENV_FILE = SYSTEM_ENV
 
 
+def cmd_gui(a) -> None:
+    """The window (llmt_gui.py, next to this file)."""
+    from importlib.machinery import SourceFileLoader
+    import importlib.util
+    path = ROOT / "llmt_gui.py"
+    if not path.exists():
+        die(f"{path} is missing")
+    loader = SourceFileLoader("llmt_gui", str(path))
+    m = importlib.util.module_from_spec(importlib.util.spec_from_loader("llmt_gui", loader))
+    loader.exec_module(m)
+    m.main()
+
+
 def cmd_env(a) -> None:
     use_system_env(a)
     if not a.system and ENV_FILE != SYSTEM_ENV and SYSTEM_ENV.exists():
@@ -3339,6 +3353,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--keep", type=int, default=3, help="always keep the newest N (default 3)")
     p.add_argument("--prefix")
     p.add_argument("--yes", action="store_true")
+    sub.add_parser("gui", help="a window: setup of this machine, settings, and the machines (tkinter)")
     p = sub.add_parser("env", help="settings: config/env, or yours in a shared release; --system: the machine's")
     p.add_argument("--edit", action="store_true")
     p.add_argument("--system", action="store_true", help=f"the machine's file, {SYSTEM_ENV} (admin)")
@@ -3365,7 +3380,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     {"setup": cmd_setup, "list": cmd_list, "install": cmd_install, "remove": cmd_remove, "status": cmd_status,
      "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "tune": cmd_tune, "jobs": cmd_jobs, "env": cmd_env,
-     "deploy": cmd_deploy, "releases": cmd_releases, "rollback": cmd_rollback, "servers": cmd_servers, "gc": cmd_gc, "router": cmd_router, "mcp": cmd_mcp}[a.cmd](a)
+     "deploy": cmd_deploy, "releases": cmd_releases, "rollback": cmd_rollback, "servers": cmd_servers, "gc": cmd_gc, "router": cmd_router, "mcp": cmd_mcp, "gui": cmd_gui}[a.cmd](a)
 
 
 if __name__ == "__main__":

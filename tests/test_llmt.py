@@ -413,6 +413,149 @@ class MemoryPlacement(unittest.TestCase):
                          "mochi")
 
 
+G = load("llmt_gui", "llmt_gui.py")      # its model works without tkinter
+
+GUI_STATUS = {
+    "llmt": "2026.11.12.1", "mode": "release", "commit": "abc1234", "release": {"release": "2026.11.12.2"},
+    "runtime": {"installed": "2026.11.10.1", "version": "2026.11.10.1", "problems": []},
+    "slurm": {"cpus": 20, "cpus_allocated": 18, "state": "mixed", "jobs": [
+        {"id": "349", "key": "cfdt", "state": "RUNNING", "elapsed": "6:00", "limit": "3:10:00", "cpus": "18",
+         "reason": "spark-5da5", "start": "", "study": "s50_n35", "request": "run_x"},
+        {"id": "351", "key": "cfdt", "state": "PENDING", "elapsed": "0:00", "limit": "3:10:00", "cpus": "10",
+         "reason": "Resources", "start": "2026-11-12T21:44:59", "study": "s50_n25", "request": "run_y",
+         "req_nodes": "spark-5da5"}]},
+    "translators": {
+        "cfdt": {"version": "2026.11.10.3", "commit": "c206002", "backends": {"OpenFOAM": {"found": True}},
+                 "status": {"executor": {"kind": "slurm"}}},
+        "lmpt": {"version": "2026.11.09.5", "commit": "f4b01bf", "reinstall": True, "problem": "missing scipy",
+                 "backends": {"LAMMPS": {"found": False}}, "status": {"executor": {"kind": "slurm"}}},
+        "omct": {"version": None}}}
+
+
+class GuiModel(unittest.TestCase):
+    """llmt gui: what the window shows, from llmt status --json and the translators' jobs() (no tkinter needed)."""
+
+    def test_machine_rows(self):
+        res = {"name": "spark1", "ok": True, "data": GUI_STATUS, "load": 18.2, "cores": 20}
+        s = G.machine_summary(res)
+        self.assertEqual(s["bundle"], "release 2026.11.12.2 @ abc1234")
+        self.assertEqual(s["cpus"], "18/20 in use (mixed)")
+        self.assertEqual(s["jobs"], "1 running, 1 queued")
+        self.assertIn("lmpt: reinstall", s["note"])
+        self.assertIn("lmpt: LAMMPS missing", s["note"])
+        rows = {r["key"]: r for r in G.translator_rows(res)}
+        self.assertEqual(sorted(rows), ["cfdt", "lmpt"])                      # omct not installed there
+        self.assertEqual(rows["cfdt"]["jobs"], "1 running, 1 queued")
+        self.assertEqual(rows["lmpt"]["jobs"], "0 running, 0 queued")
+        jobs = G.slurm_job_rows(res)
+        self.assertEqual((jobs[0]["node"], jobs[1]["node"]), ("spark-5da5", "spark-5da5"))
+        self.assertIn("Resources, start 2026-11-12T21:44:59", jobs[1]["why"])
+        self.assertEqual(G.machine_summary({"name": "x", "ok": False, "error": "timeout"})["reachable"], False)
+
+    def test_request_rows(self):
+        data = {"cfdt": {"requests": [{"request": "/h/cfdt_runs/run_1", "studies": {
+                    "a": {"state": "running", "job_id": "349", "job_elapsed_min": 6.0, "eta_min_max": 204.2},
+                    "b": {"state": "queued", "job_id": "351", "reason": "Resources", "expected_start": "21:44"}}}]},
+                "lmpt": {"requests": []}, "omct": {"error": "ssh: timeout"}}
+        rows = G.request_rows(data)
+        self.assertEqual([r["state"] for r in rows], ["running", "queued", "", "error"])
+        self.assertIn("eta_min_max=204.2", rows[0]["detail"])
+        self.assertEqual(rows[2]["request"], "(none active)")
+        self.assertEqual(G.parse_json_out('note\n{"requests": []}\n'), {"requests": []})
+
+    def test_settings(self):
+        with tempfile.TemporaryDirectory() as t:
+            mine, sysf = Path(t) / "env", Path(t) / "sys-env"
+            mine.write_text("CFDT_PROCS=4\nMY_OWN=x\n")
+            sysf.write_text("CFDT_PROCS=18\nCFDT_MAX_MEM=96G\n")
+            saved = (G.L.ENV_FILE, G.L.SYSTEM_ENV)
+            G.L.ENV_FILE, G.L.SYSTEM_ENV = mine, sysf
+            try:
+                secs = dict(G.settings_sections(mine))
+                cf = {r["var"]: r for r in next(v for k, v in secs.items() if k.startswith("cfdt"))}
+                self.assertEqual((cf["CFDT_PROCS"]["value"], cf["CFDT_PROCS"]["machine"]), ("4", "18"))
+                self.assertTrue(cf["CFDT_PROCS"]["desc"])
+                self.assertEqual([r["var"] for r in secs["other"]], ["MY_OWN"])
+                probs = G.save_settings({"CFDT_SLURM_ARGS": "--mem=8G --nodelist=spark-0808", "CFDT_PROCS": ""}, mine)
+                self.assertEqual(probs, [])
+                text = mine.read_text()
+                self.assertIn("CFDT_SLURM_ARGS='--mem=8G --nodelist=spark-0808'", text)   # quoted for the shell
+                self.assertIn("# CFDT_PROCS=4", text)                                  # cleared: commented out
+                self.assertEqual(G.L.ENV_FILE, mine)                                   # restored
+            finally:
+                G.L.ENV_FILE, G.L.SYSTEM_ENV = saved
+
+    def test_fetch_local(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "llmt").write_text("import json; print(json.dumps(%r))\n" % (GUI_STATUS,))
+            res = G.fetch_machine({"name": "here", "ssh": "", "root": str(root)}, timeout=30)
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(res["data"]["commit"], "abc1234")
+            self.assertGreater(res["cores"], 0)
+            (root / "bin").mkdir()
+            (root / "bin" / "run").write_text('#!/bin/sh\n[ "$1" = cfdt ] && echo \'{"requests": []}\' || echo boom >&2\n')
+            os.chmod(root / "bin" / "run", 0o755)
+            got = G.fetch_requests({"name": "here", "ssh": "", "root": str(root)}, ["cfdt", "lmpt"], timeout=30)
+            self.assertEqual(got["cfdt"], {"requests": []})
+            self.assertIn("boom", got["lmpt"]["error"])
+
+    def test_window_with_mocked_tk(self):
+        """Every handler of the window runs (tkinter mocked: this checks the code, not the look)."""
+        from unittest import mock
+        saved = (G.tk, G.ttk, G.messagebox, G.L.SETUP_FILE, G.L.CONFIG_DIR, G.L.ENV_FILE, G.L.SYSTEM_ENV)
+        G.tk, G.ttk, G.messagebox = mock.MagicMock(), mock.MagicMock(), mock.MagicMock()
+        G.messagebox.askyesno.return_value = True
+        with tempfile.TemporaryDirectory() as t:
+            t = Path(t)
+            G.L.SETUP_FILE, G.L.CONFIG_DIR, G.L.ENV_FILE, G.L.SYSTEM_ENV = t / "setup.json", t, t / "env", t / "sys"
+            (t / "env").write_text("CFDT_PROCS=4\n")
+            try:
+                with mock.patch.object(G.App, "refresh_setup"), mock.patch.object(G.App, "refresh_machines"):
+                    app = G.App(mock.MagicMock())
+                    app.show_setup(dict(GUI_STATUS, root="/r", venv="/r/.venv", python="3.12"))
+                    app.st_tree.selection.return_value = ("cfdt",)
+                    app.run = mock.MagicMock()
+                    for fn in (app.do_install, app.do_reinstall, app.do_remove, app.do_test, app.do_mcp_test,
+                               lambda: app.do_update(True), app.save_options):
+                        fn()
+                    self.assertEqual(app.run.call_args_list[1].args[0], ["update", "cfdt", "--no-pull"])
+                    app.where_var.get.return_value = "local"
+                    app.set_where()
+                    self.assertEqual(json.loads((t / "setup.json").read_text())["mcp"]["cfdt"], {"where": "local"})
+                    # settings: pick, set, save
+                    app.file_var.get.return_value = "mine"
+                    app.env_tree.insert.side_effect = lambda parent, where, iid=None, **kw: iid or "P"
+                    app.load_settings()
+                    iid = next(k for k, m in app.env_meta.items() if m["var"] == "CFDT_PROCS")
+                    app.env_tree.selection.return_value = (iid,)
+                    app.pick_var()
+                    app.var_value.get.return_value = "8"
+                    app.set_var()
+                    app.save_env()
+                    self.assertIn("CFDT_PROCS=8", (t / "env").read_text())
+                    # machines: a status, the jobs, the requests
+                    res = {"name": G.LOCAL, "ok": True, "data": GUI_STATUS, "asked": time.time(), "seconds": 1}
+                    app.m_tree.exists.return_value = True
+                    app.m_tree.get_children.return_value = (G.LOCAL,)
+                    app.m_tree.selection.return_value = (G.LOCAL,)
+                    app.show_machine(res)
+                    app.pick_machine()
+                    app.show_reqs(G.LOCAL, {"cfdt": {"requests": [{"request": "/r", "studies": {"a": {"state": "running"}}}]}})
+                    app.auto_var.get.return_value = True
+                    app.every_var.get.return_value = "2"
+                    app.schedule()
+                    G.MachinesDialog(mock.MagicMock(), on_save=lambda: None)
+                    G.RawEditor(mock.MagicMock(), t / "env", on_save=lambda: None)
+            finally:
+                G.tk, G.ttk, G.messagebox, G.L.SETUP_FILE, G.L.CONFIG_DIR, G.L.ENV_FILE, G.L.SYSTEM_ENV = saved
+
+    def test_machines_list(self):
+        hosts = G.machines({"router": {"hosts": [{"name": "mochi", "ssh": "n@mochi", "root": "/opt/x"},
+                                                 {"name": "bad"}]}})
+        self.assertEqual([h["name"] for h in hosts], [G.LOCAL, "mochi"])
+
+
 class ServersList(unittest.TestCase):
     """Item 3: the process list; a symlinked prefix; no match for shells or jobs; own process skipped."""
 

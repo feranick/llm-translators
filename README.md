@@ -33,6 +33,7 @@ Version: 2026.10.25.2.
 
 - [Installation](#installation): prerequisites, then three paths (one machine; a Mac and Linux workstations; a shared server), what setup does, and checking an install
 - [Commands](#commands)
+- [A window: llmt gui](#a-window-llmt-gui)
 - [Settings](#settings)
 - [Long runs: SLURM](#long-runs-slurm)
 - [Several machines: the router](#several-machines-the-router)
@@ -252,6 +253,7 @@ Setup can be run again at any time: it remembers the earlier answers (`config/se
 
 ```
 llmt setup                      guided setup (also what plain ./llmt does the first time)
+llmt gui                        a window for the same: setup, settings, the machines (see "A window" below)
 llmt list                       the translators, their backends, what is installed here
 llmt status [KEY...] [-v] [--json]   versions, commits, backends, how each runs, the SLURM queue
 llmt install KEY... [--python P] [--extra lmpt:lammps] [--no-test] [--no-uses] [--link-system-gmsh]
@@ -291,6 +293,27 @@ llmt servers [--stop]           the translator MCP servers running here, with th
 In a shared release, `install`, `remove`, `update` and `pin` are refused: the admin updates it with `deploy`.
 
 ---
+
+## A window: llmt gui
+
+`./llmt gui` opens a window (`llmt_gui.py`; standard library and tkinter only). It runs the same `llmt` commands as a terminal, in the background, and shows their output in a log at the bottom.
+
+- **Setup (this machine).** The translators here: version, commit, checkout state, Claude app entry, backends, and what needs doing (a reinstall, a missing dependency).
+  - Buttons act on the selected rows: Install, Update (pinned), Update to latest, Reinstall (`update --no-pull`), Remove, Run tests, Suggest tuning.
+  - Options: the test tools and each translator's optional extras, saved in `config/setup.json`.
+  - Claude app entries: set the selected translators to local, router or none, then "Write Claude config" (`llmt mcp config`) and "Test entries" (`llmt mcp test`). Remote and existing entries are kept unless you replace them. "Machines…" edits the router's machines.
+  - In a shared release, installing and updating are the admin's, so those buttons are off.
+- **Settings.** Your settings file (`config/env`, or `~/.config/llm-translators/env` in a release), and the machine's `/etc/llm-translators/env` when you may write it.
+  - Every variable of `translators.json` by translator, with its description and the machine's value next to yours, plus any other variable in the file.
+  - Set or clear (comment out) values, then Save. Values are quoted for the shell, and problems in the file are shown. "Edit file…" edits the file as text.
+- **Machines.** This machine and the router's machines (`config/setup.json`), read-only.
+  - For each: the llm-translators release and commit, `llmt` version, SLURM CPUs in use, the translators' jobs, load, and notes (reinstall needed, missing backends). Under it, each translator's version, commit, how it runs, its jobs and backends. This is `llmt status --json` over ssh.
+  - For the selected machine: its SLURM jobs (job, state, elapsed and limit, node, study, request, reason).
+    - "Fetch active requests" shows each translator's active requests and studies, with progress and ETA where the translator gives them (`<cli> jobs --active`). Double-click copies a request's path.
+    - "List MCP servers" runs `llmt servers` there (read-only).
+  - Refresh on demand, or every N minutes.
+
+tkinter: the python.org Python includes it. Homebrew's needs `brew install python-tk@3.x`. On Linux: `sudo apt install python3-tk`. macOS's `/usr/bin/python3` works too, with an older Tk: `/usr/bin/python3 llmt gui`.
 
 ## Settings
 
