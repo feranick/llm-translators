@@ -33,7 +33,7 @@ Version: 2026.10.25.2.
 
 - [Installation](#installation): prerequisites, then three paths (one machine; a Mac and Linux workstations; a shared server), what setup does, and checking an install
 - [Commands](#commands)
-- [A window: llmt gui](#a-window-llmt-gui)
+- [A window: llmt gui and llmt web](#a-window-llmt-gui-and-llmt-web)
 - [Settings](#settings)
 - [Long runs: SLURM](#long-runs-slurm)
 - [Several machines: the router](#several-machines-the-router)
@@ -254,6 +254,7 @@ Setup can be run again at any time: it remembers the earlier answers (`config/se
 ```
 llmt setup                      guided setup (also what plain ./llmt does the first time)
 llmt gui                        a window for the same: setup, settings, the machines (see "A window" below)
+llmt web [--port N] [--no-browser]   the same window as a web page (127.0.0.1 only, with an access token)
 llmt list                       the translators, their backends, what is installed here
 llmt status [KEY...] [-v] [--json]   versions, commits, backends, how each runs, the SLURM queue
 llmt install KEY... [--python P] [--extra lmpt:lammps] [--no-test] [--no-uses] [--link-system-gmsh]
@@ -294,9 +295,17 @@ In a shared release, `install`, `remove`, `update` and `pin` are refused: the ad
 
 ---
 
-## A window: llmt gui
+## A window: llmt gui and llmt web
 
-`./llmt gui` opens a window (`llmt_gui.py`; standard library and tkinter only). It runs the same `llmt` commands as a terminal, in the background, and shows their output in a log at the bottom.
+Two front ends for the same thing, in `UI/`:
+
+- **`./llmt gui`** opens a window (`UI/llmt_gui.py`; standard library and tkinter).
+- **`./llmt web`** opens the same in your browser (`UI/llmt_web.py` serving `UI/llmt_web.html`; standard library only, no tkinter).
+  - It serves on 127.0.0.1 only, port 8790 (`--port N`, or `--port 0` for any free port).
+  - The address it prints ends with `#t=<token>`. Every API call needs that token and a local Host, so other web sites can't read the page's data or start commands. Ctrl-C stops it.
+  - Opened directly as a file, `UI/llmt_web.html` shows demo data: a way to look at it without a server.
+
+Both use one model (`UI/llmt_gui.py`) and behave alike. They run the same `llmt` commands as a terminal, in the background, and show their output in a log at the bottom. One command runs at a time.
 
 - **Setup (this machine).** The translators here: version, commit, checkout state, Claude app entry, backends, and what needs doing (a reinstall, a missing dependency).
   - Buttons act on the selected rows: Install, Update (pinned), Update to latest, Reinstall (`update --no-pull`), Remove, Run tests, Suggest tuning.
@@ -309,11 +318,11 @@ In a shared release, `install`, `remove`, `update` and `pin` are refused: the ad
 - **Machines.** This machine and the router's machines (`config/setup.json`), read-only.
   - For each: the llm-translators release and commit, `llmt` version, SLURM CPUs in use, the translators' jobs, load, and notes (reinstall needed, missing backends). Under it, each translator's version, commit, how it runs, its jobs and backends. This is `llmt status --json` over ssh.
   - For the selected machine: its SLURM jobs (job, state, elapsed and limit, node, study, request, reason).
-    - "Fetch active requests" shows each translator's active requests and studies, with progress and ETA where the translator gives them (`<cli> jobs --active`). Double-click copies a request's path.
+    - "Fetch active requests" shows each translator's active requests and studies, with progress and ETA where the translator gives them (`<cli> jobs --active`). Double-click (in the browser: click) copies a request's path.
     - "List MCP servers" runs `llmt servers` there (read-only).
   - Refresh on demand, or every N minutes.
 
-tkinter: the python.org Python includes it. Homebrew's needs `brew install python-tk@3.x`. On Linux: `sudo apt install python3-tk`. macOS's `/usr/bin/python3` works too, with an older Tk: `/usr/bin/python3 llmt gui`.
+tkinter (only for `llmt gui`): the python.org Python includes it. Homebrew's needs `brew install python-tk@3.x`. On Linux: `sudo apt install python3-tk`. macOS's `/usr/bin/python3` works too, with an older Tk: `/usr/bin/python3 llmt gui`.
 
 ## Settings
 

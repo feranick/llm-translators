@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -413,7 +414,7 @@ class MemoryPlacement(unittest.TestCase):
                          "mochi")
 
 
-G = load("llmt_gui", "llmt_gui.py")      # its model works without tkinter
+G = load("llmt_gui", "UI/llmt_gui.py")      # its model works without tkinter
 
 GUI_STATUS = {
     "llmt": "2026.11.12.1", "mode": "release", "commit": "abc1234", "release": {"release": "2026.11.12.2"},
@@ -451,6 +452,22 @@ class GuiModel(unittest.TestCase):
         self.assertEqual((jobs[0]["node"], jobs[1]["node"]), ("spark-5da5", "spark-5da5"))
         self.assertIn("Resources, start 2026-11-12T21:44:59", jobs[1]["why"])
         self.assertEqual(G.machine_summary({"name": "x", "ok": False, "error": "timeout"})["reachable"], False)
+        notes = G.machine_notes(res)
+        self.assertIn("lmpt: missing scipy. Fix, on that machine: ", notes[0])
+        self.assertTrue(any("backend LAMMPS not found" in n for n in notes))
+
+    def test_jobs_per_node(self):
+        # spark1 of a two-node cluster: llmt status lists the user's jobs on both nodes; spark1 counts its own
+        d = json.loads(json.dumps(GUI_STATUS))
+        d["slurm"].update(node="spark-5da5", cluster_nodes=2)
+        d["slurm"]["jobs"].append({"id": "352", "key": "cfdt", "state": "RUNNING", "reason": "spark-0808",
+                                   "nodes": "spark-0808", "study": "other", "request": "run_z"})
+        d["slurm"]["jobs"].append({"id": "353", "key": "cfdt", "state": "PENDING", "reason": "Resources",
+                                   "req_nodes": "spark-0808", "study": "other2", "request": "run_z"})
+        res = {"name": "spark1", "ok": True, "data": d}
+        self.assertEqual(G.machine_summary(res)["jobs"],
+                         "1 running, 1 queued on spark-5da5 (cluster: 2 running, 2 queued)")
+        self.assertEqual({r["key"]: r["jobs"] for r in G.translator_rows(res)}["cfdt"], "1 running, 1 queued")
 
     def test_request_rows(self):
         data = {"cfdt": {"requests": [{"request": "/h/cfdt_runs/run_1", "studies": {
@@ -554,6 +571,109 @@ class GuiModel(unittest.TestCase):
         hosts = G.machines({"router": {"hosts": [{"name": "mochi", "ssh": "n@mochi", "root": "/opt/x"},
                                                  {"name": "bad"}]}})
         self.assertEqual([h["name"] for h in hosts], [G.LOCAL, "mochi"])
+
+
+W = load("llmt_web", "UI/llmt_web.py")
+
+
+class WebApi(unittest.TestCase):
+    """llmt web: the page and its API on 127.0.0.1 (token and Host checked; the same model as the window)."""
+
+    def setUp(self):
+        import http.client
+        self.http = http.client
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        self.t = t
+        (t / "env").write_text("CFDT_PROCS=4\n")
+        root = t / "root"
+        root.mkdir()
+        (root / "llmt").write_text("import json; print(json.dumps(%r))\n" % (GUI_STATUS,))
+        L_ = W.L
+        self.saved = (L_.SETUP_FILE, L_.CONFIG_DIR, L_.ENV_FILE, L_.SYSTEM_ENV, W.G.machines, W.G.action_args)
+        L_.SETUP_FILE, L_.CONFIG_DIR, L_.ENV_FILE, L_.SYSTEM_ENV = t / "setup.json", t, t / "env", t / "sys-env"
+        W.G.machines = lambda setup=None: [{"name": "local", "ssh": "", "root": str(root), "label": "this machine"}]
+        self.httpd, self.url, self.st = W.serve(port=0, open_browser=False, token="tok")
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        L_ = W.L
+        L_.SETUP_FILE, L_.CONFIG_DIR, L_.ENV_FILE, L_.SYSTEM_ENV, W.G.machines, W.G.action_args = self.saved
+        self.tmp.cleanup()
+
+    def req(self, method, path, body=None, token="tok", host=None, ctype="application/json"):
+        c = self.http.HTTPConnection("127.0.0.1", self.port, timeout=60)
+        h = {"Host": host or f"127.0.0.1:{self.port}"}
+        if token is not None:
+            h["X-LLMT-Token"] = token
+        data = None
+        if body is not None:
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            h["Content-Type"] = ctype
+        c.request(method, path, body=data, headers=h)
+        r = c.getresponse()
+        raw = r.read()
+        c.close()
+        try:
+            return r.status, json.loads(raw)
+        except json.JSONDecodeError:
+            return r.status, raw.decode()
+
+    def test_access(self):
+        self.assertTrue(self.url.endswith("/#t=tok"))
+        code, page = self.req("GET", "/", token=None)
+        self.assertEqual(code, 200)
+        self.assertIn("llm-translators", page)
+        self.assertEqual(self.req("GET", "/api/info", token=None)[0], 401)
+        self.assertEqual(self.req("GET", "/api/info", token="wrong")[0], 401)
+        self.assertEqual(self.req("GET", "/api/info", host="evil.example")[0], 403)     # DNS rebinding
+        self.assertEqual(self.req("GET", "/", token=None, host="evil.example")[0], 403)
+        self.assertEqual(self.req("POST", "/api/options", b"test=1", ctype="application/x-www-form-urlencoded")[0], 400)
+        code, info = self.req("GET", "/api/info")
+        self.assertEqual((code, info["llmt"]), (200, W.L.__version__))
+
+    def test_setup_and_settings(self):
+        code, r = self.req("POST", "/api/options", {"test": False, "extras": {"cfdt": ["render", "bogus"]}})
+        self.assertEqual((code, r["extras"]), (200, {"cfdt": ["render"]}))
+        self.assertEqual(self.req("POST", "/api/mcp", {"keys": ["cfdt"], "where": "router"})[0], 400)  # no machines yet
+        self.assertEqual(self.req("POST", "/api/hosts", {"hosts": [{"name": "a b", "root": "/x"}]})[0], 400)
+        code, r = self.req("POST", "/api/hosts", {"hosts": [{"name": "mochi", "ssh": "n@mochi", "root": "/opt/x"}]})
+        self.assertEqual(code, 200)
+        code, r = self.req("POST", "/api/mcp", {"keys": ["cfdt", "feat"], "where": "router"})
+        self.assertEqual((code, r["changed"]), (200, ["feat", "cfdt"]))
+        code, s = self.req("GET", "/api/settings?file=mine")
+        cf = next(x for x in s["sections"] if x["name"].startswith("cfdt"))
+        self.assertEqual(next(r for r in cf["rows"] if r["var"] == "CFDT_PROCS")["value"], "4")
+        code, r = self.req("POST", "/api/settings", {"file": "mine", "changes": {"CFDT_PROCS": "8"}})
+        self.assertEqual(code, 200)
+        self.assertIn("CFDT_PROCS=8", (self.t / "env").read_text())
+        self.assertEqual(self.req("POST", "/api/settings", {"file": "mine", "changes": {"BAD NAME": "1"}})[0], 400)
+        code, r = self.req("POST", "/api/settings/raw", {"file": "mine", "text": "CFDT_PROCS=12\nX=a b\n"})
+        self.assertEqual(code, 200)
+        self.assertTrue(r["problems"])                                       # 'a b' without quotes is flagged
+        self.assertEqual(self.req("GET", "/api/settings/raw?file=mine")[1]["text"], "CFDT_PROCS=12\nX=a b\n")
+
+    def test_actions_and_machines(self):
+        self.assertEqual(self.req("POST", "/api/action", {"action": "deploy"})[0], 400)    # only Setup's actions
+        self.assertEqual(self.req("POST", "/api/action", {"action": "remove", "keys": []})[0], 400)
+        W.G.action_args = lambda action, keys, test=True: ["--version"]
+        code, j = self.req("POST", "/api/action", {"action": "test", "keys": ["cfdt"]})
+        self.assertEqual(code, 200)
+        end = time.time() + 20
+        while not j.get("done") and time.time() < end:
+            time.sleep(0.2)
+            j = self.req("GET", "/api/job?from=0")[1]
+        self.assertEqual(j["rc"], 0)
+        self.assertIn(f"llm-translators {W.L.__version__}", "".join(j["lines"]))
+        code, m = self.req("GET", "/api/machine/local")
+        self.assertEqual(code, 200)
+        self.assertEqual(m["summary"]["cpus"], "18/20 in use (mixed)")
+        self.assertEqual(m["installed"], ["cfdt", "lmpt"])
+        self.assertEqual(len(m["jobs"]), 2)
+        self.assertEqual(self.req("GET", "/api/machine/nowhere")[0], 404)
 
 
 class ServersList(unittest.TestCase):
@@ -721,6 +841,20 @@ class Reinstall(unittest.TestCase):
         self.assertNotIn("pytest-xyz", rep["missing"])                 # the test extra was not chosen
         rep = self.report([])
         self.assertEqual(rep["missing"], ["matplotlib-new-xyz>=3.7"])
+        # installed but older than the code asks: 'outdated', not 'missing'
+        (self.src / "pyproject.toml").write_text(textwrap.dedent('''\
+            [project]
+            name = "fake-translator"
+            version = "2026.10.28.1"
+            dependencies = ["pip>=999"]
+            '''))
+        rep = self.report([])
+        self.assertEqual(rep["missing"], [])
+        self.assertEqual(len(rep["outdated"]), 1)
+        self.assertRegex(rep["outdated"][0], r"^pip \S+, needs >=999$")
+        bad = L.reinstall_needed("x", rep, "pinned")
+        self.assertIn("installed but not the version the code needs: pip", bad["problem"])
+        self.assertNotIn("missing", bad["problem"])
 
     def test_hint_and_status_line(self):
         rep = {"version": "2026.10.28.1", "dist_version": "2026.10.21.1", "stale": True, "missing": ["matplotlib>=3.7"]}

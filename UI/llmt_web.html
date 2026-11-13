@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-translators</title>
+<!-- UI/llmt_web.html — Version: 2026.11.12.3. Served by UI/llmt_web.py (./llmt web). Opened as a file, it shows
+     demo data (no server): useful to look at the layout. -->
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #5d6677; --line: #dde1e8; --soft: #eef1f5;
+  --accent: #2f5bd3; --accent-ink: #ffffff; --ok: #1f7a4d; --warn: #a35a00; --bad: #b3261e; --sel: #e6edff;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151b; --panel: #1a1e26; --ink: #e5e8ee; --muted: #9aa3b2; --line: #2c323d; --soft: #222833;
+    --accent: #7c9cff; --accent-ink: #0d1020; --ok: #5cc28f; --warn: #e3a64f; --bad: #ff8a80; --sel: #26324f;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12151b; --panel: #1a1e26; --ink: #e5e8ee; --muted: #9aa3b2; --line: #2c323d; --soft: #222833;
+  --accent: #7c9cff; --accent-ink: #0d1020; --ok: #5cc28f; --warn: #e3a64f; --bad: #ff8a80; --sel: #26324f;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+       display: flex; flex-direction: column; }
+header { display: flex; align-items: center; gap: 16px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+header .meta { color: var(--muted); font-size: 12px; flex: 1; min-width: 200px; overflow-wrap: anywhere; }
+nav { display: flex; gap: 4px; }
+nav button { border: 1px solid transparent; background: none; color: var(--muted); padding: 6px 12px; border-radius: 6px; font: inherit; cursor: pointer; }
+nav button[aria-selected="true"] { background: var(--soft); color: var(--ink); border-color: var(--line); font-weight: 600; }
+.demo { background: var(--warn); color: #fff; border-radius: 4px; padding: 2px 8px; font-size: 12px; }
+main { flex: 1; overflow: auto; padding: 12px 16px; min-height: 0; }
+section.tab { display: none; }
+section.tab.on { display: block; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+.card h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grow { flex: 1; }
+button.b { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+button.b:hover:not(:disabled) { border-color: var(--accent); }
+button.b.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.b:disabled { opacity: .45; cursor: not-allowed; }
+.sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 4px; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
+tr.sel td { background: var(--sel); }
+tbody tr.clickable { cursor: pointer; }
+tbody tr.clickable:hover td { background: var(--soft); }
+tr.child td:first-child { padding-left: 28px; }
+tr.child td { color: var(--muted); }
+td.mono, .mono { font-family: var(--mono); font-size: 12px; }
+label.chk { display: inline-flex; gap: 5px; align-items: center; margin-right: 12px; }
+input[type=text], input[type=number], textarea { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+input[type=text] { width: 100%; }
+.split { display: grid; grid-template-columns: minmax(0, 3fr) minmax(260px, 2fr); gap: 12px; }
+@media (max-width: 820px) { .split { grid-template-columns: 1fr; } }
+details.sec { border-bottom: 1px solid var(--line); }
+details.sec summary { cursor: pointer; padding: 6px 4px; font-weight: 600; }
+details.sec summary .muted { font-weight: 400; }
+.pill { display: inline-block; border-radius: 10px; padding: 0 7px; font-size: 11px; background: var(--soft); border: 1px solid var(--line); }
+.subtabs { display: flex; gap: 4px; margin: 8px 0; flex-wrap: wrap; }
+.subtabs button { font: inherit; border: 1px solid var(--line); background: none; color: var(--muted); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+.subtabs button[aria-selected="true"] { color: var(--ink); background: var(--soft); }
+pre.out { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 var(--mono); }
+#logbar { background: var(--panel); border-top: 1px solid var(--line); display: flex; flex-direction: column; height: 200px; min-height: 90px; resize: vertical; overflow: hidden; }
+#logbar .row { padding: 6px 16px; border-bottom: 1px solid var(--line); }
+#log { flex: 1; overflow: auto; padding: 6px 16px; }
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--ink); width: min(820px, 94vw); padding: 14px; }
+dialog::backdrop { background: rgba(0,0,0,.35); }
+dialog textarea { width: 100%; height: 55vh; font: 12px/1.45 var(--mono); }
+.caret { display: inline-block; width: 14px; color: var(--muted); }
+.spin { display: inline-block; width: 10px; height: 10px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: s 1s linear infinite; vertical-align: -1px; }
+@keyframes s { to { transform: rotate(360deg); } }
+.empty { color: var(--muted); padding: 10px 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>llm-translators</h1>
+  <nav role="tablist">
+    <button role="tab" data-tab="setup" aria-selected="true">Setup (this machine)</button>
+    <button role="tab" data-tab="settings" aria-selected="false">Settings</button>
+    <button role="tab" data-tab="machines" aria-selected="false">Machines</button>
+  </nav>
+  <div class="meta" id="meta">…</div>
+  <span class="demo" id="demo" hidden>demo data</span>
+</header>
+<div id="demoBanner" hidden style="background:var(--warn);color:#fff;padding:8px 16px;font-weight:600">
+  Demo data: these are not your machines. This page was opened as a file. For your own data, run
+  <span class="mono">./llmt web</span> in llm-translators and open the address it prints.
+</div>
+
+<main>
+<!-- ======================== Setup ======================== -->
+<section class="tab on" id="tab-setup">
+  <div class="card"><div id="setupInfo" class="small muted">Reading llmt status…</div></div>
+  <div class="card">
+    <div class="tablewrap"><table>
+      <thead><tr><th><input type="checkbox" id="selAll" aria-label="select all"></th><th>Translator</th><th>Installed</th>
+        <th>Commit</th><th>Checkout</th><th>Claude app</th><th>Backends</th><th>Note</th></tr></thead>
+      <tbody id="stBody"><tr><td colspan="8" class="empty"><span class="spin"></span> reading…</td></tr></tbody>
+    </table></div>
+    <p class="small warn" id="sharedNote" hidden>This is a shared release: installing and updating are the admin's (llmt deploy).</p>
+    <div class="row" style="margin-top:8px">
+      <button class="b" data-act="install" data-need="1">Install</button>
+      <button class="b" data-act="update">Update (pinned)</button>
+      <button class="b" data-act="update-latest" data-confirm="Check out each translator's newest commit (past the pins) for {keys}? 'llmt pin' records them afterwards.">Update to latest</button>
+      <button class="b" data-act="reinstall" data-need="1">Reinstall</button>
+      <button class="b" data-act="remove" data-need="1" data-confirm="Uninstall {keys} from the venv?">Remove</button>
+      <span class="sep"></span>
+      <button class="b" data-act="test">Run tests</button>
+      <button class="b" data-act="tune">Suggest tuning</button>
+      <span class="grow"></span>
+      <button class="b" id="stRefresh">Refresh</button>
+    </div>
+    <p class="small muted" style="margin:6px 0 0">Buttons act on the selected translators (none selected: Update, Run tests and Test entries take all).</p>
+  </div>
+  <div class="card">
+    <h2>Options for Install and Update</h2>
+    <div class="row" id="opts"></div>
+  </div>
+  <div class="card">
+    <h2>Claude app on this machine</h2>
+    <div class="row">
+      <span>Selected translators:</span>
+      <label class="chk"><input type="radio" name="where" value="local"> local</label>
+      <label class="chk"><input type="radio" name="where" value="router" checked> router (several machines)</label>
+      <label class="chk"><input type="radio" name="where" value="none"> none</label>
+      <button class="b" id="setWhere">Set</button>
+      <span class="sep"></span>
+      <button class="b" data-act="mcp-config">Write Claude config</button>
+      <button class="b" data-act="mcp-test">Test entries</button>
+      <span class="grow"></span>
+      <button class="b" data-open="hosts">Machines…</button>
+    </div>
+    <p class="small muted" style="margin:6px 0 0">After Write Claude config, restart the Claude app. Remote and existing entries are kept unless you confirm.</p>
+  </div>
+</section>
+
+<!-- ======================== Settings ======================== -->
+<section class="tab" id="tab-settings">
+  <div class="card row">
+    <label class="chk"><input type="radio" name="envfile" value="mine" checked> <span>Mine: <span class="mono" id="envMine"></span></span></label>
+    <label class="chk" id="envSysLabel" hidden><input type="radio" name="envfile" value="system"> <span>The machine's: <span class="mono" id="envSys"></span></span></label>
+    <span class="grow"></span>
+    <input type="text" id="envFilter" placeholder="Filter variables" style="width:200px">
+    <button class="b" id="envReload">Reload</button>
+    <button class="b" id="envRaw">Edit file…</button>
+  </div>
+  <div class="split">
+    <div class="card" id="envSecs"><div class="empty">reading…</div></div>
+    <div class="card">
+      <h2 id="varName">Select a variable</h2>
+      <p id="varDesc" class="small"></p>
+      <input type="text" id="varValue" disabled>
+      <div class="row" style="margin-top:8px">
+        <button class="b" id="varSet" disabled>Set</button>
+        <button class="b" id="varClear" disabled>Clear (comment out)</button>
+      </div>
+      <p class="small muted">Values are written quoted, as the shell needs them. Servers read settings when they start: restart the Claude app (servers over ssh too).</p>
+      <p class="small warn" id="envPending"></p>
+      <div class="row"><button class="b primary" id="envSave" disabled>Save changes</button><button class="b" id="envDiscard">Discard</button></div>
+      <p class="small bad" id="envProblems"></p>
+    </div>
+  </div>
+</section>
+
+<!-- ======================== Machines ======================== -->
+<section class="tab" id="tab-machines">
+  <div class="card row">
+    <button class="b primary" id="mRefresh">Refresh</button>
+    <label class="chk"><input type="checkbox" id="mAuto"> every</label>
+    <input type="number" id="mEvery" value="5" min="1" max="120" style="width:64px"> <span class="muted">min</span>
+    <span class="muted small" id="mStatus"></span>
+    <span class="grow"></span>
+    <button class="b" data-open="hosts">Machines…</button>
+  </div>
+  <div class="card">
+    <div class="tablewrap"><table>
+      <thead><tr><th>Machine / translator</th><th>Version / bundle</th><th>SLURM CPUs · runs</th><th>Translator jobs</th><th>Load / cores</th><th>Note</th></tr></thead>
+      <tbody id="mBody"><tr><td colspan="6" class="empty">…</td></tr></tbody>
+    </table></div>
+    <p class="small muted" style="margin:6px 0 0">Read-only: llmt status over ssh. Click a machine for its jobs; ▸ shows its translators.</p>
+  </div>
+  <div class="card" id="mDetail" hidden>
+    <div class="row"><h2 id="mSelName" style="margin:0;text-transform:none;letter-spacing:0;font-size:14px;color:var(--ink)">—</h2><span class="grow"></span>
+      <button class="b" id="mReqs">Fetch active requests</button><button class="b" id="mSrv">List MCP servers</button></div>
+    <ul id="mNotes" class="small warn" style="margin:6px 0;padding-left:18px"></ul>
+    <div class="subtabs" role="tablist">
+      <button data-sub="jobs" aria-selected="true">SLURM jobs</button>
+      <button data-sub="reqs" aria-selected="false">Active requests</button>
+      <button data-sub="srv" aria-selected="false">MCP servers</button>
+    </div>
+    <div data-pane="jobs" class="tablewrap"></div>
+    <div data-pane="reqs" class="tablewrap" hidden><div class="empty">Fetch active requests asks each translator there (its jobs --active).</div></div>
+    <div data-pane="srv" hidden><pre class="out" id="srvOut">List MCP servers runs llmt servers there (read-only).</pre></div>
+  </div>
+</section>
+</main>
+
+<div id="logbar">
+  <div class="row"><strong id="runLabel">Log</strong><span class="grow"></span>
+    <button class="b" id="stop" disabled>Stop</button><button class="b" id="clearLog">Clear</button></div>
+  <div id="log"><pre class="out" id="logOut"></pre></div>
+</div>
+
+<dialog id="dlgHosts">
+  <h3 style="margin-top:0">Machines (the router's, config/setup.json)</h3>
+  <div class="tablewrap"><table><thead><tr><th>Name</th><th>ssh (user@host)</th><th>llm-translators folder there</th><th></th></tr></thead>
+    <tbody id="hostsBody"></tbody></table></div>
+  <div class="row" style="margin-top:8px"><button class="b" id="hostAdd">Add a machine</button><span class="grow"></span>
+    <button class="b" id="hostsCancel">Cancel</button><button class="b primary" id="hostsSave">Save</button></div>
+  <p class="small muted">The router reads these when it starts: restart the Claude app after saving. 'llmt router setup' checks each machine too.</p>
+  <p class="small bad" id="hostsErr"></p>
+</dialog>
+
+<dialog id="dlgRaw">
+  <h3 style="margin-top:0" class="mono" id="rawPath"></h3>
+  <textarea id="rawText" spellcheck="false"></textarea>
+  <div class="row" style="margin-top:8px"><span class="small muted" id="rawNote"></span><span class="grow"></span>
+    <button class="b" id="rawCancel">Close</button><button class="b primary" id="rawSave">Save</button></div>
+  <p class="small bad" id="rawErr"></p>
+</dialog>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const DEMO = location.protocol === "file:" || /[#&]demo\b/.test(location.hash);
+const TOKEN = (location.hash.match(/[#&]t=([^&]+)/) || [])[1] || "";
+
+async function api(path, body) {
+  if (DEMO) return demoApi(path, body);
+  const opt = {method: body ? "POST" : "GET", headers: {"X-LLMT-Token": TOKEN}};
+  if (body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  const r = await fetch("/api/" + path, opt);
+  const j = await r.json().catch(() => ({error: r.statusText}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+let INFO = null;
+const say = t => { const o = $("#logOut"); o.textContent += t.endsWith("\n") ? t : t + "\n"; $("#log").scrollTop = 1e9; };
+
+// ---------------- tabs
+$$("nav button").forEach(b => b.onclick = () => {
+  $$("nav button").forEach(x => x.setAttribute("aria-selected", x === b));
+  $$("section.tab").forEach(s => s.classList.toggle("on", s.id === "tab-" + b.dataset.tab));
+});
+
+// ---------------- the running command (one at a time), its output in the log
+let jobNext = 0, jobTimer = null, afterJob = null;
+async function runAction(action, keys, then) {
+  try {
+    const j = await api("action", {action, keys, test: $("#optTest") ? $("#optTest").checked : true});
+    jobNext = 0; afterJob = then || null; showJob(j); pollJob();
+  } catch (e) { say("! " + e.message); }
+}
+function showJob(j) {
+  (j.lines || []).forEach(say); jobNext = j.next ?? jobNext;
+  $("#runLabel").textContent = j.done ? "Log" : "Running: " + (j.title || "");
+  $("#stop").disabled = !!j.done;
+}
+async function pollJob() {
+  clearTimeout(jobTimer);
+  try {
+    const j = await api("job?from=" + jobNext);
+    if (j.id) showJob(j);
+    if (j.id && !j.done) { jobTimer = setTimeout(pollJob, 500); return; }
+    if (afterJob) { const f = afterJob; afterJob = null; f(j.rc); }
+  } catch (e) { say("! " + e.message); }
+}
+$("#stop").onclick = () => api("job/stop", {}).then(() => say("(stopping)")).catch(e => say("! " + e.message));
+$("#clearLog").onclick = () => $("#logOut").textContent = "";
+
+// ---------------- Setup
+function selectedKeys() { return $$("#stBody input[type=checkbox]:checked").map(c => c.value); }
+$("#selAll").onchange = e => $$("#stBody input[type=checkbox]").forEach(c => c.checked = e.target.checked);
+const CHANGES = ["install", "update", "update-latest", "reinstall", "remove"];
+$$("[data-act]").forEach(b => b.onclick = () => {
+  const keys = selectedKeys(), act = b.dataset.act;
+  if (b.dataset.need && !keys.length) return alert("Select one or more translators first.");
+  if (b.dataset.confirm && !confirm(b.dataset.confirm.replace("{keys}", keys.join(", ") || "all"))) return;
+  runAction(act, keys, CHANGES.includes(act) ? () => loadStatus() : null);
+});
+$("#stRefresh").onclick = () => loadStatus();
+
+async function loadStatus() {
+  $("#setupInfo").innerHTML = '<span class="spin"></span> Reading llmt status…';
+  let d;
+  try { d = await api("status"); } catch (e) { $("#setupInfo").textContent = "llmt status failed: " + e.message; return; }
+  if (d.error) { $("#setupInfo").textContent = "llmt status failed: " + d.error; return; }
+  const rt = d.runtime || {}, rel = d.release || {};
+  $("#setupInfo").innerHTML =
+    `llm-translators <b>${esc(d.llmt)}</b> · ${d.mode === "release" ? "release " + esc(rel.release) : "checkout"} @ <span class="mono">${esc(d.commit || "?")}</span> · <span class="mono">${esc(d.root)}</span><br>` +
+    `venv: <span class="mono">${esc(d.venv || "none yet (Install creates it)")}</span>${d.python ? " (Python " + esc(d.python) + ")" : ""}` +
+    (d.runtime ? ` · llmt-runtime ${esc(rt.installed || "-")} (pinned ${esc(rt.version || "?")})` : "") +
+    ((d.settings || []).length ? ` · settings: <span class="mono">${esc(d.settings.join(", "))}</span>` : "");
+  const was = new Set(selectedKeys()), mcp = (INFO.setup || {}).mcp || {};
+  const rows = Object.entries(d.translators || {}).map(([k, t]) => {
+    const bes = Object.entries(t.backends || {}).map(([n, b]) => `<span class="${b.found ? "ok" : "bad"}">${esc(n)} ${b.found ? "ok" : "MISSING"}</span>`).join(", ");
+    let note = t.problem ? `<span class="warn">${esc(t.problem)}: run ${esc(t.fix)}</span>` : (t.version ? "" : '<span class="muted">not installed</span>');
+    if (t.submodule === "moved") note += (note ? "; " : "") + '<span class="warn">not at the pinned commit</span>';
+    return `<tr><td><input type="checkbox" value="${esc(k)}" ${was.has(k) ? "checked" : ""} aria-label="${esc(k)}"></td>
+      <td><b>${esc(k)}</b> <span class="muted small">${esc((INFO.registry[k] || {}).repo || "")}</span></td>
+      <td class="mono">${esc(t.version || "-")}</td><td class="mono">${esc(t.commit || "-")}</td><td>${esc(t.submodule || "-")}</td>
+      <td>${esc((mcp[k] || {}).where || "-")}</td><td>${bes || (t.version ? '<span class="muted">none needed</span>' : "-")}</td><td>${note}</td></tr>`;
+  });
+  $("#stBody").innerHTML = rows.join("") || '<tr><td colspan="8" class="empty">no translators</td></tr>';
+}
+
+function buildOptions() {
+  const s = INFO.setup, dis = INFO.shared ? "disabled" : "";
+  let h = `<label class="chk"><input type="checkbox" id="optTest" ${s.test ? "checked" : ""} ${dis}> test tools (pytest)</label>`;
+  for (const [k, t] of Object.entries(INFO.registry))
+    for (const [e, what] of Object.entries(t.optional_extras || {}))
+      h += `<label class="chk" title="${esc(what)}"><input type="checkbox" data-extra="${esc(k)}:${esc(e)}" ${((s.extras || {})[k] || []).includes(e) ? "checked" : ""} ${dis}> ${esc(k)}: ${esc(e)}</label>`;
+  $("#opts").innerHTML = h;
+  $$("#opts input").forEach(c => c.onchange = saveOptions);
+}
+async function saveOptions() {
+  const extras = {};
+  $$("[data-extra]").forEach(c => { if (c.checked) { const [k, e] = c.dataset.extra.split(":"); (extras[k] ||= []).push(e); } });
+  try { const r = await api("options", {test: $("#optTest").checked, extras}); INFO.setup.test = r.test; INFO.setup.extras = r.extras;
+        say("(config/setup.json: options saved; Install or Reinstall applies them)"); } catch (e) { say("! " + e.message); }
+}
+$("#setWhere").onclick = async () => {
+  const keys = selectedKeys(); if (!keys.length) return alert("Select one or more translators first.");
+  const where = $("input[name=where]:checked").value;
+  try {
+    let r = await api("mcp", {keys, where});
+    if (r.kept.length && confirm(`${r.kept.join(", ")}: remote or existing entries now. Replace them too?`))
+      r = {changed: r.changed.concat((await api("mcp", {keys: r.kept, where, replace: true})).changed), kept: []};
+    say(`(config/setup.json: ${r.changed.join(", ") || "nothing"} -> ${where}${r.kept.length ? "; kept " + r.kept.join(", ") : ""}. 'Write Claude config' updates the Claude app; restart it.)`);
+    INFO = await api("info"); loadStatus();
+  } catch (e) { alert(e.message); }
+};
+
+// ---------------- Machines dialog (router hosts)
+let hostRows = [];
+function drawHosts() {
+  $("#hostsBody").innerHTML = hostRows.map((h, i) => `<tr>
+    <td><input type="text" data-i="${i}" data-f="name" value="${esc(h.name)}"></td>
+    <td><input type="text" data-i="${i}" data-f="ssh" value="${esc(h.ssh)}" placeholder="user@host"></td>
+    <td><input type="text" data-i="${i}" data-f="root" value="${esc(h.root)}"></td>
+    <td><button class="b" data-del="${i}" aria-label="remove">✕</button></td></tr>`).join("") || '<tr><td colspan="4" class="empty">no machines</td></tr>';
+  $$("#hostsBody input").forEach(inp => inp.oninput = () => hostRows[inp.dataset.i][inp.dataset.f] = inp.value);
+  $$("#hostsBody [data-del]").forEach(b => b.onclick = () => { hostRows.splice(+b.dataset.del, 1); drawHosts(); });
+}
+$$("[data-open=hosts]").forEach(b => b.onclick = () => { hostRows = (INFO.setup.hosts || []).map(h => ({...h})); $("#hostsErr").textContent = ""; drawHosts(); $("#dlgHosts").showModal(); });
+$("#hostAdd").onclick = () => { hostRows.push({name: "", ssh: "", root: "/opt/llm-translators/current"}); drawHosts(); };
+$("#hostsCancel").onclick = () => $("#dlgHosts").close();
+$("#hostsSave").onclick = async () => {
+  try { const r = await api("hosts", {hosts: hostRows}); INFO.setup.hosts = r.hosts; $("#dlgHosts").close(); say("(config/setup.json: router machines saved)"); loadMachines(); }
+  catch (e) { $("#hostsErr").textContent = e.message; }
+};
+
+// ---------------- Settings
+let ENV = null, envSel = null, pending = {};
+const openSecs = new Map();         // sections the user opened or closed (kept across redraws)
+const envFile = () => $("input[name=envfile]:checked").value;
+async function loadSettings() {
+  pending = {}; envSel = null; updatePending();
+  try { ENV = await api("settings?file=" + envFile()); } catch (e) { $("#envSecs").innerHTML = `<div class="empty bad">${esc(e.message)}</div>`; return; }
+  drawSettings();
+  $("#envProblems").textContent = (ENV.problems || []).join("\n") + (ENV.writable ? "" : `\n${ENV.path} is not writable by you (the admin edits it: sudo llmt env --system --edit).`);
+  pickVar(null);
+}
+function drawSettings() {
+  const f = $("#envFilter").value.trim().toLowerCase();
+  $("#envSecs").innerHTML = ENV.sections.map((s, si) => {
+    const rows = s.rows.filter(r => !f || r.var.toLowerCase().includes(f) || (r.desc || "").toLowerCase().includes(f));
+    if (!rows.length) return "";
+    const set = s.rows.filter(r => r.value).length;
+    const hot = s.rows.some(r => (envSel && envSel.var === r.var) || Object.prototype.hasOwnProperty.call(pending, r.var));
+    const isOpen = f || hot || (openSecs.has(s.name) ? openSecs.get(s.name) : set > 0);
+    return `<details class="sec" data-sec="${esc(s.name)}" ${isOpen ? "open" : ""}><summary>${esc(s.name)} <span class="pill">${set} set</span></summary>
+      <table><thead><tr><th>Variable</th><th>Value (this file)</th><th>Machine's file</th></tr></thead><tbody>${rows.map(r => {
+        const p = Object.prototype.hasOwnProperty.call(pending, r.var), v = p ? (pending[r.var] || "(cleared)") + " *" : r.value;
+        return `<tr class="clickable ${envSel && envSel.var === r.var ? "sel" : ""}" data-var="${esc(r.var)}" data-s="${si}">
+          <td class="mono">${esc(r.var)}</td><td class="mono ${p ? "warn" : ""}">${esc(v)}</td><td class="mono muted">${esc(r.machine)}</td></tr>`;
+      }).join("")}</tbody></table></details>`;
+  }).join("") || '<div class="empty">no variable matches</div>';
+  $$("#envSecs tr[data-var]").forEach(tr => tr.onclick = () => pickVar(ENV.sections[+tr.dataset.s].rows.find(r => r.var === tr.dataset.var)));
+  $$("#envSecs details.sec").forEach(d => d.ontoggle = () => openSecs.set(d.dataset.sec, d.open));
+}
+function pickVar(r) {
+  envSel = r;
+  $("#varName").textContent = r ? r.var : "Select a variable";
+  $("#varDesc").textContent = r ? (r.desc || "(not described in translators.json)") : "";
+  $("#varValue").value = r ? (pending[r.var] ?? r.value) : "";
+  ["#varValue", "#varSet", "#varClear"].forEach(s => $(s).disabled = !r);
+  $$("#envSecs tr[data-var]").forEach(tr => tr.classList.toggle("sel", !!r && tr.dataset.var === r.var));
+}
+function setVar(clear) { if (!envSel) return; pending[envSel.var] = clear ? "" : $("#varValue").value.trim(); updatePending(); drawSettings(); }
+function updatePending() { const k = Object.keys(pending); $("#envPending").textContent = k.length ? "Not saved yet: " + k.join(", ") : ""; $("#envSave").disabled = !k.length; }
+$("#varSet").onclick = () => setVar(false);
+$("#varValue").onkeydown = e => { if (e.key === "Enter") setVar(false); };
+$("#varClear").onclick = () => setVar(true);
+$("#envSave").onclick = async () => {
+  try { const r = await api("settings", {file: envFile(), changes: pending}); say(`(saved ${Object.keys(pending).join(", ")} in ${ENV.path})`);
+        await loadSettings(); if (r.problems.length) alert(r.problems.join("\n")); } catch (e) { alert(e.message); }
+};
+$("#envDiscard").onclick = loadSettings;
+$("#envReload").onclick = loadSettings;
+$("#envFilter").oninput = () => ENV && drawSettings();
+$$("input[name=envfile]").forEach(r => r.onchange = loadSettings);
+$("#envRaw").onclick = async () => {
+  try { const r = await api("settings/raw?file=" + envFile());
+        $("#rawPath").textContent = r.path; $("#rawText").value = r.text; $("#rawSave").disabled = !r.writable;
+        $("#rawNote").textContent = r.writable ? "" : "read-only for you"; $("#rawErr").textContent = ""; $("#dlgRaw").showModal(); }
+  catch (e) { alert(e.message); }
+};
+$("#rawCancel").onclick = () => $("#dlgRaw").close();
+$("#rawSave").onclick = async () => {
+  try { const r = await api("settings/raw", {file: envFile(), text: $("#rawText").value});
+        if (r.problems.length) alert(r.problems.join("\n")); $("#dlgRaw").close(); loadSettings(); }
+  catch (e) { $("#rawErr").textContent = e.message; }
+};
+
+// ---------------- Machines
+let MACH = [], MV = {}, opened = new Set(), msel = null, autoTimer = null;
+async function loadMachines() {
+  try { MACH = (await api("machines")).machines; } catch (e) { $("#mStatus").textContent = e.message; return; }
+  MV = {}; drawMachines(); $("#mStatus").textContent = `asking ${MACH.length} machine(s)…`;
+  await Promise.all(MACH.map(async m => {
+    try { MV[m.name] = await api("machine/" + encodeURIComponent(m.name)); } catch (e) { MV[m.name] = {error: e.message}; }
+    drawMachines();
+    const n = Object.keys(MV).length;
+    $("#mStatus").textContent = `${n}/${MACH.length} answered · last ${new Date().toLocaleTimeString()}`;
+  }));
+  if (msel) drawDetail();
+}
+function drawMachines() {
+  $("#mBody").innerHTML = MACH.map(m => {
+    const v = MV[m.name], name = esc(m.label || m.name);
+    if (!v) return `<tr><td><span class="caret"></span><b>${name}</b></td><td colspan="5"><span class="spin"></span> <span class="muted">asking ${esc(m.ssh || "here")}…</span></td></tr>`;
+    if (v.error) return `<tr class="clickable ${msel === m.name ? "sel" : ""}" data-m="${esc(m.name)}"><td><span class="caret"></span><b>${name}</b></td><td colspan="5" class="bad">${esc(v.error)}</td></tr>`;
+    const s = v.summary, kids = v.translators || [], isOpen = opened.has(m.name);
+    let h = `<tr class="clickable ${msel === m.name ? "sel" : ""}" data-m="${esc(m.name)}">
+      <td><span class="caret" data-toggle="${esc(m.name)}">${kids.length ? (isOpen ? "▾" : "▸") : ""}</span><b>${name}</b></td>`;
+    if (!s.reachable) return h + `<td colspan="5"><span class="bad">unreachable</span> <span class="muted small">${esc(s.error || "")}</span></td></tr>`;
+    h += `<td>${esc(s.bundle || "")} <span class="muted small">llmt ${esc(s.llmt || "")}</span></td><td>${esc(s.cpus || "")}</td>
+      <td>${esc(s.jobs || "")}</td><td>${esc(s.load || "")}</td><td class="${s.note ? "warn" : ""}">${esc(s.note || "")}</td></tr>`;
+    if (isOpen) h += kids.map(t => `<tr class="child"><td>${esc(t.key)}</td><td class="mono">${esc(t.version)} (${esc(t.commit)})</td>
+      <td>${esc(t.executor)}</td><td>${esc(t.jobs)}</td><td></td><td>${t.note ? '<span class="warn">' + esc(t.note) + "</span>; " : ""}${esc(t.backends)}</td></tr>`).join("");
+    return h;
+  }).join("") || '<tr><td colspan="6" class="empty">no machines</td></tr>';
+  $$("#mBody [data-toggle]").forEach(c => c.onclick = e => { e.stopPropagation(); const n = c.dataset.toggle; opened.has(n) ? opened.delete(n) : opened.add(n); drawMachines(); });
+  $$("#mBody tr[data-m]").forEach(tr => tr.onclick = () => { msel = tr.dataset.m; drawMachines(); drawDetail(); });
+}
+function subtab(name) {
+  $$("#mDetail .subtabs button").forEach(b => b.setAttribute("aria-selected", b.dataset.sub === name));
+  $$("#mDetail [data-pane]").forEach(p => p.hidden = p.dataset.pane !== name);
+}
+$$("#mDetail .subtabs button").forEach(b => b.onclick = () => subtab(b.dataset.sub));
+function drawDetail() {
+  const m = MACH.find(x => x.name === msel), v = MV[msel] || {};
+  $("#mDetail").hidden = !m; if (!m) return;
+  $("#mSelName").textContent = (m.label || m.name) + (v.result && v.result.seconds ? `  (${v.result.seconds} s)` : "");
+  $("#mNotes").innerHTML = (v.notes || (v.error ? [v.error] : [])).map(n => `<li>${esc(n)}</li>`).join("");
+  const jobs = v.jobs || [];
+  $('[data-pane="jobs"]').innerHTML = jobs.length ? `<table><thead><tr><th>Job</th><th>Tr.</th><th>State</th><th>Elapsed / limit</th><th>CPUs</th><th>Node</th><th>Study</th><th>Request</th><th>Reason / start</th></tr></thead><tbody>${
+    jobs.map(j => `<tr><td class="mono">${esc(j.id)}</td><td>${esc(j.key)}</td><td class="${j.state === "RUNNING" ? "ok" : "warn"}">${esc(j.state)}</td><td class="mono">${esc(j.time)}</td><td>${esc(j.cpus)}</td><td>${esc(j.node)}</td><td>${esc(j.study)}</td><td class="mono">${esc(j.request)}</td><td>${esc(j.why)}</td></tr>`).join("")}</tbody></table>`
+    : `<div class="empty">${v.summary && v.summary.cpus === "no SLURM" ? "no SLURM here" : "no translator jobs queued or running"}</div>`;
+}
+$("#mReqs").onclick = async () => {
+  if (!msel) return; subtab("reqs");
+  const pane = $('[data-pane="reqs"]'); pane.innerHTML = '<div class="empty"><span class="spin"></span> asking each translator…</div>';
+  try {
+    const rows = (await api("machine/" + encodeURIComponent(msel) + "/requests")).rows;
+    pane.innerHTML = `<table><thead><tr><th>Tr.</th><th>Request</th><th>Study</th><th>State</th><th>Job</th><th>Detail</th></tr></thead><tbody>${
+      rows.map(r => `<tr class="clickable" title="click: copy the request's path" data-copy="${esc(r.request)}"><td>${esc(r.key)}</td><td class="mono">${esc(r.request)}</td><td>${esc(r.study)}</td>
+        <td class="${r.state === "error" ? "bad" : ""}">${esc(r.state)}</td><td class="mono">${esc(r.job)}</td><td class="small">${esc(r.detail)}</td></tr>`).join("")}</tbody></table>`;
+    $$("[data-copy]", pane).forEach(tr => tr.onclick = () => { if (tr.dataset.copy.startsWith("/")) navigator.clipboard?.writeText(tr.dataset.copy).then(() => say("(copied " + tr.dataset.copy + ")")); });
+  } catch (e) { pane.innerHTML = `<div class="empty bad">${esc(e.message)}</div>`; }
+};
+$("#mSrv").onclick = async () => {
+  if (!msel) return; subtab("srv"); $("#srvOut").textContent = "llmt servers …";
+  try { $("#srvOut").textContent = (await api("machine/" + encodeURIComponent(msel) + "/servers")).text +
+        "\n\n(read-only: on the machine, 'llmt servers --stop' ends old-release servers and leftover workers)"; }
+  catch (e) { $("#srvOut").textContent = e.message; }
+};
+$("#mRefresh").onclick = loadMachines;
+function schedule() { clearInterval(autoTimer); if ($("#mAuto").checked) autoTimer = setInterval(loadMachines, Math.max(1, +$("#mEvery").value || 5) * 60000); }
+$("#mAuto").onchange = schedule; $("#mEvery").onchange = schedule;
+
+// ---------------- start
+(async function start() {
+  $("#demo").hidden = !DEMO;
+  $("#demoBanner").hidden = !DEMO;
+  if (!DEMO && !TOKEN) { $("#setupInfo").innerHTML = '<span class="bad">No access token: open the address that <span class="mono">./llmt web</span> printed (it ends with #t=…).</span>'; return; }
+  try { INFO = await api("info"); } catch (e) { $("#setupInfo").innerHTML = `<span class="bad">${esc(e.message)}</span>`; return; }
+  $("#meta").textContent = `llmt ${INFO.llmt} · ${INFO.root}${INFO.shared ? " · shared release" : ""}`;
+  document.title = `llm-translators ${INFO.llmt}`;
+  $("#sharedNote").hidden = !INFO.shared;
+  if (INFO.shared) $$("[data-act]").forEach(b => { if (CHANGES.includes(b.dataset.act)) b.disabled = true; });
+  $("#envMine").textContent = INFO.env.mine;
+  if (INFO.env.system) { $("#envSys").textContent = INFO.env.system; $("#envSysLabel").hidden = false; }
+  buildOptions();
+  loadStatus(); loadSettings(); loadMachines(); pollJob();
+})();
+
+// ---------------- demo data (opened as a file: no server)
+function demoApi(path, body) {
+  const D = demoApi.D || (demoApi.D = {
+    info: {llmt: "2026.11.12.2", root: "/Users/you/Software/llm-translators", shared: false, keys: ["b3dt", "feat", "cfdt", "lmpt", "omct"], local: "local",
+      registry: {b3dt: {repo: "build123d-translator", optional_extras: {}}, feat: {repo: "fea-translator", optional_extras: {}},
+                 cfdt: {repo: "cfd-translator", optional_extras: {render: "3D images with VTK"}}, lmpt: {repo: "lammps-translator", optional_extras: {lammps: "LAMMPS from PyPI"}},
+                 omct: {repo: "openmodelica-translator", optional_extras: {}}},
+      setup: {test: true, extras: {}, mcp: {b3dt: {where: "local"}, feat: {where: "router"}, cfdt: {where: "router"}, lmpt: {where: "router"}, omct: {where: "router"}},
+              hosts: [{name: "carbonio", ssh: "nicola@carbonio", root: "/opt/llm-translators/current"}, {name: "spark1", ssh: "feranick@100.77.175.91", root: "/opt/llm-translators/current"}]},
+      env: {mine: "/Users/you/Software/llm-translators/config/env", system: "/etc/llm-translators/env"}},
+    status: {llmt: "2026.11.12.2", mode: "checkout", commit: "38ea944", root: "/Users/you/Software/llm-translators", venv: "/Users/you/Software/llm-translators/.venv", python: "3.12.7",
+      runtime: {installed: "2026.11.10.1", version: "2026.11.10.1"}, settings: ["/Users/you/Software/llm-translators/config/env"],
+      translators: {b3dt: {version: "2026.11.05.2", commit: "1a2b3c4", submodule: "pinned", backends: {}},
+                    feat: {version: "2026.11.09.10", commit: "7e8c12e", submodule: "pinned", backends: {Gmsh: {found: true}, CalculiX: {found: false}}},
+                    cfdt: {version: null, commit: "ba91b5c", submodule: "pinned"}, lmpt: {version: null, commit: "f4b01bf", submodule: "absent"},
+                    omct: {version: null, commit: "63afee9", submodule: "absent"}}},
+    machines: {machines: [{name: "local", ssh: "", label: "this machine"}, {name: "carbonio", ssh: "nicola@carbonio"}, {name: "spark1", ssh: "feranick@100.77.175.91"}]},
+    "machine/local": {summary: {reachable: true, bundle: "checkout @ 38ea944", llmt: "2026.11.12.2", cpus: "no SLURM", jobs: "", load: "2.1 / 12", note: "feat: CalculiX missing"},
+      translators: [{key: "b3dt", version: "2026.11.05.2", commit: "1a2b3c4", executor: "local", jobs: "", backends: "none needed", note: ""},
+                    {key: "feat", version: "2026.11.09.10", commit: "7e8c12e", executor: "local", jobs: "", backends: "Gmsh ok, CalculiX MISSING", note: ""}], jobs: [], result: {seconds: 4.1}},
+    "machine/carbonio": {summary: {reachable: true, bundle: "release 2026.11.12.1 @ 38ea944", llmt: "2026.11.12.2", cpus: "4/12 in use (mixed)", jobs: "1 running, 0 queued", load: "4.2 / 12", note: ""},
+      translators: [{key: "feat", version: "2026.11.09.10", commit: "7e8c12e", executor: "slurm", jobs: "1 running, 0 queued", backends: "Gmsh ok, CalculiX ok", note: ""},
+                    {key: "cfdt", version: "2026.11.10.3", commit: "ba91b5c", executor: "slurm", jobs: "0 running, 0 queued", backends: "OpenFOAM ok", note: ""}],
+      jobs: [{id: "5781", key: "feat", state: "RUNNING", time: "21:12 / 1:10:00", cpus: "4", node: "carbonio", study: "s50_cover_25Nm", request: "run_20261112_101500_ab12cd", why: ""}], result: {seconds: 9.3}},
+    "machine/spark1": {summary: {reachable: true, bundle: "release 2026.11.12.1 @ 38ea944", llmt: "2026.11.12.2", cpus: "18/20 in use (mixed)", jobs: "1 running, 1 queued on spark-5da5 (cluster: 2 running, 1 queued)", load: "18.2 / 20", note: "lmpt: reinstall"},
+      notes: ["lmpt: missing scipy>=1.10. Fix, on that machine: the admin rebuilds the release: sudo llmt deploy"],
+      translators: [{key: "cfdt", version: "2026.11.10.3", commit: "ba91b5c", executor: "slurm", jobs: "1 running, 1 queued", backends: "OpenFOAM ok", note: ""},
+                    {key: "lmpt", version: "2026.11.09.5", commit: "f4b01bf", executor: "slurm", jobs: "0 running, 0 queued", backends: "LAMMPS ok", note: "missing scipy"}],
+      jobs: [{id: "349", key: "cfdt", state: "RUNNING", time: "1:36:00 / 3:10:00", cpus: "18", node: "spark-5da5", study: "s50_Q40_vol_n35", request: "run_20261112_113458_420c10", why: ""},
+             {id: "351", key: "cfdt", state: "PENDING", time: "0:00 / 3:10:00", cpus: "10", node: "spark-5da5", study: "s50_Q40_vol_n25", request: "run_20261112_113624_eb4958", why: "Resources, start 2026-11-12T21:44:59"}], result: {seconds: 12.8}},
+    settings: {path: "/Users/you/Software/llm-translators/config/env", writable: true, problems: [], sections: [
+      {name: "feat  (fea-translator)", rows: [{var: "FEAT_PROCS", desc: "threads per study (default: 1)", value: "4", machine: ""}, {var: "FEAT_TIMEOUT", desc: "seconds a run may take", value: "", machine: ""}]},
+      {name: "cfdt  (cfd-translator)", rows: [{var: "CFDT_EXECUTOR", desc: "local or slurm", value: "", machine: "slurm"}, {var: "CFDT_SLURM_ARGS", desc: "extra sbatch options", value: "", machine: "--mem=8G"}]}]},
+  });
+  const ok = v => new Promise(r => setTimeout(() => r(JSON.parse(JSON.stringify(v))), 150 + Math.random() * 400));
+  if (path === "action") { D.job = {id: "d", title: body.action, lines: [`$ ./llmt ${body.action} ${(body.keys || []).join(" ")}\n`, "(demo: nothing runs)\n", "(exit 0)\n"], next: 3, done: true, rc: 0}; return ok(D.job); }
+  if (path.startsWith("job")) return ok(D.job ? {...D.job, lines: []} : {id: null, done: true, lines: [], next: 0});
+  if (path.startsWith("settings/raw")) return ok({path: D.settings.path, writable: true, text: "FEAT_PROCS=4\n"});
+  if (path.startsWith("settings")) return ok(body ? {problems: []} : D.settings);
+  if (path.endsWith("/requests")) return ok({rows: [{key: "cfdt", request: "/home/feranick/cfdt_runs/run_20261112_113458_420c10", study: "s50_Q40_vol_n35", state: "running", job: "349", detail: "stage=solving; job_elapsed_min=96.0; eta_min_max=204.2"}]});
+  if (path.endsWith("/servers")) return ok({text: "Translator MCP servers on this machine (shared prefix /opt/llm-translators, current: 2026.11.12.1)\n    770072  feranick     cfdt  release 2026.11.12.1 (current)"});
+  if (path === "options") return ok(body);
+  if (path === "mcp") return ok({changed: body.keys, kept: []});
+  if (path === "hosts") return ok({hosts: body.hosts});
+  return ok(D[decodeURIComponent(path)] || {error: "demo: " + path});
+}
+</script>
+</body>
+</html>

@@ -2,7 +2,8 @@
 """llmt — set up and manage the llm-translators (one venv, one MCP server per translator).
 
     llmt setup                      guided setup: what to install here, venv, backends, MCP servers
-    llmt gui                        a window: setup, settings, and the machines (needs tkinter; llmt_gui.py)
+    llmt gui                        a window: setup, settings, and the machines (needs tkinter; UI/llmt_gui.py)
+    llmt web [--port N]             the same in a browser (UI/llmt_web.py: a server on 127.0.0.1 only)
     llmt list                      the translators, what they need, what is installed here
     llmt install KEY... [options]   install translators into the shared venv (and what they use)
     llmt remove KEY...              uninstall translators from the venv
@@ -55,7 +56,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.11.12.1"
+__version__ = "2026.11.12.3"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -298,14 +299,15 @@ for k, (pkg, repo, extras, src) in REG.items():
         m = importlib.import_module(pkg)
     except Exception:
         continue
-    r = {"version": getattr(m, "__version__", "?"), "missing": []}
+    r = {"version": getattr(m, "__version__", "?"), "missing": [], "outdated": []}
     d = dist_of(pkg, repo)
     reqs = source_reqs(src, extras)
     if d is not None:
         r["dist"] = d.metadata["Name"]
         r["dist_version"] = d.version
         r["stale"] = r["version"] != "?" and norm(d.version) != norm(r["version"])
-        reqs += list(d.requires or [])
+        if not reqs:          # the checkout's pyproject says what the code needs; the installed metadata may be older
+            reqs = list(d.requires or [])
     if Requirement is not None:
         seen = set()
         for s in reqs:
@@ -317,14 +319,14 @@ for k, (pkg, repo, extras, src) in REG.items():
                 continue
             v = have(q.name)
             if v is None:
-                miss = None if importable(q.name) else q.name + str(q.specifier)
+                miss, kind = (None if importable(q.name) else q.name + str(q.specifier)), "missing"
             elif q.specifier and not q.specifier.contains(v, prereleases=True):
-                miss = f"{q.name}{q.specifier} (installed {v})"
+                miss, kind = f"{q.name} {v}, needs {q.specifier}", "outdated"      # installed, but too old (or new)
             else:
                 miss = None
             if miss and miss not in seen:
                 seen.add(miss)
-                r["missing"].append(miss)
+                r[kind].append(miss)
     out[k] = r
 print(json.dumps(out))
 '''
@@ -365,6 +367,8 @@ def reinstall_needed(key: str, rep: dict, state: str) -> dict:
         parts.append(f"installed as {rep.get('dist_version')}, code {rep.get('version')}")
     if rep.get("missing"):
         parts.append("missing " + ", ".join(rep["missing"]))
+    if rep.get("outdated"):
+        parts.append("installed but not the version the code needs: " + "; ".join(rep["outdated"]))
     if not parts:
         return {}
     if SHARED:
@@ -1316,6 +1320,7 @@ def status_data(keys: list[str] | None = None) -> dict:
         if k in inst:
             d["installed_as"] = rep[k].get("dist_version")
             d["missing"] = rep[k].get("missing", [])
+            d["outdated"] = rep[k].get("outdated", [])
             d["reinstall"] = False
             d.update(reinstall_needed(k, rep[k], state))
             st = tool_status(k)
@@ -3217,17 +3222,27 @@ def use_system_env(a) -> None:
         ENV_FILE = SYSTEM_ENV
 
 
-def cmd_gui(a) -> None:
-    """The window (llmt_gui.py, next to this file)."""
+def _ui(name: str):
+    """A module of the UI folder (UI/llmt_gui.py, UI/llmt_web.py)."""
     from importlib.machinery import SourceFileLoader
     import importlib.util
-    path = ROOT / "llmt_gui.py"
+    path = ROOT / "UI" / f"{name}.py"
     if not path.exists():
         die(f"{path} is missing")
-    loader = SourceFileLoader("llmt_gui", str(path))
-    m = importlib.util.module_from_spec(importlib.util.spec_from_loader("llmt_gui", loader))
+    loader = SourceFileLoader(name, str(path))
+    m = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
     loader.exec_module(m)
-    m.main()
+    return m
+
+
+def cmd_gui(a) -> None:
+    """The window (UI/llmt_gui.py; tkinter)."""
+    _ui("llmt_gui").main()
+
+
+def cmd_web(a) -> None:
+    """The same in a browser: a server on 127.0.0.1 for UI/llmt_web.html (UI/llmt_web.py)."""
+    _ui("llmt_web").main((["--port", str(a.port)] if a.port is not None else []) + (["--no-browser"] if a.no_browser else []))
 
 
 def cmd_env(a) -> None:
@@ -3354,6 +3369,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--prefix")
     p.add_argument("--yes", action="store_true")
     sub.add_parser("gui", help="a window: setup of this machine, settings, and the machines (tkinter)")
+    p = sub.add_parser("web", help="the same in a browser: a server on 127.0.0.1 only, with an access token")
+    p.add_argument("--port", type=int, help="default 8790; 0: any free port")
+    p.add_argument("--no-browser", action="store_true", help="print the address only")
     p = sub.add_parser("env", help="settings: config/env, or yours in a shared release; --system: the machine's")
     p.add_argument("--edit", action="store_true")
     p.add_argument("--system", action="store_true", help=f"the machine's file, {SYSTEM_ENV} (admin)")
@@ -3380,7 +3398,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     {"setup": cmd_setup, "list": cmd_list, "install": cmd_install, "remove": cmd_remove, "status": cmd_status,
      "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "tune": cmd_tune, "jobs": cmd_jobs, "env": cmd_env,
-     "deploy": cmd_deploy, "releases": cmd_releases, "rollback": cmd_rollback, "servers": cmd_servers, "gc": cmd_gc, "router": cmd_router, "mcp": cmd_mcp, "gui": cmd_gui}[a.cmd](a)
+     "deploy": cmd_deploy, "releases": cmd_releases, "rollback": cmd_rollback, "servers": cmd_servers, "gc": cmd_gc, "router": cmd_router, "mcp": cmd_mcp, "gui": cmd_gui, "web": cmd_web}[a.cmd](a)
 
 
 if __name__ == "__main__":

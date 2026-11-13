@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""llmt_gui.py — a window for llm-translators: set up this machine, edit its settings, watch the machines.
-Version: 2026.11.12.1
+"""UI/llmt_gui.py — a window for llm-translators: set up this machine, edit its settings, watch the machines.
+Version: 2026.11.12.3
 
-    ./llmt gui                 (or: python3 llmt_gui.py)
+    ./llmt gui                 (or: python3 UI/llmt_gui.py)
+    ./llmt web                 the same in a browser (UI/llmt_web.py, UI/llmt_web.html)
 
 Tabs:
     Setup      the translators on this machine: install, update, reinstall, remove, test; extras; MCP entries
@@ -38,13 +39,14 @@ try:  # the model below works without tkinter (tests); the window needs it
 except ImportError:  # pragma: no cover
     tk = ttk = messagebox = None
 
-__version__ = "2026.11.12.1"
+__version__ = "2026.11.12.3"
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent          # UI/
+TOP = HERE.parent                               # the llm-translators folder (llmt)
 
 
 def load_llmt():
-    loader = SourceFileLoader("llmt", str(HERE / "llmt"))
+    loader = SourceFileLoader("llmt", str(TOP / "llmt"))
     spec = importlib.util.spec_from_loader("llmt", loader)
     m = importlib.util.module_from_spec(spec)
     loader.exec_module(m)
@@ -162,6 +164,27 @@ def fetch_servers(host: dict, timeout: float = 60) -> str:
         return f"error: {exc}"
 
 
+def on_node(job: dict, node: str) -> bool:
+    """A translator job of llmt status runs on (or, pending, asked for) this node: %N or %R for running jobs,
+    the --nodelist asked (%n, req_nodes) for pending ones. Same rule as the router's per-node queue."""
+    s = (job.get("nodes") or job.get("reason") or "") if job.get("state") == "RUNNING" else (job.get("req_nodes") or "")
+    return node in {x for x in re.split(r"[,\s]+", str(s).strip()) if x}
+
+
+def jobs_text(jobs: list) -> str:
+    return (f"{sum(1 for j in jobs if j.get('state') == 'RUNNING')} running, "
+            f"{sum(1 for j in jobs if j.get('state') != 'RUNNING')} queued")
+
+
+def node_jobs(d: dict) -> tuple[list, list, str | None]:
+    """-> (this machine's jobs, the cluster's, its node). On a node of a cluster of several (the sparks), llmt status
+    lists the user's jobs on every node: each machine counts its own node's; otherwise all."""
+    sl = d.get("slurm") or {}
+    jobs = sl.get("jobs") or []
+    node = sl.get("node") if (sl.get("cluster_nodes") or 1) > 1 else None
+    return ([j for j in jobs if on_node(j, node)] if node else jobs), jobs, node
+
+
 def machine_summary(res: dict) -> dict:
     """One row of the machine table."""
     d = res.get("data") or {}
@@ -176,11 +199,10 @@ def machine_summary(res: dict) -> dict:
     row["runtime"] = rt.get("installed") or rt.get("version")
     sl = d.get("slurm") or {}
     if sl:
-        jobs = sl.get("jobs") or []
+        mine, every, node = node_jobs(d)
         row["cpus"] = f"{sl.get('cpus_allocated', '?')}/{sl.get('cpus', '?')} in use" + \
             (f" ({sl.get('state')})" if sl.get("state") else "")
-        row["jobs"] = f"{sum(1 for j in jobs if j.get('state') == 'RUNNING')} running, " \
-                      f"{sum(1 for j in jobs if j.get('state') != 'RUNNING')} queued"
+        row["jobs"] = jobs_text(mine) + (f" on {node} (cluster: {jobs_text(every)})" if node else "")
     else:
         row["cpus"], row["jobs"] = "no SLURM", ""
     if res.get("load") is not None:
@@ -198,10 +220,32 @@ def machine_summary(res: dict) -> dict:
     return row
 
 
+def machine_notes(res: dict) -> list[str]:
+    """The full notes of a machine (the table shows them short): what needs doing for each translator, with the
+    command, and each backend that was not found, with what its status said."""
+    d = res.get("data") or {}
+    out = []
+    if res.get("error"):
+        out.append(str(res["error"]))
+    for k, t in (d.get("translators") or {}).items():
+        if not t.get("version"):
+            continue
+        if t.get("problem"):
+            out.append(f"{k}: {t['problem']}. Fix, on that machine: {t.get('fix', '')}")
+        for n, b in (t.get("backends") or {}).items():
+            if not b.get("found"):
+                out.append(f"{k}: backend {n} not found ({b.get('detail') or 'not found'}). If it is installed, "
+                           f"point to it in the settings file there (see BACKENDS.md)")
+    rt = d.get("runtime") or {}
+    for p in rt.get("problems") or []:
+        out.append(f"llmt-runtime: {p}")
+    return out
+
+
 def translator_rows(res: dict) -> list[dict]:
     """The translators installed on a machine (children of its row)."""
     d = res.get("data") or {}
-    jobs = ((d.get("slurm") or {}).get("jobs")) or []
+    jobs, every, _ = node_jobs(d)
     out = []
     for k, t in (d.get("translators") or {}).items():
         if not t.get("version"):
@@ -213,8 +257,7 @@ def translator_rows(res: dict) -> list[dict]:
         bes = t.get("backends") or {}
         out.append({"key": k, "version": t["version"], "commit": t.get("commit") or "",
                     "executor": kind or (t.get("executor") or {}).get("setting") or "local",
-                    "jobs": (f"{sum(1 for j in mine if j.get('state') == 'RUNNING')} running, "
-                             f"{sum(1 for j in mine if j.get('state') != 'RUNNING')} queued") if jobs or kind == "slurm" else "",
+                    "jobs": jobs_text(mine) if every or kind == "slurm" else "",
                     "backends": ", ".join(f"{n} {'ok' if b.get('found') else 'MISSING'}" for n, b in bes.items()) or "none needed",
                     "note": t.get("problem") or ""})
     return out
@@ -284,8 +327,80 @@ def settings_sections(env_file: Path | None = None) -> list[tuple[str, list[dict
     return out
 
 
+ACTIONS = ("install", "update", "update-latest", "reinstall", "remove", "test", "tune", "mcp-config", "mcp-test")
+CHANGES_INSTALL = ("install", "update", "update-latest", "reinstall", "remove")
+
+
+def action_args(action: str, keys: list[str], test: bool = True) -> list[str]:
+    """The llmt arguments of a Setup action on these translators (the window's and the web page's buttons)."""
+    keys = [k for k in L.KEYS if k in set(keys)]
+    if action not in ACTIONS:
+        raise ValueError(f"unknown action {action!r}")
+    if L.SHARED and action in CHANGES_INSTALL:
+        raise ValueError("a shared release: installing and updating are the admin's (llmt deploy)")
+    if action in ("install", "reinstall", "remove") and not keys:
+        raise ValueError("select one or more translators first")
+    return {"install": ["install", *keys, "--test" if test else "--no-test"],
+            "update": ["update", *keys], "update-latest": ["update", *keys, "--latest"],
+            "reinstall": ["update", *keys, "--no-pull"], "remove": ["remove", *keys], "test": ["test", *keys],
+            "tune": ["tune", "--print"], "mcp-config": ["mcp", "config"], "mcp-test": ["mcp", "test", *keys]}[action]
+
+
+def save_options(test: bool, extras: dict) -> dict:
+    """config/setup.json: the test tools and each translator's optional extras (Install and Reinstall use them)."""
+    setup = L.load_setup()
+    setup["test"] = bool(test)
+    setup["extras"] = {k: [e for e in es if e in (L.REGISTRY[k].get("optional_extras") or {})]
+                       for k, es in (extras or {}).items() if k in L.REGISTRY and es}
+    L.save_setup(setup)
+    return setup
+
+
+def set_mcp_where(keys: list[str], where: str, replace: bool = False) -> tuple[list, list]:
+    """config/setup.json: the Claude app's entry for these translators (local / router / none). A remote or existing
+    entry is kept unless replace. -> (changed, kept). llmt mcp config writes them into the Claude app's config."""
+    if where not in ("local", "router", "none"):
+        raise ValueError(f"where: local, router or none, not {where!r}")
+    setup = L.load_setup()
+    if where == "router" and not (setup.get("router") or {}).get("hosts"):
+        raise ValueError("no machines for the router yet: add them first (Machines)")
+    mcp = setup.setdefault("mcp", {})
+    changed, kept = [], []
+    for k in [k for k in L.KEYS if k in set(keys)]:
+        prev = mcp.get(k) or {}
+        if prev.get("where") in ("remote", "existing") and not replace:
+            kept.append(k)
+            continue
+        mcp[k] = {"where": where, **({"env": prev["env"]} if prev.get("env") and where == "local" else {})}
+        changed.append(k)
+    L.save_setup(setup)
+    return changed, kept
+
+
+def save_hosts(hosts: list[dict]) -> list[dict]:
+    """config/setup.json: the router's machines (name, ssh user@host, llm-translators folder there)."""
+    clean, seen = [], set()
+    for h in hosts:
+        name, ssh, root = (str(h.get(x, "")).strip() for x in ("name", "ssh", "root"))
+        if not name or not root:
+            raise ValueError("each machine needs a name and its llm-translators folder")
+        if name == LOCAL or name in seen or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise ValueError(f"machine name {name!r}: letters, digits, _ . -, unique, not '{LOCAL}'")
+        if ssh and not re.fullmatch(r"[A-Za-z0-9_.@:-]+", ssh):
+            raise ValueError(f"ssh {ssh!r}: user@host")
+        seen.add(name)
+        clean.append({"name": name, "ssh": ssh, "root": root})
+    setup = L.load_setup()
+    setup.setdefault("router", {})["hosts"] = clean
+    L.save_setup(setup)
+    return clean
+
+
 def save_settings(changes: dict, env_file: Path) -> list[str]:
     """Writes the changed variables ('' comments a variable out) into env_file; -> the file's problems."""
+    for var, val in changes.items():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(var)) or "\n" in str(val) or "\r" in str(val):
+            raise ValueError(f"{var!r}: a variable name, and a value on one line")
     saved = L.ENV_FILE
     try:
         L.ENV_FILE = Path(env_file)
@@ -516,64 +631,65 @@ class App:
         self.st_tree.selection_set([k for k in sel if self.st_tree.exists(k)])
 
     def save_options(self):
-        setup = L.load_setup()
-        setup["test"] = bool(self.test_var.get())
         ex: dict = {}
         for (k, e), v in self.extra_vars.items():
             if v.get():
                 ex.setdefault(k, []).append(e)
-        setup["extras"] = ex
-        L.save_setup(setup)
+        save_options(bool(self.test_var.get()), ex)
         self.say("(config/setup.json: options saved; Install or Reinstall applies them)")
 
+    def action(self, action: str, need=False, confirm: str | None = None):
+        keys = self.selected_keys(need=need)
+        if need and not keys:
+            return
+        if confirm and not messagebox.askyesno(action, confirm.format(keys=", ".join(keys) or "all")):
+            return
+        try:
+            args = action_args(action, keys, bool(self.test_var.get()))
+        except ValueError as exc:
+            messagebox.showinfo(action, str(exc))
+            return
+        self.run(args, action, after=(lambda rc: self.refresh_setup()) if action in CHANGES_INSTALL else None)
+
     def do_install(self):
-        keys = self.selected_keys()
-        if keys:
-            self.run(["install", *keys, "--test" if self.test_var.get() else "--no-test"], "install",
-                     after=lambda rc: self.refresh_setup())
+        self.action("install", need=True)
 
     def do_update(self, latest: bool):
-        keys = self.selected_keys(need=False)
-        args = ["update", *keys] + (["--latest"] if latest else [])
-        if latest and not messagebox.askyesno("Update to latest", "Check out each translator's newest commit "
-                                              "(past the pins)? 'llmt pin' records them afterwards."):
-            return
-        self.run(args, "update", after=lambda rc: self.refresh_setup())
+        if latest:
+            self.action("update-latest", confirm="Check out each translator's newest commit (past the pins) for "
+                                                 "{keys}? 'llmt pin' records them afterwards.")
+        else:
+            self.action("update")
 
     def do_reinstall(self):
-        keys = self.selected_keys()
-        if keys:
-            self.run(["update", *keys, "--no-pull"], "reinstall", after=lambda rc: self.refresh_setup())
+        self.action("reinstall", need=True)
 
     def do_remove(self):
-        keys = self.selected_keys()
-        if keys and messagebox.askyesno("Remove", f"Uninstall {', '.join(keys)} from the venv?"):
-            self.run(["remove", *keys], "remove", after=lambda rc: self.refresh_setup())
+        self.action("remove", need=True, confirm="Uninstall {keys} from the venv?")
 
     def do_test(self):
-        self.run(["test", *self.selected_keys(need=False)], "tests")
+        self.action("test")
 
     def do_mcp_test(self):
-        self.run(["mcp", "test", *self.selected_keys(need=False)], "mcp test")
+        self.action("mcp-test")
 
     def set_where(self):
         keys = self.selected_keys()
         if not keys:
             return
         w = self.where_var.get()
-        setup = L.load_setup()
-        mcp = setup.setdefault("mcp", {})
-        if w == "router" and not (setup.get("router") or {}).get("hosts"):
-            messagebox.showwarning("Router", "No machines for the router yet: add them with Machines…")
+        mcp = L.load_setup().get("mcp") or {}
+        others = [k for k in keys if (mcp.get(k) or {}).get("where") in ("remote", "existing")]
+        replace = bool(others) and messagebox.askyesno(
+            "Replace", f"{', '.join(others)}: remote or existing entries now. Replace them too?")
+        try:
+            changed, kept = set_mcp_where(keys, w, replace)
+        except ValueError as exc:
+            messagebox.showwarning("Claude app", str(exc))
             return
-        for k in keys:
-            prev = mcp.get(k) or {}
-            if prev.get("where") in ("remote", "existing") and not messagebox.askyesno(
-                    "Replace", f"{k} is '{prev['where']}' now ({prev.get('host') or prev.get('entry', '')}). Replace it?"):
-                continue
-            mcp[k] = {"where": w, **({"env": prev["env"]} if prev.get("env") and w == "local" else {})}
-        L.save_setup(setup)
-        self.say(f"(config/setup.json: {', '.join(keys)} -> {w}. 'Write Claude config' updates the Claude app; restart it.)")
+        self.say(f"(config/setup.json: {', '.join(changed) or 'nothing'} -> {w}" +
+                 (f"; kept {', '.join(kept)}" if kept else "") +
+                 ". 'Write Claude config' updates the Claude app; restart it.)")
         self.refresh_setup()
 
     def edit_machines(self):
@@ -706,9 +822,9 @@ class App:
 
         pw = ttk.PanedWindow(tab, orient="vertical")
         pw.pack(fill="both", expand=True, pady=4)
-        f, self.m_tree = self.tree(pw, [("version", "Version / bundle", 210), ("cpus", "SLURM CPUs", 150),
-                                        ("jobs", "Translator jobs", 140), ("load", "Load / cores", 90),
-                                        ("note", "Note", 380)], height=9, show="tree headings")
+        f, self.m_tree = self.tree(pw, [("version", "Version / bundle", 300), ("cpus", "SLURM CPUs · runs", 150),
+                                        ("jobs", "Translator jobs", 170), ("load", "Load / cores", 90),
+                                        ("note", "Note", 330)], height=9, show="tree headings")
         self.m_tree.heading("#0", text="Machine / translator")
         self.m_tree.column("#0", width=170, stretch=False)
         self.m_tree.bind("<<TreeviewSelect>>", self.pick_machine)
@@ -722,6 +838,8 @@ class App:
         self.sel_label.pack(side="left")
         ttk.Button(bar, text="List MCP servers", command=self.show_servers).pack(side="right", padx=2)
         ttk.Button(bar, text="Fetch active requests", command=self.fetch_reqs).pack(side="right", padx=2)
+        self.notes_label = ttk.Label(lower, text="", foreground="#a05000", wraplength=1100, justify="left")
+        self.notes_label.pack(fill="x", pady=(2, 4))
         self.mnb = ttk.Notebook(lower)
         self.mnb.pack(fill="both", expand=True)
         f1, self.j_tree = self.tree(self.mnb, [("id", "Job", 70), ("key", "Tr.", 50), ("state", "State", 80),
@@ -790,7 +908,8 @@ class App:
             return
         res = self.results.get(name) or {}
         label = (self.host(name) or {}).get("label", name)
-        self.sel_label.configure(text=f"{label}" +(f"  ({res.get('seconds')} s)" if res.get("seconds") else ""))
+        self.sel_label.configure(text=f"{label}" + (f"  ({res.get('seconds')} s)" if res.get("seconds") else ""))
+        self.notes_label.configure(text="\n".join("• " + n for n in machine_notes(res)))
         self.j_tree.delete(*self.j_tree.get_children())
         rows = slurm_job_rows(res)
         for r in rows:
@@ -988,10 +1107,11 @@ class MachinesDialog:
             self.t.delete(iid)
 
     def save(self):
-        setup = L.load_setup()
-        r = setup.setdefault("router", {})
-        r["hosts"] = [{"name": a, "ssh": b, "root": c} for a, b, c in (self.t.item(i, "values") for i in self.t.get_children())]
-        L.save_setup(setup)
+        try:
+            save_hosts([{"name": a, "ssh": b, "root": c} for a, b, c in (self.t.item(i, "values") for i in self.t.get_children())])
+        except ValueError as exc:
+            messagebox.showerror("Not saved", str(exc), parent=self.top)
+            return
         self.on_save()
         self.top.destroy()
 
