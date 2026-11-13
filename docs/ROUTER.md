@@ -1,6 +1,6 @@
 # The router: one translator, several machines
 
-Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2); tool definitions that follow deploys, per-node queues, request names 2026.11.06.1.
+Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2); tool definitions that follow deploys, per-node queues, request names 2026.11.06.1; init_from across machines 2026.11.13.1.
 
 Until now, each MCP entry in the Claude app pointed to one machine (`ssh mochi .../bin/mcp cfdt`). With several machines able to run a translator (mochi, carbonio, a DGX Spark), choosing one by hand wastes the others, and one entry per machine (`cfdt-mochi`, `cfdt-carbonio`, ...) multiplies the tools in every chat.
 
@@ -115,6 +115,25 @@ The results stay as the translator wrote them; their paths are real paths on the
 | `machines()` | the router itself | each machine: reachable, mode (release or checkout), `llmt_release` (the llm-translators bundle installed there, named like `2026.10.26.2`; not the translator's version), `version` (the translator's version installed), `serving` (what the server process the router uses runs; `server_stale` and a `note` when it differs), backends, executor, CPUs and their use, the translator's queued and running jobs, load, expected start of a typical job, speed, preferred or excluded |
 
 Answers from a single machine get `"machine": "<name>"` at the top.
+
+## Starting from a run of another machine (init_from)
+
+A cfdt study (2026.11.13.6) can start from a finished run: `solve.init_from` or `solve.transient.init_from` is `'<request>/<study>'` or an absolute study path. Only the first study of a chain points at an earlier request; the rest name studies of the same request (`'<study>'`). When that request is on machine N (the request map), the study may still run on another machine M.
+
+- **Checked first.** Before placing, the router runs `cfdt init-check <ref>` on N.
+  - If the run is not usable (not finished, no reconstructed time…), the call is refused with N's problems. Nothing is submitted or copied.
+  - The check gives the size to copy (`init_bytes`, a few GB for 8 M cells).
+- **Placement.** The ref does not pin the call to N: N needs no copy, and every other machine's score adds the copy time (`init_bytes` at 50 MB/s, `COPY_MB_S`). Validation on the other machines drops their "no case … on this machine" for that study.
+- **The copy,** in the background, to the chosen machine M only:
+  1. On N: `cfdt pack <request folder> --studies <study> --init --out <CFDT_OUT>/.llmt-transfer/<request>.<tag>.tgz`.
+  2. N → this computer → M over the two ssh connections, appended to `<archive>.part` on M from the size already there (resumable), then checked with sha256 against N's archive.
+  3. On M: `cfdt import <archive> --name <request>@<N>`.
+  4. The temporary archives are deleted on both machines. After a failure they stay, so the next attempt resumes.
+
+  While it runs, the answer is `status: "uploading"` with `uploading.init_from` (stage, MB, `sent_pct`, `eta_s`), and nothing is submitted. Repeat the call: it stays on M while the copy runs, and uses the copy once it's done.
+- **Reused.** A copy is not made again when `<CFDT_OUT>/<request>@<N>[_importK]/<study>` exists on M with `request.json` `imported.packed` after the source's result was written.
+- **The call** goes on with the study's init_from replaced by the import's ref (`<request>@<N>/<study>`). The answer adds `staged.init_from: {<study>: {from: "<N>:<ref>", to: "<new ref>", bytes}}`.
+- **validate_studies** checks with `cfdt init-check` on N, and copies nothing. M's "no case … on this machine" goes when N's check is ok; N's problems are added when it isn't.
 
 ## Files on this computer
 

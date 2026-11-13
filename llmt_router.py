@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.10.1
+Version: 2026.11.13.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.10.1"
+__version__ = "2026.11.13.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -68,6 +68,40 @@ UPLOAD_MB = 500.0        # largest local file the router copies to a machine, un
 STAGE_ALL_MB = 25.0      # placement copies local files to every candidate (to validate there) only up to this in total
 CHUNK = 1 << 20
 BUSY_STATUS_WAIT = 20.0  # study_status / bench_status wait at most this on a machine whose server is busy
+INIT_FROM_KEYS = {"cfdt"}  # translators whose studies may start from a run of another machine (solve.init_from)
+COPY_MB_S = 50.0         # assumed speed of a copy between two machines through this computer (placement's estimate)
+INIT_CHECK_TTL = 60.0
+
+
+def parse_json_out(text: str):
+    """The JSON object a translator's CLI prints (from the first '{')."""
+    i = (text or "").find("{")
+    if i < 0:
+        return None
+    try:
+        return json.loads(text[i:])
+    except json.JSONDecodeError:
+        return None
+
+
+def init_from_refs(study) -> list:
+    """[(keys, ref, fields)]: where a study names a run to start from (solve.transient.init_from, else
+    solve.init_from), when it names another request ('<request>/<study>' or an absolute study path)."""
+    if not isinstance(study, dict):
+        return []
+    s = study.get("solve") if isinstance(study.get("solve"), dict) else {}
+    tr = s.get("transient") if isinstance(s.get("transient"), dict) else {}
+    fields = tr.get("init_fields") or s.get("init_fields") or "last"
+    for keys, ref in ((("solve", "transient", "init_from"), tr.get("init_from")), (("solve", "init_from"), s.get("init_from"))):
+        if isinstance(ref, str) and ref:
+            return [(keys, ref, fields)] if "/" in ref.rstrip("/") else []
+    return []
+
+
+def set_in(d: dict, keys: tuple, value) -> None:
+    for k in keys[:-1]:
+        d = d.setdefault(k, {})
+    d[keys[-1]] = value
 
 
 def log(msg: str) -> None:
@@ -332,6 +366,123 @@ class Upload:
             log(f"{self.host['name']}: copying {self.local} failed: {self.error}")
 
 
+def popen_cmd(host: dict, script: str) -> list:
+    """A command that runs script on the machine (ssh, or sh here), for a pipe."""
+    return ssh_base(host) + [script] if host.get("ssh") else ["sh", "-c", script]
+
+
+def remote_sha256(host: dict, path: str) -> str:
+    r = remote_cmd(host, f"p={shlex.quote(path)}; (sha256sum \"$p\" 2>/dev/null || shasum -a 256 \"$p\") | cut -d' ' -f1",
+                   timeout=1800)
+    s = r.stdout.strip().split()[-1] if r.stdout.strip() else ""
+    if not re.fullmatch(r"[0-9a-f]{64}", s):
+        raise OSError(f"{host['name']}: no sha256 of {path} ({(r.stderr or '').strip()[-150:]})")
+    return s
+
+
+class Transfer:
+    """A finished run of machine N (init_from of a study placed on M), copied to M in the background: the
+    translator packs it on N (`<cli> pack REQUEST --studies A,B --init --out ARCHIVE`), the archive goes N -> this
+    computer -> M over the two ssh connections (resumable: appended to <archive>.part from the size already there,
+    checked with sha256 against N's), then M imports it (`<cli> import ARCHIVE --name <request>@<N>`). Temporary
+    archives are deleted on both machines once imported; after a failure they stay, so the next attempt resumes."""
+
+    def __init__(self, cli: str, src: dict, dst: dict, folder: str, studies: list, out_src: str, out_dst: str,
+                 hint_bytes: int | None, tag: str):
+        self.cli, self.src, self.dst, self.folder, self.studies = cli, src, dst, folder, list(studies)
+        self.req = folder.rstrip("/").rsplit("/", 1)[-1]
+        self.name = f"{self.req}@{src['name']}"
+        self.tmp_src = f"{out_src}/.llmt-transfer/{self.req}.{tag}.tgz"
+        self.tmp_dst = f"{out_dst}/.llmt-transfer/{self.req}.{tag}.tgz"
+        self.total = hint_bytes or 0
+        self.sent = self.resumed_at = 0
+        self.stage = "packing"
+        self.started = time.time()
+        self.copy_started = None
+        self.error: str | None = None
+        self.result: dict | None = None        # source study -> its init_from ref on M
+        self.request: str | None = None        # the imported request folder on M
+        self.done = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def progress(self) -> dict:
+        p = {"from": f"{self.src['name']}:{self.folder}", "to": self.dst["name"], "studies": self.studies,
+             "stage": self.stage, "mb": round(self.total / MB, 1) if self.total else None}
+        if self.stage == "copying" and self.total:
+            rate = (self.sent - self.resumed_at) / max(0.5, time.time() - (self.copy_started or time.time()))
+            p["sent_pct"] = int(100 * self.sent / self.total)
+            p["eta_s"] = int((self.total - self.sent) / rate) + 1 if rate > 0 else None
+        return p
+
+    def _run(self) -> None:
+        q = shlex.quote
+        root_s, root_d = root_expr(self.src["root"]), root_expr(self.dst["root"])
+        try:
+            # 1. pack on N (once: an archive marked .ok from an earlier attempt is reused)
+            r = remote_cmd(self.src, f"a={q(self.tmp_src)}; if [ -f \"$a.ok\" ]; then echo '{{\"bytes\": '$(wc -c < \"$a\")'}}'; "
+                                     f"else mkdir -p \"$(dirname \"$a\")\" && {root_s}/bin/run {q(self.cli)} pack "
+                                     f"{q(self.folder)} --studies {q(','.join(self.studies))} --init --out \"$a\" && "
+                                     f"touch \"$a.ok\"; fi", timeout=6 * 3600)
+            p = parse_json_out(r.stdout)
+            if not p or p.get("error") or r.returncode != 0:
+                raise OSError(f"pack on {self.src['name']}: {(p or {}).get('error') or (r.stderr or r.stdout).strip()[-300:]}")
+            self.total = int(p.get("bytes") or 0)
+            sha = remote_sha256(self.src, self.tmp_src)
+            # 2. N -> here -> M, appended to <archive>.part from what M already has
+            self.stage = "copying"
+            part = self.tmp_dst + ".part"
+            for attempt in range(3):
+                r = remote_cmd(self.dst, f"mkdir -p \"$(dirname {q(part)})\" || exit 1; "
+                                         f"if [ -f {q(part)} ]; then wc -c < {q(part)}; else echo 0; fi", timeout=60)
+                off = int((r.stdout.split() or ["0"])[-1]) if r.returncode == 0 else 0
+                if off > self.total:
+                    off = 0
+                self.sent = self.resumed_at = off
+                self.copy_started = time.time()
+                if off < self.total:
+                    a = subprocess.Popen(popen_cmd(self.src, f"tail -c +{off + 1} {q(self.tmp_src)}"),
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    b = subprocess.Popen(popen_cmd(self.dst, f"cat {'>>' if off else '>'} {q(part)}"),
+                                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    try:
+                        for chunk in iter(lambda: a.stdout.read(CHUNK), b""):
+                            b.stdin.write(chunk)
+                            self.sent += len(chunk)
+                        b.stdin.close()
+                    except BrokenPipeError:
+                        pass
+                    a.wait()
+                    b.wait()
+                if self.sent >= self.total:
+                    break
+                log(f"copy of {self.name} to {self.dst['name']} stopped at {self.sent}/{self.total} bytes: resuming")
+            self.stage = "checking"
+            if remote_sha256(self.dst, part) != sha:
+                remote_cmd(self.dst, f"rm -f {q(part)}", timeout=60)
+                raise OSError(f"the copy on {self.dst['name']} differs from {self.src['name']}'s archive (sha256): "
+                              f"removed; the next call copies it again")
+            remote_cmd(self.dst, f"mv -f {q(part)} {q(self.tmp_dst)}", timeout=60)
+            # 3. import on M
+            self.stage = "importing"
+            r = remote_cmd(self.dst, f"{root_d}/bin/run {q(self.cli)} import {q(self.tmp_dst)} --name {q(self.name)}",
+                           timeout=3 * 3600)
+            imp = parse_json_out(r.stdout)
+            if not imp or imp.get("error") or not isinstance(imp.get("init_from"), dict):
+                raise OSError(f"import on {self.dst['name']}: {(imp or {}).get('error') or (r.stderr or r.stdout).strip()[-300:]}")
+            self.result = {s: imp["init_from"][s] for s in self.studies if s in imp["init_from"]}
+            self.request = imp.get("request")
+            for tmp, h in ((self.tmp_src, self.src), (self.tmp_dst, self.dst)):
+                remote_cmd(h, f"rm -f {q(tmp)} {q(tmp + '.ok')} {q(tmp + '.part')}", timeout=60)
+            self.stage = "done"
+            self.done = True
+            log(f"init_from: {self.src['name']}:{self.folder} ({', '.join(self.studies)}) is {self.request} on "
+                f"{self.dst['name']} ({self.total / MB:.0f} MB)")
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            self.error = str(exc)[:400]
+            log(f"init_from copy {self.name} -> {self.dst['name']} failed: {self.error}")
+
+
 # ---------------------------------------------------------------- the router
 
 class Router:
@@ -368,6 +519,8 @@ class Router:
         self.up_lock = threading.Lock()
         self.hash_cache: dict = {}       # (path, size, mtime) -> sha256
         self.unstaged: dict = {}         # a staged file's path on a machine -> the local file it came from
+        self.transfers: dict = {}        # (M, N, request folder on N, studies) -> Transfer (init_from)
+        self.init_checks: dict = {}      # (N, study folder, fields) -> (time, init-check answer)
 
     # ---- machines
     def host(self, name: str) -> dict | None:
@@ -1144,6 +1297,205 @@ class Router:
             return float(v)
         return parse_mem_mb(caps.get("mem"))
 
+    # ---- init_from: a study starting from a finished run of another machine (cfdt 2026.11.13.6)
+    def ref_hits(self, ref: str) -> list:
+        """[(machine, request folder there, study)] for '<request>/<study>' or an absolute study path, from the
+        request map (the last one learned last)."""
+        ref = ref.rstrip("/")
+        if ref.startswith("/"):
+            folder, _, study = ref.rpartition("/")
+            n = self.paths.get(folder)
+            return [(n, folder, study)] if n and study else []
+        req, _, study = ref.partition("/")
+        if not req or not study or "/" in study:
+            return []
+        return [(n, p, study) for p, n in list(self.paths.items()) if p.rstrip("/").rsplit("/", 1)[-1] == req]
+
+    def init_refs(self, studies: dict) -> list:
+        """The studies' init_from refs to a request the router knows: [{study, keys, ref, fields, hits}]."""
+        if self.key not in INIT_FROM_KEYS or not isinstance(studies, dict):
+            return []
+        out = []
+        for name, st in studies.items():
+            for keys, ref, fields in init_from_refs(st):
+                hits = self.ref_hits(ref)
+                if hits:
+                    out.append({"study": name, "keys": keys, "ref": ref, "fields": fields, "hits": hits})
+        return out
+
+    @staticmethod
+    def foreign(r: dict, machine: str) -> tuple | None:
+        """(N, request folder on N, study) when r's request is on another machine than machine, else None."""
+        if any(h[0] == machine for h in r["hits"]):
+            return None
+        return r["hits"][-1]
+
+    def init_check(self, n: str, folder: str, study: str, fields: str) -> dict:
+        """`<cli> init-check <folder>/<study>` on machine n (cached a minute when ok), with the source result's
+        modification time (to tell whether a copy made earlier is still current)."""
+        key = (n, f"{folder}/{study}", fields)
+        hit = self.init_checks.get(key)
+        if hit and time.time() - hit[0] < INIT_CHECK_TTL and hit[1].get("ok"):
+            return hit[1]
+        h = self.host(n)
+        path = f"{folder}/{study}"
+        q = shlex.quote
+        script = (f"{root_expr(h['root'])}/bin/run {q(self.t['cli'])} init-check {q(path)} --fields {q(fields)}; "
+                  f"echo; echo @@MTIME; python3 -c 'import os,sys; print(os.path.getmtime(sys.argv[1]))' "
+                  f"{q(f'{path}/{study}.json')} 2>/dev/null")
+        try:
+            r = remote_cmd(h, script, timeout=120)
+            text, _, mt = r.stdout.partition("@@MTIME")
+            c = parse_json_out(text) or {"ok": False, "problems": [f"no answer from {self.t['cli']} init-check on {n}: "
+                                                                   f"{(r.stderr or text).strip()[-200:]}"]}
+            try:
+                c["result_mtime"] = float(mt.split()[0])
+            except (ValueError, IndexError):
+                pass
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            c = {"ok": False, "problems": [f"cannot check on {n}: {exc}"]}
+        self.init_checks[key] = (time.time(), c)
+        return c
+
+    def check_refs(self, refs: list) -> None:
+        """init-check on each ref's machine, in parallel; the answers go into the refs ('check')."""
+        def one(r):
+            n, folder, study = r["hits"][-1]
+            r["check"] = self.init_check(n, folder, study, r["fields"])
+        ths = [threading.Thread(target=one, args=(r,), daemon=True) for r in refs]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join(150)
+
+    def fix_init_validation(self, v, machine: str, refs: list) -> None:
+        """A validation answer of machine for studies whose init_from is a run of another machine: its 'no case
+        ... on this machine' goes (the router copies the run when the study runs) when that machine's check is ok;
+        that machine's problems are added when it is not."""
+        if not isinstance(v, dict) or not isinstance(v.get("studies"), dict):
+            return
+        for r in refs:
+            src = self.foreign(r, machine)
+            rec = v["studies"].get(r["study"])
+            if not src or not isinstance(rec, dict):
+                continue
+            c = r.get("check") or {}
+            errs = [e for e in rec.get("errors") or [] if not ("init_from" in e and "no case in" in e)]
+            if c.get("ok"):
+                rec["init_from"] = {"from": f"{src[0]}:{r['ref']}", "bytes": c.get("init_bytes"),
+                                    "note": f"copied from {src[0]} when the study runs"}
+            else:
+                errs += [f"init_from {src[0]}:{r['ref']}: {p}" for p in c.get("problems") or ["cannot be checked"]]
+            rec["errors"] = errs
+            rec["ok"] = not errs
+        v["ok"] = all(x.get("ok") for x in v["studies"].values() if isinstance(x, dict)) and not v.get("errors")
+
+    def imported_on(self, m: str, n: str, folder: str, studies: dict) -> dict:
+        """{study: init_from ref on m} for studies (name -> source result mtime) already imported on m from n's
+        request folder by an earlier call, and packed after the source's result was written."""
+        h = self.host(m)
+        out_m = (self.status(m) or {}).get("out_dir")
+        if not out_m:
+            return {}
+        name = f"{folder.rstrip('/').rsplit('/', 1)[-1]}@{n}"
+        prog = ("import glob,json,os,sys\n"
+                "a=json.loads(sys.argv[1]); res={}\n"
+                "ds=[d for d in glob.glob(os.path.join(a['out'],a['name']+'*')) if os.path.basename(d)==a['name'] "
+                "or os.path.basename(d).startswith(a['name']+'_import')]\n"
+                "for d in sorted(ds,key=os.path.getmtime,reverse=True):\n"
+                " try: m=json.load(open(os.path.join(d,'request.json')))\n"
+                " except Exception: continue\n"
+                " pk=(m.get('imported') or {}).get('packed') or 0\n"
+                " for s,mt in a['studies'].items():\n"
+                "  if s not in res and os.path.isdir(os.path.join(d,s,'case')) and pk>=(mt or 0): "
+                "res[s]=os.path.basename(d)+'/'+s\n"
+                "print(json.dumps(res))\n")
+        arg = json.dumps({"out": out_m, "name": name, "studies": studies})
+        try:
+            r = remote_cmd(h, f"python3 -c {shlex.quote(prog)} {shlex.quote(arg)}", timeout=60)
+            return parse_json_out(r.stdout) or {}
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+
+    def stage_inits(self, m: str, studies: dict, refs: list, deadline: float | None, margin: float = 12.0) -> tuple:
+        """The init_from runs of other machines, copied to m (or found there from an earlier call).
+        -> (studies with their init_from on m, staged {study: {from, to, bytes}}, uploading {...} or None)."""
+        foreign = [(r, self.foreign(r, m)) for r in refs]
+        foreign = [(r, s) for r, s in foreign if s]
+        if not foreign:
+            return studies, {}, None
+        groups: dict = {}
+        for r, (n, folder, study) in foreign:
+            groups.setdefault((n, folder), []).append((r, study))
+        new = copy.deepcopy(studies)
+        staged, pending = {}, {}
+        out_m = (self.status(m) or {}).get("out_dir")
+        if not out_m:
+            raise ValueError(f"init_from: cannot tell {m}'s output folder ({self.key.upper()}_OUT): machines() shows why")
+        for (n, folder), items in groups.items():
+            src = sorted({s for _, s in items})
+            mtimes = {s: next((r.get("check") or {}).get("result_mtime") for r, s2 in items if s2 == s) for s in src}
+            got = self.imported_on(m, n, folder, mtimes)
+            need = [s for s in src if s not in got]
+            nbytes = {s: next(((r.get("check") or {}).get("init_bytes") for r, s2 in items if s2 == s), None) for s in src}
+            if need:
+                key = (m, n, folder, tuple(need))
+                with self.up_lock:
+                    t = self.transfers.get(key)
+                    if t is None or t.error:
+                        out_n = (self.status(n) or {}).get("out_dir")
+                        if not out_n:
+                            raise ValueError(f"init_from: cannot tell {n}'s output folder: machines() shows why")
+                        tag = hashlib.sha1(json.dumps([n, folder, need, [mtimes[s] for s in need]]).encode()).hexdigest()[:10]
+                        t = Transfer(self.t["cli"], self.host(n), self.host(m), folder, need, out_n, out_m,
+                                     sum(int(nbytes[s] or 0) for s in need) or None, tag)
+                        self.transfers[key] = t
+                end = None if deadline is None else deadline - margin
+                while not t.done and not t.error and (end is None or time.time() < end):
+                    time.sleep(0.2)
+                if t.error:
+                    raise ValueError(f"init_from: copying {n}:{folder} ({', '.join(need)}) to {m} failed: {t.error}")
+                if not t.done:
+                    pending[f"{n}:{folder}"] = t.progress()
+                    continue
+                if t.request:
+                    self.remember(t.request, m)
+                miss = [s for s in need if s not in (t.result or {})]
+                if miss:
+                    raise ValueError(f"init_from: {m} imported {t.name} without {', '.join(miss)}")
+                got.update(t.result)
+                for s in need:
+                    nbytes[s] = nbytes[s] or (t.total if len(need) == 1 else None)
+            for r, s in items:
+                set_in(new[r["study"]], r["keys"], got[s])
+                staged[r["study"]] = {"from": f"{n}:{r['ref']}", "to": got[s], "bytes": nbytes.get(s)}
+        return new, staged, (pending or None)
+
+    def post_validate(self, machine: str, tool: str, args: dict, r: dict) -> dict:
+        """validate_studies answered by machine: studies whose init_from is a run of another machine are checked
+        there (init-check; nothing is copied) instead of failing for 'no case ... on this machine'."""
+        if tool != self.validate_tool() or r.get("isError"):
+            return r
+        arg = next((a for a in PLACE_ARGS if isinstance(args.get(a), dict)), None)
+        refs = [x for x in (self.init_refs(args[arg]) if arg else []) if self.foreign(x, machine)]
+        data = self.parse(r)
+        if not refs or not isinstance(data, dict):
+            return r
+        self.check_refs(refs)
+        self.fix_init_validation(data, machine, refs)
+        out = self.text_result(data)
+        if isinstance(r.get("structuredContent"), dict):
+            out["structuredContent"] = data
+        return out
+
+    def transferring_to(self, refs: list, active: bool = False) -> list:
+        """Machines that received (active: are receiving) the init_from runs of these refs: no copy to make there;
+        a call repeated while one copies stays there."""
+        want = {(r["hits"][-1][0], r["hits"][-1][1]) for r in refs}
+        with self.up_lock:
+            return list(dict.fromkeys(m for (m, n, folder, _), t in self.transfers.items()
+                                      if (n, folder) in want and not t.error and not (active and t.done)))
+
     def validate_tool(self) -> str | None:
         names = {t["name"] for t in self.tools}
         return next((n for n in ("validate_studies", "validate_goals") if n in names), None)
@@ -1199,7 +1551,24 @@ class Router:
             for n, cap in short:
                 warnings.append(f"{n} left out: run.mem {need_txt} > its {fmt_mb(cap)}")
             cands = [n for n, _ in fit]
-        aff = self.affinity(studies) if arg else None
+        # init_from a finished run of another machine: checked there first (an unfinished one refuses the call
+        # before anything is copied); it does not pin the call to that machine, the copy's time counts instead
+        refs = self.init_refs(studies) if arg else []
+        if refs:
+            self.check_refs(refs)
+            bad = [f"{r['study']}: init_from {r['hits'][-1][0]}:{r['ref']}: {p}" for r in refs
+                   if not (r.get("check") or {}).get("ok") for p in (r.get("check") or {}).get("problems") or ["not ready"]]
+            if bad:
+                raise ValueError("; ".join(bad) + ". Nothing was submitted or copied.")
+            if not manual:
+                there = [n for n in self.transferring_to(refs, active=True) if n in cands]
+                if there:
+                    cands = there[:1]
+                    warnings.append(f"kept on {there[0]}: the init_from run is copied there")
+        no_init = copy.deepcopy(studies)
+        for r in refs:
+            set_in(no_init[r["study"]], r["keys"], None)
+        aff = self.affinity(no_init) if arg else None
         if aff and not manual:
             if aff in cands:
                 cands = [aff]
@@ -1234,6 +1603,8 @@ class Router:
             ok = []
             for n in cands:
                 v = vres.get(n)
+                if refs:
+                    self.fix_init_validation(v, n, refs)
                 if isinstance(v, dict) and "unreachable" not in v:
                     src = v.get("studies") if isinstance(v.get("studies"), dict) else \
                         v.get("goals") if isinstance(v.get("goals"), dict) else v
@@ -1274,10 +1645,15 @@ class Router:
                     start = 0.0
             run_min = (minutes or 0) * float(self.speed.get(n, 1.0))
             small = minutes is not None and minutes < self.small
-            score = start + (0 if small else run_min) - (0.5 * (len(self.prefer) - self.prefer.index(n))
-                                                          if n in self.prefer else 0)
+            # init_from runs of another machine: copied here first (at COPY_MB_S), unless already imported here
+            copy_b = sum(int((r.get("check") or {}).get("init_bytes") or 0) for r in refs
+                         if self.foreign(r, n) and n not in self.transferring_to([r]))
+            copy_min = copy_b / (COPY_MB_S * MB) / 60.0
+            score = start + (0 if small else run_min) + copy_min - (0.5 * (len(self.prefer) - self.prefer.index(n))
+                                                                     if n in self.prefer else 0)
             rows.append({"machine": n, "start_min": round(start, 1), "run_min": round(run_min, 1) if minutes else None,
-                         "score": round(score, 2), "why": why + (f", estimate {minutes:.0f} min" if minutes else ""),
+                         "score": round(score, 2), "why": why + (f", estimate {minutes:.0f} min" if minutes else "") +
+                         (f", copies {copy_b / MB / 1024:.1f} GB of init_from first (~{copy_min:.0f} min)" if copy_b else ""),
                          "version": st.get("version")})
         rows.sort(key=lambda r: (r["score"], cands.index(r["machine"])))
         best = rows[0]
@@ -1286,6 +1662,8 @@ class Router:
             info["why"] = f"chosen in run.host; {best['why']}"
         if warnings:
             info["warnings"] = warnings
+        if refs:
+            info["_init_refs"] = refs           # for tool_call: the copies (taken out of the answer)
         return best["machine"], send, info
 
     @staticmethod
@@ -1373,7 +1751,7 @@ class Router:
                 n = next((m for m in pinned if sts.get(m, {}).get("reachable")), None)
                 if n is None:
                     raise ValueError(f"run.host: {', '.join(pinned)} does not answer now")
-                r = self.call(n, tool, args, deadline)
+                r = self.post_validate(n, tool, args, self.call(n, tool, args, deadline))
                 return self.with_fields(r, {"machine": n})
             if pinned:                                                   # placement reads it back from the studies
                 args = self.put_host(args, pinned)
@@ -1387,6 +1765,19 @@ class Router:
                     rname = f"run_{_dt.datetime.now():%Y%m%d_%H%M%S}_{secrets.token_hex(3)}"
                     args = dict(args, request_name=rname)
                 name, send, info = self.place(tool, args, deadline)
+                refs = info.pop("_init_refs", [])
+                staged_init = {}
+                if refs:                                   # init_from runs of another machine: copied here first
+                    arg = next(a for a in PLACE_ARGS if isinstance(send.get(a), dict))
+                    new, staged_init, pend = self.stage_inits(name, send[arg], refs, deadline)
+                    if pend:
+                        eta = max([p.get("eta_s") or 60 for p in pend.values()])
+                        return self.text_result({
+                            "status": "uploading", "machine": name, "router": info, "uploading": {"init_from": pend},
+                            "next": f"the runs to start from are being copied to {name}; nothing was submitted yet. "
+                                    f"Call {tool} again with the same arguments in about {eta} s: the copy goes on "
+                                    f"meanwhile, and the next call uses it."})
+                    send = dict(send, **{arg: new})
                 req = None
                 if isinstance(rname, str):
                     out = (self.status_cache.get(name, (0, {}))[1] or {}).get("out_dir") or \
@@ -1406,7 +1797,11 @@ class Router:
                                 f"run_studies with request_name='{rname}' is safe: it returns the status)."})
                 self.forget(name)                     # it has new work: the next placement asks it again
                 self.learn(self.parse(r), name)
-                return self.with_fields(r, {"machine": name, "router": info})
+                extra = {"machine": name, "router": info}
+                if staged_init:
+                    prev = (self.parse(r) or {}).get("staged") if isinstance(self.parse(r), dict) else None
+                    extra["staged"] = {**(prev if isinstance(prev, dict) else {}), "init_from": staged_init}
+                return self.with_fields(r, extra)
             name, send = self.route_path(args)
             if name:
                 r = self.call(name, tool, send, deadline)
@@ -1427,7 +1822,7 @@ class Router:
                 self.learn(self.parse(r), n)
                 return self.with_fields(r, {"machine": n})
             name = self.default_machine()
-            r = self.call(name, tool, args, deadline)
+            r = self.post_validate(name, tool, args, self.call(name, tool, args, deadline))
             self.learn(self.parse(r), name)
             return self.with_fields(r, {"machine": name})
         except (ValueError, ChildError) as exc:

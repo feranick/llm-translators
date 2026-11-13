@@ -676,6 +676,230 @@ class WebApi(unittest.TestCase):
         self.assertEqual(self.req("GET", "/api/machine/nowhere")[0], 404)
 
 
+FAKE_CFDT_RUN = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    # <root>/bin/run cfdt init-check | pack | import, as cfdt 2026.11.13.6 answers them (enough for the router)
+    import json, os, sys, tarfile, time
+    a = sys.argv[1:]
+    with open(os.environ["FAKE_RUN_LOG"], "a") as f:
+        f.write(json.dumps({"home": os.environ["HOME"], "argv": a}) + "\\n")
+    out = os.path.join(os.environ["HOME"], "cfdt_runs")
+    opt = lambda k: a[a.index(k) + 1] if k in a else None
+    cmd = a[1]
+    if cmd == "init-check":
+        src = a[2] if a[2].startswith("/") else os.path.join(out, a[2])
+        name = os.path.basename(src)
+        fin = os.path.isfile(os.path.join(src, name + ".json"))
+        probs = [] if os.path.isdir(os.path.join(src, "case")) else [f"no case in {src}"]
+        if not fin:
+            probs.append(f"{name} has no result yet: wait until it finishes")
+        print(json.dumps({"ref": a[2], "folder": src, "ok": not probs, "problems": probs, "finished": fin,
+                          "init_bytes": 4096}))
+        sys.exit(1 if probs else 0)
+    if cmd == "pack":
+        req, dest, studies = a[2], opt("--out"), opt("--studies").split(",")
+        base = os.path.basename(req)
+        import tempfile
+        side = tempfile.mkdtemp()
+        with open(os.path.join(side, "request.json"), "w") as f:
+            json.dump({"names": studies}, f)
+        with open(os.path.join(side, "cfdt_pack.json"), "w") as f:
+            json.dump({"packed": time.time(), "init": True, "studies": {s: {"init": {"bytes": 1}} for s in studies}}, f)
+        with tarfile.open(dest, "w:gz") as t:
+            t.add(os.path.join(side, "request.json"), f"{base}/request.json")
+            t.add(os.path.join(side, "cfdt_pack.json"), f"{base}/cfdt_pack.json")
+            for s in studies:
+                t.add(os.path.join(req, s), f"{base}/{s}")
+        print(json.dumps({"archive": dest, "bytes": os.path.getsize(dest)}))
+        sys.exit(0)
+    if cmd == "import":
+        name = opt("--name")
+        dest, k = os.path.join(out, name), 1
+        while os.path.exists(dest):
+            k += 1
+            dest = os.path.join(out, f"{name}_import{k}")
+        tmp = dest + ".tmp"
+        os.makedirs(tmp)
+        with tarfile.open(a[2]) as t:
+            t.extractall(tmp)
+        os.rename(os.path.join(tmp, os.listdir(tmp)[0]), dest)
+        os.rmdir(tmp)
+        man = json.load(open(os.path.join(dest, "cfdt_pack.json")))
+        meta = json.load(open(os.path.join(dest, "request.json")))
+        meta["imported"] = {"packed": man["packed"]}
+        json.dump(meta, open(os.path.join(dest, "request.json"), "w"))
+        print(json.dumps({"request": dest, "init_from": {s: f"{os.path.basename(dest)}/{s}" for s in meta["names"]}}))
+''')
+
+FAKE_INIT_SERVER = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    # cfdt's server, reduced: validation refuses an init_from with no case on this machine; run_studies reports the
+    # init_from it got and whether that case is here
+    import json, os, sys
+    OUT = os.path.join(os.environ["HOME"], "cfdt_runs")
+
+    def where(st):
+        s = st.get("solve") or {}
+        ref = (s.get("transient") or {}).get("init_from") or s.get("init_from")
+        if not ref or "/" not in ref:
+            return ref, True
+        src = ref if ref.startswith("/") else os.path.join(OUT, ref)
+        return ref, os.path.isdir(os.path.join(src, "case"))
+
+    for line in sys.stdin:
+        m = json.loads(line)
+        if "id" not in m:
+            continue
+        meth, p = m["method"], m.get("params") or {}
+        if meth == "initialize":
+            r = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                 "serverInfo": {"name": "fake", "version": "x"}, "instructions": "fake"}
+        elif meth == "tools/list":
+            obj = {"type": "object", "properties": {"studies": {"type": "object"}}}
+            r = {"tools": [{"name": n, "description": "", "inputSchema": obj}
+                           for n in ("jobs", "validate_studies", "run_studies")]}
+        elif meth == "tools/call":
+            name, args = p["name"], p.get("arguments") or {}
+            st = args.get("studies") or {}
+            if name == "validate_studies":
+                res = {}
+                for k, s in st.items():
+                    ref, here = where(s)
+                    res[k] = {"ok": here, "errors": [] if here else
+                              [f"solve.init_from: no case in {ref} on this machine (a run of another machine: ...)"]}
+                out = {"ok": all(x["ok"] for x in res.values()), "studies": res}
+            elif name == "run_studies":
+                out = {"translator": "1", "request": os.path.join(OUT, "run_new"),
+                       "got": {k: dict(zip(("ref", "here"), where(s))) for k, s in st.items()}}
+            else:
+                out = {"translator": "1", "requests": []}
+            r = {"content": [{"type": "text", "text": json.dumps(out)}]}
+        else:
+            r = {}
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}) + "\\n")
+        sys.stdout.flush()
+''')
+
+
+class InitFrom(unittest.TestCase):
+    """cfdt init_from a finished run of another machine: checked there, packed, relayed, imported once, reused."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        self.t = t
+        root = t / "root"
+        (root / "bin").mkdir(parents=True)
+        for path, text in ((root / "bin" / "mcp", FAKE_INIT_SERVER), (root / "bin" / "run", FAKE_CFDT_RUN),
+                           (root / "llmt", FAKE_STAGE_LLMT), (t / "ssh", FAKE_SSH)):
+            path.write_text(text)
+            os.chmod(path, 0o755)
+        self.m1 = t / "remotes" / "m1" / "cfdt_runs"
+        (t / "remotes" / "m2" / "cfdt_runs").mkdir(parents=True)
+        for req, finished in (("run_A", True), ("run_B", False)):
+            s = self.m1 / req / "s1"
+            (s / "case" / "0.5").mkdir(parents=True)
+            (s / "case" / "0.5" / "U").write_text("fields " * 500)
+            if finished:
+                (s / "s1.json").write_text('{"ok": true}')
+        self.log, self.runlog = t / "ssh.log", t / "run.log"
+        self.saved_env = {k: os.environ.get(k) for k in ("FAKE_REMOTES", "FAKE_HIDE", "FAKE_LOG", "FAKE_SLOW", "FAKE_RUN_LOG")}
+        os.environ.update(FAKE_REMOTES=str(t / "remotes"), FAKE_HIDE=str(t / "nothing-hidden"), FAKE_LOG=str(self.log),
+                          FAKE_SLOW="0", FAKE_RUN_LOG=str(self.runlog))
+        self.saved = (R.L.ssh_exe, R.PATHS_FILE)
+        R.L.ssh_exe = lambda: str(t / "ssh")
+        R.PATHS_FILE = t / "router_paths.json"
+        r = R.Router("cfdt")
+        r.hosts = [{"name": m, "ssh": f"u@{m}", "root": str(root)} for m in ("m1", "m2")]
+        r.prefer, r.exclude, r.speed, r.paths = [], set(), {}, {}
+        r.initialize({"protocolVersion": "2025-06-18"})
+        for req in ("run_A", "run_B"):                      # the router saw these requests run on m1
+            r.remember(str(self.m1 / req), "m1")
+        self.r = r
+
+    def tearDown(self):
+        self.r.close()
+        R.L.ssh_exe, R.PATHS_FILE = self.saved
+        for k, v in self.saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def packs(self) -> int:
+        if not self.runlog.exists():
+            return 0
+        return sum(1 for x in self.runlog.read_text().splitlines() if json.loads(x)["argv"][1] == "pack")
+
+    def run_on_m2(self, studies: dict) -> dict:
+        studies = {k: dict(v, run={"host": "m2"}) for k, v in studies.items()}
+        return R.Router.parse(self.r.tool_call("run_studies", {"studies": studies}))
+
+    def test_staged_once_and_reused(self):
+        out = self.run_on_m2({"c1": {"solve": {"init_from": "run_A/s1"}}})
+        self.assertEqual(out["machine"], "m2", out)
+        self.assertEqual(out["got"]["c1"], {"ref": "run_A@m1/s1", "here": True})     # m2 starts from its copy
+        st = out["staged"]["init_from"]["c1"]
+        self.assertEqual((st["from"], st["to"]), ("m1:run_A/s1", "run_A@m1/s1"))
+        self.assertEqual(self.packs(), 1)
+        m2 = self.t / "remotes" / "m2" / "cfdt_runs"
+        self.assertEqual((m2 / "run_A@m1" / "s1" / "case" / "0.5" / "U").read_text(), "fields " * 500)
+        for side in (self.m1, m2):                            # the temporary archives are gone on both
+            self.assertEqual([p.name for p in (side / ".llmt-transfer").iterdir()], [])
+        # the next study of the chain, an absolute ref, another call: reused, nothing packed again
+        out = self.run_on_m2({"c2": {"solve": {"transient": {"init_from": str(self.m1 / "run_A" / "s1")}}}})
+        self.assertEqual(out["got"]["c2"], {"ref": "run_A@m1/s1", "here": True})
+        self.assertEqual(self.packs(), 1)
+        # placed freely, m1 (which holds the run) wins: no copy to make
+        out = R.Router.parse(self.r.tool_call("run_studies", {"studies": {"c3": {"solve": {"init_from": "run_A/s1"}}}}))
+        self.assertEqual(out["machine"], "m1")
+        self.assertEqual(out["got"]["c3"]["ref"], "run_A/s1")
+        self.assertNotIn("staged", out)
+
+    def test_slow_copy_answers_uploading(self):
+        os.environ["FAKE_SLOW"] = "4"                        # the copy into m2 takes longer than this call may wait
+        saved = R.BUDGET
+        R.BUDGET = 16.0
+        try:
+            out = self.run_on_m2({"c1": {"solve": {"init_from": "run_A/s1"}}})
+        finally:
+            R.BUDGET = saved
+        self.assertEqual(out["status"], "uploading", out)
+        prog = next(iter(out["uploading"]["init_from"].values()))
+        self.assertIn(prog["stage"], ("packing", "copying", "checking", "importing"))
+        self.assertIn("nothing was submitted", out["next"])
+        t = next(iter(self.r.transfers.values()))
+        t.thread.join(30)
+        self.assertTrue(t.done, t.error)
+        os.environ["FAKE_SLOW"] = "0"
+        out = self.run_on_m2({"c1": {"solve": {"init_from": "run_A/s1"}}})   # the same call again: uses the copy
+        self.assertEqual(out["got"]["c1"], {"ref": "run_A@m1/s1", "here": True})
+        self.assertEqual(self.packs(), 1)
+
+    def test_unfinished_refused_before_copy(self):
+        res = self.r.tool_call("run_studies", {"studies": {"c1": {"solve": {"init_from": "run_B/s1"}, "run": {"host": "m2"}}}})
+        out = R.Router.parse(res)
+        self.assertTrue(res.get("isError"))
+        self.assertIn("has no result yet", out["error"])
+        self.assertIn("Nothing was submitted or copied", out["error"])
+        self.assertEqual(self.packs(), 0)
+
+    def test_validate_without_copy(self):
+        out = R.Router.parse(self.r.tool_call("validate_studies", {"studies": {
+            "c1": {"solve": {"init_from": "run_A/s1"}, "run": {"host": "m2"}}}}))
+        self.assertEqual(out["machine"], "m2")
+        self.assertTrue(out["studies"]["c1"]["ok"], out)
+        self.assertEqual(out["studies"]["c1"]["init_from"]["from"], "m1:run_A/s1")
+        out = R.Router.parse(self.r.tool_call("validate_studies", {"studies": {
+            "c1": {"solve": {"init_from": "run_B/s1"}, "run": {"host": "m2"}}}}))
+        self.assertFalse(out["studies"]["c1"]["ok"])
+        self.assertTrue(any("has no result yet" in e for e in out["studies"]["c1"]["errors"]))
+        self.assertFalse(any("no case in" in e for e in out["studies"]["c1"]["errors"]))
+        self.assertEqual(self.packs(), 0)
+        self.assertFalse((self.t / "remotes" / "m2" / "cfdt_runs" / "run_A@m1").exists())
+
+
 class ServersList(unittest.TestCase):
     """Item 3: the process list; a symlinked prefix; no match for shells or jobs; own process skipped."""
 
