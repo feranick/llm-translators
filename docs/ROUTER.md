@@ -1,6 +1,6 @@
 # The router: one translator, several machines
 
-Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2); tool definitions that follow deploys, per-node queues, request names 2026.11.06.1; init_from across machines 2026.11.13.1.
+Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2); tool definitions that follow deploys, per-node queues, request names 2026.11.06.1; init_from across machines 2026.11.13.1 (copies judged by the fields' time 2026.11.13.2).
 
 Until now, each MCP entry in the Claude app pointed to one machine (`ssh mochi .../bin/mcp cfdt`). With several machines able to run a translator (mochi, carbonio, a DGX Spark), choosing one by hand wastes the others, and one entry per machine (`cfdt-mochi`, `cfdt-carbonio`, ...) multiplies the tools in every chat.
 
@@ -131,7 +131,9 @@ A cfdt study (2026.11.13.6) can start from a finished run: `solve.init_from` or 
   4. The temporary archives are deleted on both machines. After a failure they stay, so the next attempt resumes.
 
   While it runs, the answer is `status: "uploading"` with `uploading.init_from` (stage, MB, `sent_pct`, `eta_s`), and nothing is submitted. Repeat the call: it stays on M while the copy runs, and uses the copy once it's done.
-- **Reused.** A copy is not made again when `<CFDT_OUT>/<request>@<N>[_importK]/<study>` exists on M with `request.json` `imported.packed` after the source's result was written.
+- **Reused.** A copy is not made again when `<CFDT_OUT>/<request>@<N>[_importK]/<study>` exists on M with `request.json` `imported.packed` after the source last changed.
+  - "Last changed" is init-check's `fields_mtime` (cfdt 2026.11.13.8: the latest time directory), else the result file's time. A reprocess rewrites the result but not the fields, so it causes no new copy.
+  - A copy the router made itself is reused only while the source is unchanged (router 2026.11.13.2).
 - **The call** goes on with the study's init_from replaced by the import's ref (`<request>@<N>/<study>`). The answer adds `staged.init_from: {<study>: {from: "<N>:<ref>", to: "<new ref>", bytes}}`.
 - **validate_studies** checks with `cfdt init-check` on N, and copies nothing. M's "no case … on this machine" goes when N's check is ok; N's problems are added when it isn't.
 

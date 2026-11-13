@@ -693,8 +693,13 @@ FAKE_CFDT_RUN = textwrap.dedent('''\
         probs = [] if os.path.isdir(os.path.join(src, "case")) else [f"no case in {src}"]
         if not fin:
             probs.append(f"{name} has no result yet: wait until it finishes")
-        print(json.dumps({"ref": a[2], "folder": src, "ok": not probs, "problems": probs, "finished": fin,
-                          "init_bytes": 4096}))
+        ans = {"ref": a[2], "folder": src, "ok": not probs, "problems": probs, "finished": fin, "init_bytes": 4096}
+        times = sorted(d for d in os.listdir(os.path.join(src, "case")) if d.replace(".", "").isdigit()) \\
+            if os.path.isdir(os.path.join(src, "case")) else []
+        if times and not os.environ.get("FAKE_NO_FIELDS_MTIME"):         # cfdt 2026.11.13.8
+            td = os.path.join(src, "case", times[-1])
+            ans["fields_mtime"] = max([os.path.getmtime(td)] + [os.path.getmtime(os.path.join(td, f)) for f in os.listdir(td)])
+        print(json.dumps(ans))
         sys.exit(1 if probs else 0)
     if cmd == "pack":
         req, dest, studies = a[2], opt("--out"), opt("--studies").split(",")
@@ -856,6 +861,41 @@ class InitFrom(unittest.TestCase):
         self.assertEqual(out["machine"], "m1")
         self.assertEqual(out["got"]["c3"]["ref"], "run_A/s1")
         self.assertNotIn("staged", out)
+
+    def age(self, path: Path, seconds: float) -> None:
+        t = time.time() + seconds
+        os.utime(path, (t, t))
+
+    def test_reprocessed_source_reused_fields_changed_copied(self):
+        src = self.m1 / "run_A" / "s1"
+        tdir = src / "case" / "0.5"
+        for p in (tdir / "U", tdir):                         # fields written well before the copy
+            self.age(p, -3600)
+        out = self.run_on_m2({"c1": {"solve": {"init_from": "run_A/s1"}}})
+        self.assertEqual(out["got"]["c1"]["ref"], "run_A@m1/s1")
+        self.assertEqual(self.packs(), 1)
+        # a reprocess on m1: the result is rewritten after the copy, the fields are not
+        self.age(src / "s1.json", +600)
+        self.r.init_checks.clear()
+        out = self.run_on_m2({"c2": {"solve": {"init_from": "run_A/s1"}}})
+        self.assertEqual(out["got"]["c2"]["ref"], "run_A@m1/s1")
+        self.assertEqual(self.packs(), 1)                     # reused: no new copy
+        # without fields_mtime (cfdt before 2026.11.13.8) the result's time decides: a new copy
+        os.environ["FAKE_NO_FIELDS_MTIME"] = "1"
+        try:
+            self.r.init_checks.clear()
+            out = self.run_on_m2({"c3": {"solve": {"init_from": "run_A/s1"}}})
+        finally:
+            os.environ.pop("FAKE_NO_FIELDS_MTIME", None)
+        self.assertEqual(self.packs(), 2)
+        self.assertEqual(out["got"]["c3"]["ref"], "run_A@m1_import2/s1")
+        # the fields themselves change (the run continued): copied again
+        for p in (tdir / "U", tdir):
+            self.age(p, +1200)
+        self.r.init_checks.clear()
+        out = self.run_on_m2({"c4": {"solve": {"init_from": "run_A/s1"}}})
+        self.assertEqual(self.packs(), 3)
+        self.assertEqual(out["got"]["c4"], {"ref": "run_A@m1_import3/s1", "here": True})
 
     def test_slow_copy_answers_uploading(self):
         os.environ["FAKE_SLOW"] = "4"                        # the copy into m2 takes longer than this call may wait

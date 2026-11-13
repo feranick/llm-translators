@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.13.1
+Version: 2026.11.13.2
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.13.1"
+__version__ = "2026.11.13.2"
 
 HERE = Path(__file__).resolve().parent
 
@@ -392,6 +392,7 @@ class Transfer:
         self.cli, self.src, self.dst, self.folder, self.studies = cli, src, dst, folder, list(studies)
         self.req = folder.rstrip("/").rsplit("/", 1)[-1]
         self.name = f"{self.req}@{src['name']}"
+        self.tag = tag
         self.tmp_src = f"{out_src}/.llmt-transfer/{self.req}.{tag}.tgz"
         self.tmp_dst = f"{out_dst}/.llmt-transfer/{self.req}.{tag}.tgz"
         self.total = hint_bytes or 0
@@ -1390,9 +1391,21 @@ class Router:
             rec["ok"] = not errs
         v["ok"] = all(x.get("ok") for x in v["studies"].values() if isinstance(x, dict)) and not v.get("errors")
 
+    @staticmethod
+    def source_mtime(check) -> float | None:
+        """When what init_from takes from a source run last changed: its latest time directory (init-check's
+        fields_mtime, cfdt 2026.11.13.8), else its result file. A reprocess rewrites the result, not the fields, so
+        with fields_mtime it does not make an imported copy out of date (no new multi-GB copy)."""
+        c = check if isinstance(check, dict) else {}
+        for k in ("fields_mtime", "result_mtime"):
+            v = c.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return float(v)
+        return None
+
     def imported_on(self, m: str, n: str, folder: str, studies: dict) -> dict:
-        """{study: init_from ref on m} for studies (name -> source result mtime) already imported on m from n's
-        request folder by an earlier call, and packed after the source's result was written."""
+        """{study: init_from ref on m} for studies (name -> when the source last changed: source_mtime) already
+        imported on m from n's request folder by an earlier call, and packed after that."""
         h = self.host(m)
         out_m = (self.status(m) or {}).get("out_dir")
         if not out_m:
@@ -1434,19 +1447,20 @@ class Router:
             raise ValueError(f"init_from: cannot tell {m}'s output folder ({self.key.upper()}_OUT): machines() shows why")
         for (n, folder), items in groups.items():
             src = sorted({s for _, s in items})
-            mtimes = {s: next((r.get("check") or {}).get("result_mtime") for r, s2 in items if s2 == s) for s in src}
+            mtimes = {s: next(self.source_mtime(r.get("check")) for r, s2 in items if s2 == s) for s in src}
             got = self.imported_on(m, n, folder, mtimes)
             need = [s for s in src if s not in got]
             nbytes = {s: next(((r.get("check") or {}).get("init_bytes") for r, s2 in items if s2 == s), None) for s in src}
             if need:
                 key = (m, n, folder, tuple(need))
+                # the source's state names the copy: a finished one is reused only while the source is unchanged
+                tag = hashlib.sha1(json.dumps([n, folder, need, [mtimes[s] for s in need]]).encode()).hexdigest()[:10]
                 with self.up_lock:
                     t = self.transfers.get(key)
-                    if t is None or t.error:
+                    if t is None or t.error or (t.done and t.tag != tag):
                         out_n = (self.status(n) or {}).get("out_dir")
                         if not out_n:
                             raise ValueError(f"init_from: cannot tell {n}'s output folder: machines() shows why")
-                        tag = hashlib.sha1(json.dumps([n, folder, need, [mtimes[s] for s in need]]).encode()).hexdigest()[:10]
                         t = Transfer(self.t["cli"], self.host(n), self.host(m), folder, need, out_n, out_m,
                                      sum(int(nbytes[s] or 0) for s in need) or None, tag)
                         self.transfers[key] = t
