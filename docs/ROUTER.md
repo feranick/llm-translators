@@ -1,6 +1,6 @@
 # The router: one translator, several machines
 
-Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2); tool definitions that follow deploys, per-node queues, request names 2026.11.06.1; init_from across machines 2026.11.13.1 (copies judged by the fields' time 2026.11.13.2).
+Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2); tool definitions that follow deploys, per-node queues, request names 2026.11.06.1; init_from across machines 2026.11.13.1 (copies judged by the fields' time 2026.11.13.2); run.host checked study by study, memory per study with its reason 2026.11.14.1.
 
 Until now, each MCP entry in the Claude app pointed to one machine (`ssh mochi .../bin/mcp cfdt`). With several machines able to run a translator (mochi, carbonio, a DGX Spark), choosing one by hand wastes the others, and one entry per machine (`cfdt-mochi`, `cfdt-carbonio`, ...) multiplies the tools in every chat.
 
@@ -57,12 +57,17 @@ Claude app ── stdio ──> bin/router cfdt  (on the Mac; Python standard li
 
 Placement applies to calls that start work: those with a `studies` or `goals` argument (`run_studies`, `build_parts`), and `run_benchmarks`. The steps:
 
-1. **A manual choice wins.** A study may say `"run": {"host": "mochi"}`, or a list in order of preference. The router removes `host` before passing the study on. All studies of one call go to one machine; if their choices conflict, the call is refused and the router says why.
+1. **A manual choice wins, and is never overridden silently.** A study may say `"run": {"host": "mochi"}`, or a list in order of preference. The router removes `host` before passing the study on. One request runs on one machine (2026.11.14.1):
+   - **Each study keeps its own `run.host`.** Before 2026.11.14.1, the router merged every study's `run.host` into one list for all of them, so a mixed request went to the first machine of that list.
+   - **Every `run.host` must allow the same machine.** Preference lists may overlap: the request goes to their common machines, in the first study's order. If they share none, the call is refused before anything is validated, placed or copied. The answer says which studies want which machines (e.g. `a -> carbonio; b -> spark1`) and suggests one request per machine. `validate_studies` is refused the same way.
+   - **Studies without `run.host`** go wherever the request goes. If one of them excludes every machine the others' `run.host` allows (memory, below), the call is refused. The answer names the requirement (e.g. "r2_g0p45_plain_sl needs ~40 GB (its estimate), which excludes carbonio (its largest job: 15G)") and suggests a separate request or another `run.host`.
 
-   **Memory comes next** (2026.11.07.1). The largest `run.mem` among the studies, read as SLURM reads `--mem` (K, M, G, T; M without a suffix; `"auto"` and unset are ignored), is compared with each machine's largest job memory: `executor.caps.mem_mb` in its status, else `caps.mem` parsed.
-   - A machine below it is left out, before anything is validated or copied there. The answer says so: "mochi left out: run.mem 90G > its 62G".
-   - A machine that reports no limit stays a candidate (an older version, or memory unknown).
-   - If no allowed machine is left, the call fails before any upload, listing each machine's limit.
+   **Memory comes next** (2026.11.07.1; per study 2026.11.14.1). Each study's needs are compared with each machine's largest job memory (`executor.caps.mem_mb` in its status, else `caps.mem` parsed):
+   - **Its `run.mem`,** read as SLURM reads `--mem` (K, M, G, T; M without a suffix; `"auto"` and unset are ignored). This is checked before anything is validated or copied.
+   - **The memory its validation estimates** on that machine (`estimate.mem_mb`), after validation.
+   - **The answer says why.** A machine below a study's need is left out, and `router.warnings` says which study excludes it: "carbonio left out: r2_g0p45_plain_sl needs ~40 GB (its estimate), which excludes carbonio (its largest job: 15G)".
+   - **No limit reported:** the machine stays a candidate (an older version, or memory unknown).
+   - **Nothing fits:** if no allowed machine is left, the call fails before any upload, with each study's reason.
    - `machines()` shows the limit as `max_job_mem`. cfdt 2026.11.07.1 reports it from the SLURM nodes' memory (or `CFDT_MAX_MEM` if lower); the other translators report it when their `*_MAX_MEM` is set.
    - With llmt-runtime the node's memory is given exactly: `caps.mem` is `64000M` rather than `62G` (a whole number of GB only when it is one), so a `run.mem` of 64000M is no longer refused; `caps.mem_mb` is the same number. `machines()` also shows the translator's `runtime` (llmt-runtime version) and the release's `runtime_commit`.
 2. **Data stays where it is.** A study that mentions an earlier request folder, such as a geometry `{"ref": "<request>/<study>"}` or a chained path, goes to the machine holding that folder. The router knows where each request folder lives (below).

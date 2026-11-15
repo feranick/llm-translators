@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.13.2
+Version: 2026.11.14.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.13.2"
+__version__ = "2026.11.14.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -1277,6 +1277,49 @@ class Router:
         return ((t or {}).get("inputSchema") or {}).get("properties") or {}
 
     @staticmethod
+    def study_mems(studies: dict) -> dict:
+        """{study: (MB, as written)} for the studies that set run.mem."""
+        out = {}
+        for k, s in (studies or {}).items():
+            run = s.get("run") if isinstance(s, dict) else None
+            v = run.get("mem") if isinstance(run, dict) else None
+            mb = parse_mem_mb(v)
+            if mb:
+                out[k] = (mb, str(v))
+        return out
+
+    def mem_filter(self, cands: list, sts: dict, needs_for, manual, wants: dict, warnings: list) -> list:
+        """Leaves out the machines whose largest job memory (executor.caps) is below what a study needs there
+        (needs_for(machine) -> {study: (MB, how it is known)}), saying which study excludes which machine. A
+        run.host never gets overridden: when every machine run.host allows is left out, the call is refused, with the
+        studies that exclude it and what to do."""
+        keep, why = [], {}
+        for n in cands:
+            cap = self.mem_cap_mb(sts.get(n) or {})
+            over = [(k, label) for k, (mb, label) in (needs_for(n) or {}).items() if cap is not None and mb > cap]
+            if over:
+                why[n] = [f"{k} needs {label}, which excludes {n} (its largest job: {fmt_mb(cap)})" for k, label in over]
+            else:
+                keep.append(n)
+        if not why:
+            return cands
+        reasons = "; ".join(r for n in cands if n in why for r in why[n])
+        if not keep:
+            if manual:
+                pinned = ", ".join(sorted(wants))
+                heavy = sorted({r.split(" needs ")[0] for n in why for r in why[n]})
+                raise ValueError(
+                    f"run.host asks for {' or '.join(manual)} ({pinned}), but {reasons}. Nothing was placed or copied: "
+                    f"put {', '.join(heavy)} in a separate request (for a machine with enough memory), or give "
+                    f"run.host a machine that can take every study.")
+            raise ValueError(f"no machine can take every study: {reasons}. Nothing was placed or copied: lower "
+                             f"run.mem, or split the request so that each part fits a machine.")
+        for n in cands:
+            if n in why:
+                warnings.append(f"{n} left out: " + "; ".join(why[n]))
+        return keep
+
+    @staticmethod
     def request_mem(studies: dict) -> tuple:
         """-> (MB, as written) of the largest run.mem among the studies; (None, None) when none sets one."""
         best = (None, None)
@@ -1523,17 +1566,20 @@ class Router:
         arg = next((a for a in PLACE_ARGS if isinstance(args.get(a), dict)), None)
         studies = copy.deepcopy(args.get(arg)) if arg else {}
         manual: list | None = None
-        for s in studies.values():
+        wants: dict = {}                      # study -> its run.host (a name, or names in order of preference)
+        for k, s in studies.items():
             run = s.get("run") if isinstance(s, dict) else None
             if isinstance(run, dict) and "host" in run:
                 want = run.pop("host")
-                want = [want] if isinstance(want, str) else list(want or [])
+                wants[k] = [want] if isinstance(want, str) else list(want or [])
                 if not run:
                     s.pop("run")
-                if manual is not None and want != manual:
-                    raise ValueError(f"the studies ask for different machines ({manual} and {want}): "
-                                     f"one call goes to one machine; split it")
-                manual = want
+        if wants:                              # every study's run.host must allow the one machine of the request
+            why = self.host_conflict(wants)
+            if why:
+                raise ValueError(why)
+            first = next(iter(wants.values()))
+            manual = [m for m in first if all(m in v for v in wants.values())]
         send = dict(args, **({arg: studies} if arg else {}))
         sts = self.statuses([h["name"] for h in self.ordered()], wait=min(STATUS_WAIT, max(1.0, p_end - time.time())))
         cands = self.candidates(sts)
@@ -1551,20 +1597,11 @@ class Router:
                                  "; ".join(f"{m}: {sts.get(m, {}).get('error') or 'translator or backends missing'}"
                                            for m in manual))
             cands = usable
-        # memory: a machine whose largest job memory (executor.caps) is below the request's run.mem is left out,
-        # before anything is validated or copied there
-        need, need_txt = self.request_mem(studies) if arg else (None, None)
-        if need:
-            fit, short = [], []
-            for n in cands:
-                cap = self.mem_cap_mb(sts.get(n) or {})
-                (short if cap is not None and cap < need else fit).append((n, cap))
-            if short and not fit:
-                raise ValueError(f"no machine can give run.mem {need_txt}: " + ", ".join(
-                    f"{n} {fmt_mb(c)}" for n, c in short) + ". Lower run.mem, or split the study.")
-            for n, cap in short:
-                warnings.append(f"{n} left out: run.mem {need_txt} > its {fmt_mb(cap)}")
-            cands = [n for n, _ in fit]
+        # memory: a machine whose largest job memory (executor.caps) is below a study's run.mem is left out, before
+        # anything is validated or copied there (and again after validation, with its estimates)
+        if arg:
+            needs = {k: (mb, f"run.mem {txt}") for k, (mb, txt) in self.study_mems(studies).items()}
+            cands = self.mem_filter(cands, sts, lambda n: needs, manual, wants, warnings)
         # init_from a finished run of another machine: checked there first (an unfinished one refuses the call
         # before anything is copied); it does not pin the call to that machine, the copy's time counts instead
         refs = self.init_refs(studies) if arg else []
@@ -1612,6 +1649,7 @@ class Router:
             vt = None
             warnings.append(f"the input files ({self.check_sizes(files) / MB:.0f} MB) are copied only to the chosen "
                             f"machine: placed by the queues, without validating on each machine first")
+        study_est: dict = {}                    # machine -> study -> estimated memory (MB)
         if vt and studies:
             vres = self.call_all(cands, vt, {arg: studies}, deadline=min(p_end, time.time() + 15.0))
             ok = []
@@ -1625,6 +1663,8 @@ class Router:
                     per = {k: x for k, x in src.items() if isinstance(x, dict) and "ok" in x}
                     if per and all(x.get("ok") for x in per.values()):
                         ok.append(n)
+                    study_est[n] = {k: float(x["estimate"]["mem_mb"]) for k, x in per.items()
+                                    if isinstance(x.get("estimate"), dict) and x["estimate"].get("mem_mb")}
                     es = [x.get("estimate") for x in per.values() if isinstance(x.get("estimate"), dict)]
                     if es:
                         est[n] = {"minutes": sum(float(e.get("minutes") or 0) for e in es),
@@ -1634,6 +1674,11 @@ class Router:
                 warnings.append("not valid on " + ", ".join(n for n in cands if n not in ok) +
                                 " (an older version?): left out")
                 cands = ok
+            # the memory each study will need there (the translator's estimate) against each machine's largest job
+            if study_est:
+                cands = self.mem_filter(cands, sts, lambda n: {
+                    k: (mb, f"~{mb / 1024:.0f} GB (its estimate)") for k, mb in (study_est.get(n) or {}).items()},
+                    manual, wants, warnings)
         starts: dict = {}
 
         def one_start(n):
@@ -1682,8 +1727,11 @@ class Router:
 
     @staticmethod
     def take_host(args: dict) -> tuple:
-        """-> (machines named in run.host, args without run.host) for studies / goals / study arguments."""
+        """-> (machines named in run.host, args without run.host, {arg: {study: its run.host}}) for studies / goals /
+        study arguments. Each study keeps its own run.host (put_host puts it back for place(), which checks that
+        they agree): never one study's host for another."""
         pinned: list = []
+        per: dict = {}
         out = dict(args)
         for a in (*PLACE_ARGS, "study"):
             v = args.get(a)
@@ -1695,6 +1743,7 @@ class Router:
                 if isinstance(st, dict) and isinstance(st.get("run"), dict) and "host" in st["run"]:
                     st = copy.deepcopy(st)
                     want = st["run"].pop("host")
+                    per.setdefault(a, {})[k] = want
                     for m in ([want] if isinstance(want, str) else list(want or [])):
                         if m not in pinned:
                             pinned.append(m)
@@ -1702,17 +1751,34 @@ class Router:
                         st.pop("run")
                 new[k] = st
             out[a] = new["_"] if a == "study" else new
-        return pinned, out
+        return pinned, out, per
 
     @staticmethod
-    def put_host(args: dict, pinned: list) -> dict:
-        """Puts run.host back on every study, for place() to read (it removes it again before sending)."""
+    def put_host(args: dict, per: dict) -> dict:
+        """Puts each study's own run.host back, for place() to read (it removes it again before sending)."""
         out = dict(args)
         for a in PLACE_ARGS:
-            if isinstance(args.get(a), dict):
-                out[a] = {k: ({**st, "run": {**(st.get("run") or {}), "host": pinned}} if isinstance(st, dict) else st)
+            if isinstance(args.get(a), dict) and per.get(a):
+                out[a] = {k: ({**st, "run": {**(st.get("run") or {}), "host": per[a][k]}}
+                              if isinstance(st, dict) and k in per[a] else st)
                           for k, st in args[a].items()}
         return out
+
+    @staticmethod
+    def host_conflict(wants: dict) -> str | None:
+        """None when the studies' run.host values (study -> name or [names in order of preference]) share a
+        machine; else what to tell: which studies want which machines, and to split the request."""
+        lists = {s: ([w] if isinstance(w, str) else list(w or [])) for s, w in wants.items()}
+        first = next(iter(lists.values()), [])
+        if [m for m in first if all(m in v for v in lists.values())]:
+            return None
+        groups: dict = {}
+        for s, v in lists.items():
+            groups.setdefault(" or ".join(v) or "(empty)", []).append(s)
+        return ("the studies' run.host name different machines, and one request runs on one machine: " +
+                "; ".join(f"{', '.join(ss)} -> {h}" for h, ss in groups.items()) +
+                ". Split it into one request per machine (one run_studies call each), or give them the same run.host. "
+                "Nothing was placed or copied.")
 
     def route_path(self, args: dict) -> tuple:
         """-> (machine or None, args) for a call about an existing request or file."""
@@ -1758,7 +1824,11 @@ class Router:
                 sts = self.statuses([h["name"] for h in self.ordered()])
                 names = [n for n in self.candidates(sts)] or [n for n, s in sts.items() if s.get("reachable")]
                 return self.text_result({"machines": self.call_all(names, tool, args, deadline)})
-            pinned, args = self.take_host(args)
+            pinned, args, per_host = self.take_host(args)
+            for a in PLACE_ARGS:                                         # validation too: one machine for all
+                conflict = self.host_conflict(per_host.get(a) or {}) if per_host.get(a) else None
+                if conflict:
+                    raise ValueError(conflict)
             if pinned and not (tool == "run_benchmarks" or (not tool.startswith(("validate_", "get_")) and
                                                            any(isinstance(args.get(a), dict) for a in PLACE_ARGS))):
                 sts = self.statuses([h["name"] for h in self.ordered()])
@@ -1768,7 +1838,7 @@ class Router:
                 r = self.post_validate(n, tool, args, self.call(n, tool, args, deadline))
                 return self.with_fields(r, {"machine": n})
             if pinned:                                                   # placement reads it back from the studies
-                args = self.put_host(args, pinned)
+                args = self.put_host(args, per_host)
             starts_work = tool == "run_benchmarks" or (not tool.startswith(("validate_", "get_")) and
                                                         any(isinstance(args.get(a), dict) for a in PLACE_ARGS))
             if starts_work:

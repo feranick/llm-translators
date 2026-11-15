@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import io
@@ -392,7 +393,7 @@ class MemoryPlacement(unittest.TestCase):
             "b": {"run": {"mem": "90G", "host": ["mochi", "spark1", "spark2"]}},
             "c": {"run": {"host": ["mochi", "spark1", "spark2"]}}}})
         self.assertIn(name, ("spark1", "spark2"))
-        self.assertIn("mochi left out: run.mem 90G > its 62G", info["warnings"])
+        self.assertIn("mochi left out: b needs run.mem 90G, which excludes mochi (its largest job: 62G)", info["warnings"])
         self.assertNotIn("mochi", [c["machine"] for c in info["candidates"]])
         self.assertEqual(send["studies"]["b"]["run"], {"mem": "90G"})          # run.host removed, mem kept
         # no host chosen: carbonio, whose limit is unknown, stays a candidate
@@ -404,10 +405,12 @@ class MemoryPlacement(unittest.TestCase):
         r = self.router()
         with self.assertRaises(ValueError) as cm:
             r.place("run_studies", {"studies": {"b": {"run": {"mem": "90G", "host": ["mochi"]}}}})
-        self.assertIn("no machine can give run.mem 90G: mochi 62G", str(cm.exception))
+        self.assertIn("run.host asks for mochi (b), but b needs run.mem 90G, which excludes mochi (its largest job: 62G)",
+                      str(cm.exception))
         with self.assertRaises(ValueError) as cm:
             r.place("run_studies", {"studies": {"b": {"run": {"mem": "1T", "host": ["mochi", "spark1", "spark2"]}}}})
-        self.assertIn("mochi 62G, spark1 117G, spark2 117.2G", str(cm.exception))
+        for m, cap in (("mochi", "62G"), ("spark1", "117G"), ("spark2", "117.2G")):
+            self.assertIn(f"excludes {m} (its largest job: {cap})", str(cm.exception))
         # 'auto' or no run.mem: no filter
         r.local_files = lambda args: {}
         self.assertEqual(r.place("run_studies", {"studies": {"b": {"run": {"mem": "auto", "host": "mochi"}}}})[0],
@@ -938,6 +941,84 @@ class InitFrom(unittest.TestCase):
         self.assertFalse(any("no case in" in e for e in out["studies"]["c1"]["errors"]))
         self.assertEqual(self.packs(), 0)
         self.assertFalse((self.t / "remotes" / "m2" / "cfdt_runs" / "run_A@m1").exists())
+
+
+class HostConsistency(unittest.TestCase):
+    """run.host: one request runs on one machine; a study's run.host is never overridden silently."""
+
+    def router(self, calls: list | None = None):
+        r = R.Router("cfdt")
+        r.hosts = [{"name": n, "ssh": f"u@{n}", "root": "/x"} for n in ("carbonio", "spark1", "spark2")]
+        r.prefer, r.exclude, r.speed, r.tools = [], set(), {}, [{"name": "validate_studies"}, {"name": "run_studies"}]
+
+        def st(cap):
+            return {"reachable": True, "version": "1", "backends_missing": [], "load": 0.0, "cores": 20,
+                    "executor": {"kind": "local", "procs": 2, "caps": {"mem": cap}}}
+        sts = {"carbonio": st("15G"), "spark1": st("117G"), "spark2": st("117G")}
+        r.statuses = lambda names, fresh=False, wait=0: {n: sts[n] for n in names}
+        r.local_files = lambda args: {}
+        est = {"plain": 2048, "r2_g0p45_plain_sl": 40960}             # MB: what each study will need (validation)
+
+        def call_all(names, tool, args, deadline=None):
+            if calls is not None:
+                calls.append(sorted(names))
+            return {n: {"ok": True, "studies": {k: {"ok": True, "estimate": {"minutes": 1, "procs": 1,
+                                                                            "mem_mb": est.get(k, 1024)}}
+                                                for k in args["studies"]}} for n in names}
+        r.call_all = call_all
+        return r
+
+    def test_mixed_hosts_refused(self):
+        r = self.router(calls := [])
+        studies = {"a": {"run": {"host": "carbonio"}}, "b": {"run": {"host": "spark1"}}, "c": {}}
+        with self.assertRaises(ValueError) as cm:
+            r.place("run_studies", {"studies": copy.deepcopy(studies)})
+        msg = str(cm.exception)
+        self.assertIn("a -> carbonio", msg)
+        self.assertIn("b -> spark1", msg)
+        self.assertIn("one request per machine", msg)
+        self.assertEqual(calls, [])                                    # refused before validating anything
+        # through the router's call path too: the hosts are not merged into one list for every study
+        res = r.tool_call("run_studies", {"studies": studies})
+        self.assertTrue(res.get("isError"))
+        self.assertIn("a -> carbonio", R.Router.parse(res)["error"])
+        # preference lists that share no machine are refused as well; ones that share one are placed there
+        with self.assertRaises(ValueError):
+            r.place("run_studies", {"studies": {"a": {"run": {"host": ["carbonio", "spark2"]}}, "b": {"run": {"host": "spark1"}}}})
+        name, _, _ = r.place("run_studies", {"studies": {"a": {"run": {"host": ["carbonio", "spark1"]}},
+                                                        "b": {"run": {"host": ["spark2", "spark1"]}}}})
+        self.assertEqual(name, "spark1")
+
+    def test_single_host_excluded_by_another_study(self):
+        r = self.router()
+        studies = {"plain": {"run": {"host": "carbonio"}}, "r2_g0p45_plain_sl": {}}
+        with self.assertRaises(ValueError) as cm:
+            r.place("run_studies", {"studies": studies})
+        msg = str(cm.exception)
+        self.assertIn("r2_g0p45_plain_sl needs ~40 GB (its estimate), which excludes carbonio (its largest job: 15G)", msg)
+        self.assertIn("run.host asks for carbonio (plain)", msg)
+        self.assertIn("separate request", msg)
+        # with run.mem the same is refused before anything is validated
+        r = self.router(calls := [])
+        with self.assertRaises(ValueError) as cm:
+            r.place("run_studies", {"studies": {"plain": {"run": {"host": "carbonio"}},
+                                                "big": {"run": {"mem": "40G"}}}})
+        self.assertIn("big needs run.mem 40G, which excludes carbonio", str(cm.exception))
+        self.assertEqual(calls, [])
+
+    def test_consistent_or_no_host_placed(self):
+        r = self.router()
+        name, send, info = r.place("run_studies", {"studies": {"a": {"run": {"host": "spark2"}},
+                                                              "b": {"run": {"host": "spark2", "mem": "8G"}}, "c": {}}})
+        self.assertEqual(name, "spark2")
+        self.assertEqual(send["studies"]["b"]["run"], {"mem": "8G"})   # run.host taken out, the rest kept
+        name, _, info = r.place("run_studies", {"studies": {"plain": {}}})
+        self.assertEqual(name, "carbonio")                                 # first of the equals, as before
+        # no run.host: a study too big for carbonio sends the request elsewhere, and the answer says why
+        name, _, info = r.place("run_studies", {"studies": {"plain": {}, "r2_g0p45_plain_sl": {}}})
+        self.assertIn(name, ("spark1", "spark2"))
+        self.assertIn("carbonio left out: r2_g0p45_plain_sl needs ~40 GB (its estimate), which excludes carbonio "
+                      "(its largest job: 15G)", info["warnings"])
 
 
 class ServersList(unittest.TestCase):
