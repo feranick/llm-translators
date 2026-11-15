@@ -998,13 +998,29 @@ class HostConsistency(unittest.TestCase):
         self.assertIn("r2_g0p45_plain_sl needs ~40 GB (its estimate), which excludes carbonio (its largest job: 15G)", msg)
         self.assertIn("run.host asks for carbonio (plain)", msg)
         self.assertIn("separate request", msg)
+        self.assertIn("only small input files (under 25 MB) may already have been copied", msg)   # after validation
         # with run.mem the same is refused before anything is validated
         r = self.router(calls := [])
         with self.assertRaises(ValueError) as cm:
             r.place("run_studies", {"studies": {"plain": {"run": {"host": "carbonio"}},
                                                 "big": {"run": {"mem": "40G"}}}})
         self.assertIn("big needs run.mem 40G, which excludes carbonio", str(cm.exception))
+        self.assertIn("Nothing was placed or copied", str(cm.exception))                     # before validation
         self.assertEqual(calls, [])
+
+    def test_cap_not_free_memory(self):
+        # carbonio's real cap (2026-11-14): 40G is excluded, 34G is placed there (job 5873), however little is free now
+        r = self.router()
+        st = {"reachable": True, "version": "1", "backends_missing": [], "load": 11.0, "cores": 12,
+              "executor": {"kind": "local", "procs": 2, "caps": {"mem": "38000M", "mem_mb": 38000}},
+              "slurm": {"cpus": 12, "cpus_allocated": 12, "mem_free_mb": 900, "free_mem": 900}}
+        r.statuses = lambda names, fresh=False, wait=0: {n: st for n in names}
+        r.hosts = [{"name": "carbonio", "ssh": "u@carbonio", "root": "/x"}]
+        name, _, info = r.place("run_studies", {"studies": {"s": {"run": {"mem": "34G", "host": "carbonio"}}}})
+        self.assertEqual(name, "carbonio")
+        with self.assertRaises(ValueError) as cm:
+            r.place("run_studies", {"studies": {"s": {"run": {"mem": "40G", "host": "carbonio"}}}})
+        self.assertIn("(its largest job: 37.1G)", str(cm.exception))
 
     def test_consistent_or_no_host_placed(self):
         r = self.router()

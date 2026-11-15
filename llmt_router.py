@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.14.1
+Version: 2026.11.14.2
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.14.1"
+__version__ = "2026.11.14.2"
 
 HERE = Path(__file__).resolve().parent
 
@@ -1288,11 +1288,16 @@ class Router:
                 out[k] = (mb, str(v))
         return out
 
-    def mem_filter(self, cands: list, sts: dict, needs_for, manual, wants: dict, warnings: list) -> list:
-        """Leaves out the machines whose largest job memory (executor.caps) is below what a study needs there
-        (needs_for(machine) -> {study: (MB, how it is known)}), saying which study excludes which machine. A
-        run.host never gets overridden: when every machine run.host allows is left out, the call is refused, with the
-        studies that exclude it and what to do."""
+    def mem_filter(self, cands: list, sts: dict, needs_for, manual, wants: dict, warnings: list,
+                   validated: bool = False) -> list:
+        """Leaves out the machines whose largest job memory is below what a study needs there (needs_for(machine)
+        -> {study: (MB, how it is known)}), saying which study excludes which machine. The limit is the machine's cap
+        (executor.caps: a node's SLURM memory, or *_MAX_MEM; machines() shows it as max_job_mem), never its free
+        memory: a busy machine is judged by its queue (the start estimate), not left out. A run.host never gets
+        overridden: when every machine run.host allows is left out, the call is refused, with the studies that
+        exclude it and what to do. validated: the needs come from validation, which may have copied small inputs."""
+        done = ("Nothing was placed or submitted; only small input files (under 25 MB) may already have been copied "
+                "to the machines it was validated on") if validated else "Nothing was placed or copied"
         keep, why = [], {}
         for n in cands:
             cap = self.mem_cap_mb(sts.get(n) or {})
@@ -1309,10 +1314,10 @@ class Router:
                 pinned = ", ".join(sorted(wants))
                 heavy = sorted({r.split(" needs ")[0] for n in why for r in why[n]})
                 raise ValueError(
-                    f"run.host asks for {' or '.join(manual)} ({pinned}), but {reasons}. Nothing was placed or copied: "
+                    f"run.host asks for {' or '.join(manual)} ({pinned}), but {reasons}. {done}: "
                     f"put {', '.join(heavy)} in a separate request (for a machine with enough memory), or give "
                     f"run.host a machine that can take every study.")
-            raise ValueError(f"no machine can take every study: {reasons}. Nothing was placed or copied: lower "
+            raise ValueError(f"no machine can take every study: {reasons}. {done}: lower "
                              f"run.mem, or split the request so that each part fits a machine.")
         for n in cands:
             if n in why:
@@ -1678,7 +1683,7 @@ class Router:
             if study_est:
                 cands = self.mem_filter(cands, sts, lambda n: {
                     k: (mb, f"~{mb / 1024:.0f} GB (its estimate)") for k, mb in (study_est.get(n) or {}).items()},
-                    manual, wants, warnings)
+                    manual, wants, warnings, validated=True)
         starts: dict = {}
 
         def one_start(n):
