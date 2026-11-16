@@ -1037,6 +1037,132 @@ class HostConsistency(unittest.TestCase):
                       "(its largest job: 15G)", info["warnings"])
 
 
+I = load("llmt_inspect", "llmt_inspect.py")
+
+
+class Inspect(unittest.TestCase):
+    """The router's read-only inspect tool (from the cfdt chat; sh -c in place of ssh, fake squeue/sacct)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        self.t = t
+        h = t / "home"
+        self.h = h
+        (h / "s50_sliding_v14" / "processor0").mkdir(parents=True)
+        (h / "ncc_ladder").mkdir()
+        (h / "private").mkdir()
+        (h / "private" / "secret.txt").write_text("no\n")
+        (h / "s50_sliding_v14" / "log.foamRun.620").write_text(
+            "".join(f"Time = {i}\nCourant Number mean: 0.1 max: {i * 0.5}\n" for i in range(1, 101)))
+        (h / "s50_sliding_v14" / "summary.620.json").write_text('{"ok": true}\n')
+        (h / "s50_sliding_v14" / "mesh.bin").write_bytes(b"\0\1\2" * 100)
+        (h / "s50_sliding_v14" / ".ssh").mkdir()
+        (h / "s50_sliding_v14" / ".ssh" / "id_rsa").write_text("KEY\n")
+        os.symlink(h / "private", h / "s50_sliding_v14" / "escape")
+        os.mkfifo(h / "s50_sliding_v14" / "pipe")
+        b = t / "bin"
+        b.mkdir()
+        (b / "squeue").write_text("#!/bin/sh\necho '620|ncc60|RUNNING|1:02:03|3:10:00|1|18|spark-0808|2026-11-16T08:00:00|"
+                                  "2026-11-16T08:01:00|/home/u/s50_sliding_v14'\n")
+        (b / "sacct").write_text("#!/bin/sh\necho '619|mesh|COMPLETED|00:40:00|2026-11-16T07:00:00|2026-11-16T07:40:00|0:0|"
+                                 "spark-0808|18|/home/u/s50_sliding_v14'\necho '620|ncc60|RUNNING|01:02:03|x|Unknown|0:0|"
+                                 "spark-0808|18|/home/u/s50_sliding_v14'\n")
+        for f in b.iterdir():
+            f.chmod(0o755)
+        self.saved = {k: os.environ.get(k) for k in ("HOME", "USER", "PATH")}
+        os.environ.update(HOME=str(h), USER="u", PATH=f"{b}:{os.environ['PATH']}")
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    @staticmethod
+    def remote(host, script, timeout=120):
+        return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
+
+    HOST = {"name": "spark2", "ssh": ""}
+
+    def call(self, host=None, config=None, **args):
+        return I.run(self.remote, host or self.HOST, config or {}, args)
+
+    def test_roots_and_jobs(self):
+        r = self.call(action="roots")
+        self.assertEqual(sorted(Path(x).name for x in r["roots"]), ["ncc_ladder", "s50_sliding_v14"])
+        self.assertEqual(r["machine"], "spark2")
+        r = self.call(action="jobs")
+        self.assertEqual((r["queue"][0]["job"], r["queue"][0]["state"]), ("620", "RUNNING"))
+        self.assertTrue(r["queue"][0]["workdir"].endswith("s50_sliding_v14"))
+        self.assertEqual([j["job"] for j in r["ended"]], ["619"])            # the running one only once
+        self.assertEqual(r["ended"][0]["exit"], "0:0")
+        self.assertIn("bad user", self.call(action="jobs", user="u; rm -rf ~")["error"])
+
+    def test_tail_read_grep_list(self):
+        t = self.call(action="tail", path="~/s50_sliding_v14/log.foamRun.620", lines=2)
+        self.assertEqual(t["lines"], ["Time = 100", "Courant Number mean: 0.1 max: 50.0"])
+        r = self.call(action="read", path="s50_sliding_v14/log.foamRun.620", start=3, lines=2)
+        self.assertEqual(r["lines"], ["Time = 2", "Courant Number mean: 0.1 max: 1.0"])
+        self.assertTrue(r["more"])
+        g = self.call(action="grep", path=str(self.h / "s50_sliding_v14"), files="log.*", pattern=r"max: 4\d\.")
+        self.assertEqual(len(g["matches"]), 20)
+        self.assertEqual(g["matches"][0]["path"], "log.foamRun.620")
+        names = {e["path"] for e in self.call(action="list", path="~/s50_sliding_v14")["entries"]}
+        self.assertTrue({"log.foamRun.620", "processor0", "escape", "pipe"} <= names)
+        self.assertNotIn(".ssh", names)
+
+    def test_outside_and_refusals(self):
+        for p in ("~/private/secret.txt", "~/s50_sliding_v14/../private/secret.txt",
+                  "~/s50_sliding_v14/escape/secret.txt", "/etc/passwd"):
+            self.assertIn("outside the folders", self.call(action="read", path=p)["error"], p)
+        self.assertIn("secret", self.call(action="read", path="~/s50_sliding_v14/.ssh/id_rsa")["error"])
+        self.assertIn("binary", self.call(action="read", path="~/s50_sliding_v14/mesh.bin")["error"])
+        self.assertIn("not a regular file", self.call(action="tail", path="~/s50_sliding_v14/pipe")["error"])
+
+    def test_grep_does_not_follow_a_symlinked_file_out(self):
+        # router 2026.11.16: a file symlinked into a root but pointing outside is not read by grep over the folder
+        (self.h / "private" / "outside.log").write_text("TOPSECRET\n")
+        os.symlink(self.h / "private" / "outside.log", self.h / "s50_sliding_v14" / "log.link")
+        g = self.call(action="grep", path="~/s50_sliding_v14", files="log.*", pattern="TOPSECRET")
+        self.assertEqual(g["matches"], [])
+        self.assertIn("outside the folders", self.call(action="read", path="~/s50_sliding_v14/log.link")["error"])
+
+    def test_no_shell_from_values(self):
+        flag = self.t / "pwned"
+        r = self.call(action="read", path=f"~/s50_sliding_v14/$(touch {flag})'; touch {flag}; '")
+        self.assertIn("error", r)
+        self.call(action="grep", path="~/s50_sliding_v14", pattern=f"'$(touch {flag})", files=f"`touch {flag}`")
+        self.assertFalse(flag.exists())
+
+    def test_roots_from_config_and_checks(self):
+        r = self.call(config={"inspect": {"roots": ["~/ncc_ladder"]}}, action="roots")
+        self.assertEqual([Path(x).name for x in r["roots"]], ["ncc_ladder"])
+        r = self.call(host={**self.HOST, "inspect_roots": []}, action="read", path="~/ncc_ladder/x")
+        self.assertIn("outside", r["error"])
+        with self.assertRaises(ValueError):
+            I.command({"action": "rm"}, [])
+        with self.assertRaises(ValueError):
+            I.command({"action": "read", "path": "x", "lines": "ten"}, [])
+
+    def test_router_tool(self):
+        r = R.Router("cfdt")
+        r.hosts = [{"name": "spark2", "ssh": "", "root": "/x"}]
+        r.router_cfg = {"inspect": {"roots": ["~/s50_*"]}}
+        self.assertIn("inspect", [t["name"] for t in r.tools_list()["tools"]])
+        out = R.Router.parse(r.tool_call("inspect", {"machine": "spark2", "action": "tail",
+                                                     "path": "~/s50_sliding_v14/log.foamRun.620", "lines": 1}))
+        self.assertEqual((out["machine"], out["lines"]), ("spark2", ["Courant Number mean: 0.1 max: 50.0"]))
+        res = r.tool_call("inspect", {"machine": "nowhere", "action": "roots"})
+        self.assertTrue(res.get("isError"))
+        self.assertIn("machine must be one of spark2", R.Router.parse(res)["error"])
+        res = r.tool_call("inspect", {"machine": "spark2", "action": "read", "path": "x", "lines": "ten"})
+        self.assertTrue(res.get("isError"))
+
+
 class ServersList(unittest.TestCase):
     """Item 3: the process list; a symlinked prefix; no match for shells or jobs; own process skipped."""
 

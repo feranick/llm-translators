@@ -1,6 +1,6 @@
 # The router: one translator, several machines
 
-Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2); tool definitions that follow deploys, per-node queues, request names 2026.11.06.1; init_from across machines 2026.11.13.1 (copies judged by the fields' time 2026.11.13.2); run.host checked study by study, memory per study with its reason 2026.11.14.1.
+Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2); tool definitions that follow deploys, per-node queues, request names 2026.11.06.1; init_from across machines 2026.11.13.1 (copies judged by the fields' time 2026.11.13.2); run.host checked study by study, memory per study with its reason 2026.11.14.1; inspect 2026.11.16.1.
 
 Until now, each MCP entry in the Claude app pointed to one machine (`ssh mochi .../bin/mcp cfdt`). With several machines able to run a translator (mochi, carbonio, a DGX Spark), choosing one by hand wastes the others, and one entry per machine (`cfdt-mochi`, `cfdt-carbonio`, ...) multiplies the tools in every chat.
 
@@ -120,6 +120,42 @@ The results stay as the translator wrote them; their paths are real paths on the
 | `machines()` | the router itself | each machine: reachable, mode (release or checkout), `llmt_release` (the llm-translators bundle installed there, named like `2026.10.26.2`; not the translator's version), `version` (the translator's version installed), `serving` (what the server process the router uses runs; `server_stale` and a `note` when it differs), backends, executor, CPUs and their use, the translator's queued and running jobs, load, expected start of a typical job, speed, preferred or excluded |
 
 Answers from a single machine get `"machine": "<name>"` at the top.
+
+## Looking at hand-run work: inspect
+
+Hand-run work (a port's `sbatch` scripts, a mesh ladder, a sampler) is outside the translators: its jobs are not in `jobs()`, and its logs can't be reached with `get_file`. Every router instance therefore offers its own read-only tool, whatever the translator: `inspect(machine, action, ...)` (`llmt_inspect.py`, written in the cfdt chat, router 2026.11.16.1). Any machine of the router may be inspected, excluded ones too, since inspect places nothing.
+
+| action | does |
+|---|---|
+| `jobs` | all of the user's SLURM jobs on the machine: `squeue` now, and `sacct` for those that ended in the last `days` (2, at most 14). Job, name, state, elapsed, limit, nodes, CPUs, where or why, submitted, start, work folder, exit code |
+| `roots` | the allowed folders, as the configured patterns expand on that machine |
+| `list` | a folder: name, type, size, mtime; `depth` 1-3; at most 1000 entries |
+| `read` | `lines` lines (200, at most 2000) of a text file, from line `start` |
+| `tail` | the last `lines` lines (50, at most 2000) |
+| `grep` | a Python regular expression in a file, or in a folder's files matching `files` (a glob, e.g. `log.*`): file, line, text. At most 300 matches, 200 files, 50 MB scanned |
+
+**The allowed folders** come from `setup.json`, never from the call:
+
+```json
+"router": {
+  "inspect": {"roots": ["~/s50_*", "~/ncc_ladder", "~/v2506_ring_sample"]},
+  "hosts": [{"name": "spark2", "...": "...", "inspect_roots": ["~/s50_*", "~/ncc_ladder"]}]
+}
+```
+
+- A machine's own `inspect_roots` replaces `router.inspect.roots`.
+- Without either, the defaults are `~/s50_*`, `~/ncc_ladder` and `~/v2506_ring_sample`.
+- An empty list allows nothing.
+- `~` and globs expand on the machine.
+
+**Why it cannot change anything:**
+
+- **Fixed code.** What runs on the machine is the constant script in `llmt_inspect.py` (`python3 -c '<script>' '<json>'`). The call's values reach it only as one quoted JSON argument, never as shell text. Tests put `$(...)`, backticks and quotes in the path, pattern and file glob, and nothing runs. `jobs` runs `squeue`/`sacct` with fixed arguments, and a user name must match `[A-Za-z0-9_.-]{1,64}`.
+- **Inside the folders only.** Every path is resolved on the machine (`realpath`: symlinks and `..`) and must lie inside a resolved allowed folder. So must every file `grep` opens in a folder: a symlinked file pointing outside is skipped (router 2026.11.16.1). Tests cover `..`, a symlinked folder and file pointing outside, and `/etc/passwd`.
+- **Plain text only.** Only regular files are opened, for reading: a FIFO is refused, so a read never blocks. Binary files are refused (a NUL in the first 8 KB). Names that look like secrets (`.ssh`, `.gnupg`, `.netrc`, `.aws`, `id_*`, `*.pem`, `*.key`, `*.p12`) are refused and left out of listings.
+- **Capped.** At most 200,000 characters of answer, 20 s of work on the machine and 30 s for the ssh call, well within the router's 50 s. Numbers that are not whole numbers are refused before anything is sent.
+
+The machine needs Python 3.6 or newer (`python3`).
 
 ## Starting from a run of another machine (init_from)
 

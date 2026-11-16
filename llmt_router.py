@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.14.2
+Version: 2026.11.16.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.14.2"
+__version__ = "2026.11.16.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -45,6 +45,16 @@ def _load_llmt():
 
 
 L = _load_llmt()
+
+
+def _load_inspect():
+    loader = SourceFileLoader("llmt_inspect", str(HERE / "llmt_inspect.py"))
+    m = importlib.util.module_from_spec(importlib.util.spec_from_loader("llmt_inspect", loader))
+    loader.exec_module(m)
+    return m
+
+
+INSPECT = _load_inspect()     # the read-only inspect tool (allowed folders from setup.json router.inspect.roots)
 
 POOL = 3                 # connections per machine at most
 STUCK_AFTER = 20.0       # a connection whose oldest request waits longer than this is not given new ones
@@ -493,6 +503,7 @@ class Router:
         self.key = key
         self.t = L.REGISTRY[key]
         cfg = (L.load_setup().get("router") or {})
+        self.router_cfg = cfg                  # setup.json's router block (inspect.roots)
         self.hosts = [h for h in cfg.get("hosts", []) if h.get("name") and h.get("root")]
         self.prefer = list(cfg.get("prefer", []))
         self.exclude = set(cfg.get("exclude", []))
@@ -1822,6 +1833,14 @@ class Router:
 
     def tool_call(self, tool: str, args: dict) -> dict:
         deadline = time.time() + BUDGET
+        if tool == "inspect":                 # read-only, under the configured folders; any machine, excluded ones too
+            try:
+                h = self.host(str(args.get("machine") or ""))
+                if not h:
+                    raise ValueError(f"machine must be one of {', '.join(x['name'] for x in self.hosts)}")
+                return self.text_result(INSPECT.run(remote_cmd, h, self.router_cfg, args))
+            except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+                return self.text_result({"error": str(exc), "router": "inspect (read-only)"}, True)
         if tool == "machines":
             return self.text_result(self.machines())
         try:
@@ -2007,7 +2026,9 @@ class Router:
                 f"chooses the machine; machines() shows each one's load, queue and version. Files on this computer "
                 f"(e.g. a STEP file under the home folder) can be given by their local path: the router copies them "
                 f"to the machine and lists them in 'staged'; if it answers status 'uploading', repeat the same call "
-                f"when it says.")
+                f"when it says. inspect(machine, action) looks at work outside {self.key} on a machine, read-only: all "
+                f"of the user's SLURM jobs there ('jobs'), and the files of hand-run cases under the allowed folders "
+                f"('roots', 'list', 'read', 'tail', 'grep').")
         return {"protocolVersion": proto, "capabilities": {"tools": {"listChanged": True}},
                 "serverInfo": {"name": f"{self.key} (llmt-router)", "version": __version__},
                 "instructions": self.instructions + note}
@@ -2020,7 +2041,7 @@ class Router:
                               "backends, executor (local or SLURM), CPUs and their use, this translator's queued and "
                               "running jobs, load, the expected start of a typical job, speed, preferred or excluded.",
                "inputSchema": {"type": "object", "properties": {}}}
-        return {"tools": [t for t in self.tools if t.get("name") != "machines"] + [own]}
+        return {"tools": [t for t in self.tools if t.get("name") not in ("machines", "inspect")] + [own, INSPECT.TOOL]}
 
     def close(self) -> None:
         for pool in self.children.values():
