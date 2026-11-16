@@ -1131,6 +1131,12 @@ class Inspect(unittest.TestCase):
         self.assertEqual(logs["log.ncc.air"]["last_lines"][-1], "Time = 8")
         for gone in ("log.old", "log.decomposed", "slurm-999.out"):
             self.assertNotIn(gone, logs)
+        # log.<name>.<jobid> (sbatch -o log.mesh.%j): linked to the queue too; log.ncc.air has no id
+        self.assertEqual((logs["log.foamRun.620"]["job"], logs["log.foamRun.620"]["running"]), ("620", True))
+        self.assertEqual((logs["log.ncc.air"]["job"], logs["log.ncc.air"]["running"]), (None, None))
+        (case / "log.mesh.623").write_text("cancelled\n")
+        logs = {Path(x["path"]).name: x for x in self.call(action="jobs")["recent_logs"]}
+        self.assertEqual((logs["log.mesh.623"]["job"], logs["log.mesh.623"]["running"]), ("623", False))
         # with accounting the logs come only on request
         (self.t / "bin" / "sacct").write_text("#!/bin/sh\nexit 0\n")
         self.assertNotIn("recent_logs", self.call(action="jobs"))

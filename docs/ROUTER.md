@@ -127,7 +127,7 @@ Checked against spark2 with router 2026.11.16.1: `jobs`, `roots` and `grep` over
 
 | action | does |
 |---|---|
-| `jobs` | all of the user's SLURM jobs on the machine: `squeue` now, and `sacct` for those that ended in the last `days` (2, at most 14). Job, name, state, elapsed, limit, nodes, CPUs, where or why, submitted, start, work folder, exit code. Where SLURM accounting is off (the sparks: `sacct_error` says so), finished jobs leave no record, so `recent_logs` lists the newest `slurm-*.out`, `log.*` and `*.log` files under the allowed folders instead (router 2026.11.16.2): path, size, mtime, the job id from a `slurm-<id>.out` name and whether that job is still queued, and the last 5 lines. At most 30, from the last `days`, up to 4 levels deep, skipping `processor*`, `postProcessing` and `constant`. `logs: true` adds them where accounting works too |
+| `jobs` | all of the user's SLURM jobs on the machine: `squeue` now, and `sacct` for those that ended in the last `days` (2, at most 14). Job, name, state, elapsed, limit, nodes, CPUs, where or why, submitted, start, work folder, exit code. Where SLURM accounting is off (the sparks: `sacct_error` says so), finished jobs leave no record, so `recent_logs` lists the newest `slurm-*.out`, `log.*` and `*.log` files under the allowed folders instead (router 2026.11.16.2): path, size, mtime, the job id from a `slurm-<id>.out` or `log.<name>.<id>` name (`sbatch -o log.mesh.%j`; 2026.11.16.3) and whether that job is still queued, and the last 5 lines. At most 30, from the last `days`, up to 4 levels deep, skipping `processor*`, `postProcessing` and `constant`. `logs: true` adds them where accounting works too |
 | `roots` | the allowed folders, as the configured patterns expand on that machine |
 | `list` | a folder: name, type, size, mtime; `depth` 1-3; at most 1000 entries |
 | `read` | `lines` lines (200, at most 2000) of a text file, from line `start` |
@@ -147,6 +147,7 @@ Checked against spark2 with router 2026.11.16.1: `jobs`, `roots` and `grep` over
 - Without either, the defaults are `~/s50_*`, `~/ncc_ladder` and `~/v2506_ring_sample`.
 - An empty list allows nothing.
 - `~` and globs expand on the machine.
+- **The sparks don't share home folders.** spark1 and spark2 are one SLURM cluster but each has its own home, so `~/s50_*` expands differently on each. A hand-run case lives only on the spark where it was unpacked, and its logs only there. Inspect that spark: `roots` shows which cases each one has. Its SLURM jobs show on both, since the queue is shared, but the files don't.
 
 **Why it cannot change anything:**
 

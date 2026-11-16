@@ -1,6 +1,6 @@
 """llmt_inspect.py: the router's read-only 'inspect' tool (loaded by llmt_router.py; written in the cfdt chat).
-Version: 2026.11.16.3 (jobs without SLURM accounting: recent_logs; 16.2: grep keeps each file inside the roots,
-numbers checked on the router's side)
+Version: 2026.11.16.4 (recent_logs: the job id of log.<name>.<id> too; 16.3: jobs without SLURM accounting lists
+recent_logs; 16.2: grep keeps each file inside the roots, numbers checked on the router's side)
 
 inspect(machine, action, ...) looks at hand-run work on a machine without a translator's server:
   jobs   the user's SLURM jobs (all of them, not only a translator's): squeue now, sacct for the last `days`
@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import shlex
 
-__version__ = "2026.11.16.3"
+__version__ = "2026.11.16.4"
 
 DEFAULT_ROOTS = ["~/s50_*", "~/ncc_ladder", "~/v2506_ring_sample"]
 ACTIONS = ("jobs", "roots", "list", "read", "tail", "grep")
@@ -140,7 +140,9 @@ if act == "jobs":
         found.sort(reverse=True)
         logs = []
         for mt, q, rq, size in found[:30]:
-            m = re.match(r"slurm-(\d+(?:_\d+)?)", os.path.basename(q))
+            # the job id: slurm-<id>.out, or log.<name>.<id> (sbatch -o log.mesh.%j)
+            base = os.path.basename(q)
+            m = re.match(r"slurm-(\d+(?:_\d+)?)", base) or re.match(r"^log\..+\.(\d+(?:_\d+)?)$", base)
             jid = m.group(1) if m else None
             last = []
             try:
