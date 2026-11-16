@@ -901,7 +901,7 @@ class InitFrom(unittest.TestCase):
         self.assertEqual(out["got"]["c4"], {"ref": "run_A@m1_import3/s1", "here": True})
 
     def test_slow_copy_answers_uploading(self):
-        os.environ["FAKE_SLOW"] = "4"                        # the copy into m2 takes longer than this call may wait
+        os.environ["FAKE_SLOW"] = "8"         # the copy into m2 takes clearly longer than this call may wait (~4 s)
         saved = R.BUDGET
         R.BUDGET = 16.0
         try:
