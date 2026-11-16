@@ -123,11 +123,11 @@ Answers from a single machine get `"machine": "<name>"` at the top.
 
 ## Looking at hand-run work: inspect
 
-Hand-run work (a port's `sbatch` scripts, a mesh ladder, a sampler) is outside the translators: its jobs are not in `jobs()`, and its logs can't be reached with `get_file`. Every router instance therefore offers its own read-only tool, whatever the translator: `inspect(machine, action, ...)` (`llmt_inspect.py`, written in the cfdt chat, router 2026.11.16.1). Any machine of the router may be inspected, excluded ones too, since inspect places nothing.
+Checked against spark2 with router 2026.11.16.1: `jobs`, `roots` and `grep` over `log.ncc.*` work. Hand-run work (a port's `sbatch` scripts, a mesh ladder, a sampler) is outside the translators: its jobs are not in `jobs()`, and its logs can't be reached with `get_file`. Every router instance therefore offers its own read-only tool, whatever the translator: `inspect(machine, action, ...)` (`llmt_inspect.py`, written in the cfdt chat, router 2026.11.16.1). Any machine of the router may be inspected, excluded ones too, since inspect places nothing.
 
 | action | does |
 |---|---|
-| `jobs` | all of the user's SLURM jobs on the machine: `squeue` now, and `sacct` for those that ended in the last `days` (2, at most 14). Job, name, state, elapsed, limit, nodes, CPUs, where or why, submitted, start, work folder, exit code |
+| `jobs` | all of the user's SLURM jobs on the machine: `squeue` now, and `sacct` for those that ended in the last `days` (2, at most 14). Job, name, state, elapsed, limit, nodes, CPUs, where or why, submitted, start, work folder, exit code. Where SLURM accounting is off (the sparks: `sacct_error` says so), finished jobs leave no record, so `recent_logs` lists the newest `slurm-*.out`, `log.*` and `*.log` files under the allowed folders instead (router 2026.11.16.2): path, size, mtime, the job id from a `slurm-<id>.out` name and whether that job is still queued, and the last 5 lines. At most 30, from the last `days`, up to 4 levels deep, skipping `processor*`, `postProcessing` and `constant`. `logs: true` adds them where accounting works too |
 | `roots` | the allowed folders, as the configured patterns expand on that machine |
 | `list` | a folder: name, type, size, mtime; `depth` 1-3; at most 1000 entries |
 | `read` | `lines` lines (200, at most 2000) of a text file, from line `start` |

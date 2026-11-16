@@ -1,5 +1,6 @@
 """llmt_inspect.py: the router's read-only 'inspect' tool (loaded by llmt_router.py; written in the cfdt chat).
-Version: 2026.11.16.2 (grep: each file resolved and kept inside the roots; numbers checked on the router's side)
+Version: 2026.11.16.3 (jobs without SLURM accounting: recent_logs; 16.2: grep keeps each file inside the roots,
+numbers checked on the router's side)
 
 inspect(machine, action, ...) looks at hand-run work on a machine without a translator's server:
   jobs   the user's SLURM jobs (all of them, not only a translator's): squeue now, sacct for the last `days`
@@ -21,7 +22,7 @@ from __future__ import annotations
 import json
 import shlex
 
-__version__ = "2026.11.16.2"
+__version__ = "2026.11.16.3"
 
 DEFAULT_ROOTS = ["~/s50_*", "~/ncc_ladder", "~/v2506_ring_sample"]
 ACTIONS = ("jobs", "roots", "list", "read", "tail", "grep")
@@ -32,7 +33,8 @@ TOOL = {
     "description": (
         "Read-only look at a machine outside the translator: action 'jobs' lists all of the user's SLURM jobs there "
         "(queued and running, and those that ended in the last `days`, 2 by default), with name, state, times, "
-        "nodes, work folder and exit code; 'roots' lists the folders that may be read; 'list' a folder, 'read' or "
+        "nodes, work folder and exit code; where SLURM accounting is off (no ended jobs), 'recent_logs' gives the "
+        "newest slurm-*.out / log.* files under the allowed folders with their last lines; 'roots' lists the folders that may be read; 'list' a folder, 'read' or "
         "'tail' a text file, 'grep' a regular expression in a file or a folder's files (`files`: a glob such as "
         "'log.*'). Only under the allowed folders (hand-run cases such as ~/s50_*), nothing is changed. Paths: "
         "absolute, '~/...', or relative to the home folder."),
@@ -48,6 +50,8 @@ TOOL = {
             "files": {"type": "string", "description": "grep in a folder: which files (a glob, '*' by default)"},
             "depth": {"type": "integer", "description": "list: levels below the folder (1; at most 3)"},
             "days": {"type": "integer", "description": "jobs: ended jobs of the last days (2; at most 14)"},
+            "logs": {"type": "boolean", "description": "jobs: also the newest log files under the allowed folders "
+                                                       "(automatic where SLURM accounting is off)"},
             "user": {"type": "string", "description": "jobs: whose jobs (the ssh user by default)"},
         },
         "required": ["machine", "action"],
@@ -105,8 +109,54 @@ if act == "jobs":
     live = set(q["job"] for q in queue)
     ended = [dict(zip(f2, l.split("|", len(f2) - 1))) for l in o2.splitlines() if l.strip()]
     ended = [j for j in ended if j["job"] not in live][-200:]
-    out({"user": user, "queue": queue, "ended": ended, "days": days,
-         "sacct_error": (e2.strip()[-300:] if rc2 != 0 else None)})
+    res = {"user": user, "queue": queue, "ended": ended, "days": days,
+           "sacct_error": (e2.strip()[-300:] if rc2 != 0 else None)}
+    # without SLURM accounting (the sparks) a finished job leaves no trace in squeue/sacct: its logs do. The newest
+    # slurm-*.out, log.*, *.log under the allowed folders, with their last lines (also on request: logs=true)
+    if rc2 != 0 or a.get("logs"):
+        cut = time.time() - days * 86400; found = []
+        def ok_path(q):
+            return not DENY.search(q) and any(q == x or q.startswith(x.rstrip("/") + "/") for x in roots)
+        for r in roots:
+            for dp, dns, fns in os.walk(r):
+                dns[:] = sorted(d for d in dns if not DENY.search(os.path.join(dp, d))
+                                and not d.startswith("processor") and d not in ("postProcessing", "constant"))
+                if dp[len(r):].count("/") >= 4:
+                    dns[:] = []
+                for n in fns:
+                    if not (fnmatch.fnmatch(n, "slurm-*.out") or fnmatch.fnmatch(n, "log.*") or fnmatch.fnmatch(n, "*.log")):
+                        continue
+                    q = os.path.join(dp, n); rq = os.path.realpath(q)
+                    if not ok_path(rq):
+                        continue
+                    try:
+                        s = os.stat(rq)
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(s.st_mode) and s.st_mtime >= cut:
+                        found.append((s.st_mtime, q, rq, s.st_size))
+                if time.time() - T0 > 10:
+                    break
+        found.sort(reverse=True)
+        logs = []
+        for mt, q, rq, size in found[:30]:
+            m = re.match(r"slurm-(\d+(?:_\d+)?)", os.path.basename(q))
+            jid = m.group(1) if m else None
+            last = []
+            try:
+                with open(rq, "rb") as f:
+                    f.seek(max(0, size - 8192)); data = f.read(8192)
+                if b"\0" not in data:
+                    last = [l.decode("utf-8", "replace") for l in data.split(b"\n") if l.strip()][-5:]
+            except OSError:
+                pass
+            logs.append({"path": q, "size": size, "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mt)),
+                         "job": jid, "running": (jid in live) if jid else None, "last_lines": last})
+        res["recent_logs"] = logs
+        if rc2 != 0:
+            res["note"] = ("no SLURM accounting here, so finished jobs are not listed: recent_logs are the newest log "
+                           "files under the allowed folders (last %d days), with their last lines" % days)
+    out(res)
 path = a.get("path") or ""
 if not path:
     fail("give 'path'")
@@ -244,8 +294,10 @@ def command(args: dict, roots: list) -> str:
     act = args.get("action")
     if act not in ACTIONS:
         raise ValueError(f"action must be one of {', '.join(ACTIONS)}")
-    keep = {k: args[k] for k in ("action", "path", "lines", "start", "pattern", "files", "depth", "days", "user")
-            if args.get(k) is not None}
+    keep = {k: args[k] for k in ("action", "path", "lines", "start", "pattern", "files", "depth", "days", "user",
+                                 "logs") if args.get(k) is not None}
+    if "logs" in keep:
+        keep["logs"] = bool(keep["logs"])
     for k in ("lines", "start", "depth", "days"):
         if k in keep:
             try:

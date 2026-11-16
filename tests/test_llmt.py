@@ -1102,6 +1102,40 @@ class Inspect(unittest.TestCase):
         self.assertEqual(r["ended"][0]["exit"], "0:0")
         self.assertIn("bad user", self.call(action="jobs", user="u; rm -rf ~")["error"])
 
+    def test_jobs_without_accounting_lists_recent_logs(self):
+        # the sparks: "Slurm accounting storage is disabled", so a finished hand-run job leaves only its logs
+        (self.t / "bin" / "sacct").write_text("#!/bin/sh\necho 'sacct: error: Slurm accounting storage is disabled' >&2\n"
+                                              "exit 1\n")
+        case = self.h / "s50_sliding_v14"
+        (case / "slurm-619.out").write_text("meshing\n...\nEnd\n")                    # finished (not in squeue)
+        (case / "slurm-620.out").write_text("Time = 7\n")                             # running (squeue lists 620)
+        (case / "log.ncc.air").write_text("".join(f"Time = {i}\n" for i in range(1, 9)))
+        old = case / "log.old"
+        old.write_text("long ago\n")
+        os.utime(old, (time.time() - 5 * 86400,) * 2)                                 # older than days=2
+        (case / "processor0" / "log.decomposed").write_text("skipped\n")              # decomposed folders not walked
+        (self.h / "private" / "slurm-999.out").write_text("outside\n")
+        os.symlink(self.h / "private" / "slurm-999.out", case / "slurm-999.out")     # points outside: left out
+        for i, p in enumerate((case / "log.foamRun.620", case / "slurm-619.out", case / "slurm-620.out",
+                               case / "log.ncc.air")):
+            os.utime(p, (time.time() - 400 + 100 * i,) * 2)                             # newest last
+        r = self.call(action="jobs")
+        self.assertEqual(r["ended"], [])
+        self.assertIn("accounting", r["sacct_error"])
+        self.assertIn("no SLURM accounting here", r["note"])
+        logs = {Path(x["path"]).name: x for x in r["recent_logs"]}
+        self.assertEqual([Path(x["path"]).name for x in r["recent_logs"]][:3], ["log.ncc.air", "slurm-620.out", "slurm-619.out"])
+        self.assertEqual((logs["slurm-619.out"]["job"], logs["slurm-619.out"]["running"]), ("619", False))
+        self.assertEqual((logs["slurm-620.out"]["job"], logs["slurm-620.out"]["running"]), ("620", True))
+        self.assertEqual(logs["slurm-619.out"]["last_lines"], ["meshing", "...", "End"])
+        self.assertEqual(logs["log.ncc.air"]["last_lines"][-1], "Time = 8")
+        for gone in ("log.old", "log.decomposed", "slurm-999.out"):
+            self.assertNotIn(gone, logs)
+        # with accounting the logs come only on request
+        (self.t / "bin" / "sacct").write_text("#!/bin/sh\nexit 0\n")
+        self.assertNotIn("recent_logs", self.call(action="jobs"))
+        self.assertIn("slurm-619.out", {Path(x["path"]).name for x in self.call(action="jobs", logs=True)["recent_logs"]})
+
     def test_tail_read_grep_list(self):
         t = self.call(action="tail", path="~/s50_sliding_v14/log.foamRun.620", lines=2)
         self.assertEqual(t["lines"], ["Time = 100", "Courant Number mean: 0.1 max: 50.0"])
