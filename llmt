@@ -56,7 +56,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.11.12.3"
+__version__ = "2026.11.17.1"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -2088,12 +2088,28 @@ def switch_current(prefix: Path, rel: Path) -> None:
     os.replace(tmp, prefix / "current")
 
 
-def releases_in_use(prefix: Path) -> dict[str, list[str]]:
-    """Releases that running processes (MCP servers, their workers, running jobs) or queued SLURM jobs use."""
-    base = str((prefix / "releases").resolve()) + "/"
-    pat = re.compile(re.escape(base) + r"([0-9.]+)/")
+def releases_in_use(prefix: Path, proc: Path = Path("/proc"), slurm: bool = True) -> dict[str, list[str]]:
+    """Releases that running processes (MCP servers, their workers, running jobs) or queued SLURM jobs use:
+    - a process whose program or script (the first two words of its command line) is in a release;
+    - a process whose environment (PATH, VIRTUAL_ENV) is in a release's venv: a hand-run job that sourced
+      <release>/.venv/bin/activate (spark2 job 636, 2026-11-17, ran from 2026.11.16.2 only through its PATH and gc
+      removed it mid-run). /proc/<pid>/environ is readable for one's own processes, and for all as root (gc runs with
+      sudo); it holds the environment a process started with, so a job's python, started after activate, has it;
+    - a queued job whose batch script mentions a release."""
+    rel = prefix / "releases"
+    bases = list(dict.fromkeys([str(rel.resolve()) + "/", str(rel.absolute()) + "/"]))   # a symlinked prefix too
+    pats = [re.compile(re.escape(b) + r"([0-9.]+)/") for b in bases]
     used: dict[str, list[str]] = {}
-    proc = Path("/proc")
+
+    def owner(d: Path) -> str:
+        try:
+            import pwd
+            return pwd.getpwuid(d.stat().st_uid).pw_name
+        except (ImportError, KeyError, OSError):
+            return ""
+
+    def names(text: str) -> set:
+        return {n for p in pats for n in p.findall(text + " ")}
     if proc.is_dir():
         for d in proc.iterdir():
             if not d.name.isdigit():
@@ -2103,15 +2119,19 @@ def releases_in_use(prefix: Path) -> dict[str, list[str]]:
                 cmd = " ".join(x.decode(errors="replace") for x in argv)
             except OSError:
                 continue
-            for name in set(pat.findall(cmd + " ")):
-                who = ""
-                try:
-                    import pwd
-                    who = pwd.getpwuid(d.stat().st_uid).pw_name
-                except (ImportError, KeyError, OSError):
-                    pass
+            found = names(cmd)
+            for name in found:
+                who = owner(d)
                 used.setdefault(name, []).append(f"process {d.name}" + (f" ({who})" if who else ""))
-    if shutil.which("squeue"):
+            try:  # its environment: PATH and VIRTUAL_ENV only (not other variables that may mention a path)
+                env = (d / "environ").read_bytes().split(b"\0")
+            except OSError:          # another user's process (not root), or it has ended
+                continue
+            text = " ".join(e.decode(errors="replace") for e in env if e.startswith((b"PATH=", b"VIRTUAL_ENV=")))
+            for name in names(text) - found:
+                who = owner(d)
+                used.setdefault(name, []).append(f"process {d.name} (venv" + (f", {who}" if who else "") + ")")
+    if slurm and shutil.which("squeue"):
         try:
             r = subprocess.run(["squeue", "-h", "-o", "%i|%u|%o"], capture_output=True, text=True, timeout=20)
             for line in r.stdout.splitlines():
@@ -2120,7 +2140,7 @@ def releases_in_use(prefix: Path) -> dict[str, list[str]]:
                     text = Path(script).read_text(errors="replace")[:20000]
                 except OSError:
                     continue
-                for name in set(pat.findall(text)):
+                for name in names(text):
                     used.setdefault(name, []).append(f"job {jid} ({user})")
         except (OSError, subprocess.TimeoutExpired):
             pass

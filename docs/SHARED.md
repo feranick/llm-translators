@@ -67,7 +67,7 @@ A personal checkout also reads `/etc/llm-translators/env` first, so its backend 
 | `llmt releases` | Lists the releases, with which one is current, their translators and versions, and whether they are in use |
 | `llmt rollback [RELEASE]` | Switches `current` back to the previous release (or the one named) |
 | `llmt servers [--stop]` | Lists the translator MCP servers running on the machine (user, release) and flags those not on `current`; `--stop` ends them (SIGTERM), never jobs or other processes |
-| `llmt gc [--keep N]` | Deletes old releases: never `current`, never one in use, and always keeps the newest N (default 3) |
+| `llmt gc [--keep N]` | Deletes old releases: never `current`, never one in use, and always keeps the newest N (default 3). "In use": a process whose program or script is in the release; a process whose `PATH` or `VIRTUAL_ENV` is in its venv, i.e. a hand-run job that sourced `<release>/.venv/bin/activate` (shown as "process N (venv, user)", llmt 2026.11.17.1); a queued job whose script names it. Run it with sudo, so every user's processes are seen |
 | `llmt tune --system`, `llmt env --system [--edit]` | Machine settings in `/etc/llm-translators/env` |
 
 `llmt deploy` in detail:

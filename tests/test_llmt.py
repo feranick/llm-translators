@@ -1283,6 +1283,40 @@ class Orphans(unittest.TestCase):
             self.assertEqual(found[503599]["kind"], "worker")
 
 
+class ReleasesInUse(unittest.TestCase):
+    """llmt gc / releases: what holds a release, through the command line or a venv's PATH / VIRTUAL_ENV."""
+
+    def test_venv_environment(self):
+        with tempfile.TemporaryDirectory() as t:
+            t = Path(t)
+            real = t / "data"
+            for rel in ("2026.11.16.1", "2026.11.16.2", "2026.11.17.1"):
+                (real / "releases" / rel / ".venv" / "bin").mkdir(parents=True)
+            prefix = t / "opt"
+            prefix.symlink_to(real)                                  # a symlinked prefix
+            proc = t / "proc"
+
+            def p(pid, argv, env=None):
+                d = proc / str(pid)
+                d.mkdir(parents=True)
+                (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+                if env is None:
+                    (d / "environ").mkdir()                          # unreadable as a file: another user's process
+                else:
+                    (d / "environ").write_bytes(b"\0".join(f"{k}={v}".encode() for k, v in env.items()) + b"\0")
+            v162 = f"{prefix}/releases/2026.11.16.2/.venv"          # what activate put in PATH: the literal prefix
+            # spark2 job 636: sbatch --wrap 'source <release>/.venv/bin/activate && python run.py'
+            p(636, ["python", "run.py"], {"PATH": f"{v162}/bin:/usr/bin", "VIRTUAL_ENV": v162, "HOME": "/h"})
+            p(700, [f"{real}/releases/2026.11.17.1/.venv/bin/python", "x-mcp"], {"PATH": "/usr/bin"})
+            p(701, ["bash"], {"PATH": "/usr/bin", "OLDPWD": f"{prefix}/releases/2026.11.16.1/"})  # not PATH: ignored
+            p(702, ["sleep", "1"])                                   # environ unreadable: skipped, no error
+            used = L.releases_in_use(prefix, proc=proc, slurm=False)
+            self.assertEqual(sorted(used), ["2026.11.16.2", "2026.11.17.1"])
+            self.assertTrue(used["2026.11.16.2"][0].startswith("process 636 (venv"))
+            self.assertEqual(len(used["2026.11.16.2"]), 1)           # PATH and VIRTUAL_ENV: one entry
+            self.assertNotIn("venv", used["2026.11.17.1"][0])        # found by its command line already
+
+
 class PinCheck(unittest.TestCase):
     """Item 4: a pin behind the newest commit of its branch."""
 
