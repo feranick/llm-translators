@@ -659,7 +659,9 @@ class Router:
                            version=d.get("version"), backends_missing=miss, executor=ex,
                            slurm={k: sl.get(k) for k in ("cpus", "cpus_allocated", "time_limit", "state", "nodes_usable",
                                                          "node", "cluster_nodes", "nodes", "shared_home",
-                                                         "cluster_cpus", "cluster_cpus_allocated")}
+                                                         "cluster_cpus", "cluster_cpus_allocated", "PriorityType",
+                                                         "PriorityFlags", "PriorityWeightAge", "SchedulerType",
+                                                         "chain_together", "chain_together_why")}
                            if sl else None,
                            queue=self.count_jobs(jobs) if sl else None)
                 # a node of a cluster of several (the sparks): its own jobs; the whole cluster's apart
@@ -867,8 +869,8 @@ class Router:
         would start at about that job's end, it starts when the block ends (status 'chains': end_min, an upper bound
         from the jobs' limits)."""
         wait, why = res
-        if wait is None or wait < 0.5:
-            return res
+        if wait is None or wait < 0.5 or ((st.get("slurm") or {}).get("chain_together") == "no"):
+            return res                     # (a scheduler where the next job does not go first: no block)
         blocks = [c for c in st.get("chains") or [] if c.get("time_left_min") is not None and c.get("end_min")
                   and c["time_left_min"] <= wait + 5 and c["end_min"] > wait]
         if not blocks:
@@ -1911,7 +1913,40 @@ class Router:
             info["warnings"] = warnings
         if refs:
             info["_init_refs"] = refs           # for tool_call: the copies (taken out of the answer)
+        self.chain_default(best["machine"], sts.get(best["machine"]) or {}, send.get(arg) if arg else None, info)
         return best["machine"], send, info
+
+    def chain_default(self, machine: str, st: dict, studies, info: dict) -> None:
+        """A multi-job run's chain mode, where the translator has one (translators.json chain: {path, modes}, cfdt's
+        solve.transient.chain, 'together' by default): on a machine whose scheduler does not let the next job go first
+        (llmt status: slurm.chain_together 'no', priority/multifactor with an age weight), 'together' would hold no
+        node, so a study that does not choose is sent with 'share', and the answer says so. A study's own choice is
+        kept, with a warning when it is 'together' there."""
+        spec = self.t.get("chain") or {}
+        sl = st.get("slurm") or {}
+        if not spec.get("path") or not isinstance(studies, dict) or sl.get("chain_together") != "no":
+            return
+        keys = spec["path"].split(".")
+        set_to, kept = [], []
+        for k, s in studies.items():
+            parent = s
+            for key in keys[:-1]:
+                parent = parent.get(key) if isinstance(parent, dict) else None
+            if not isinstance(parent, dict):
+                continue                       # not a multi-job study (no solve.transient)
+            if keys[-1] not in parent:
+                parent[keys[-1]] = spec.get("share", "share")
+                set_to.append(k)
+            elif parent[keys[-1]] == spec.get("together", "together"):
+                kept.append(k)
+        why = sl.get("chain_together_why") or "the next job does not go first"
+        if set_to:
+            info.setdefault("warnings", []).append(
+                f"{spec['path']} set to '{spec.get('share', 'share')}' for {', '.join(set_to)} on {machine}: {why}")
+        if kept:
+            info.setdefault("warnings", []).append(
+                f"{spec['path']} 'together' kept for {', '.join(kept)} as given, but on {machine} {why}: the run may "
+                f"not keep the node between its jobs")
 
     @staticmethod
     def take_host(args: dict) -> tuple:

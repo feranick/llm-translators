@@ -36,6 +36,7 @@
    "status": true,
    "bench": true,
    "executor": {"prefix": "FEAT", "kind": "threads", "min_minutes": 5},
+   "after_since": "2026.11.18.1",
    "backends": [
     {"key": "ccx", "name": "CalculiX (ccx)", "doc": "calculix",
      "without": "the reference solver runs static, modal and thermal on small meshes; no buckling"},
@@ -75,6 +76,7 @@
    "bench": true,
    "executor": {"prefix": "CFDT", "kind": "mpi", "min_minutes": 0},
    "after_since": "2026.11.18.3",
+   "chain": {"path": "solve.transient.chain", "together": "together", "share": "share"},
    "tuning": {"procs": "CFDT_PROCS", "workers": "CFDT_WORKERS", "workers_default": 2,
               "set": {"CFDT_TIMEOUT": "10800"}, "why": "3 h per study: OpenFOAM runs on a workstation are long"},
    "backends": [
@@ -117,6 +119,7 @@
    "status": true,
    "bench": true,
    "executor": {"prefix": "LMPT", "kind": "mpi", "min_minutes": 1},
+   "after_since": "2026.11.18.1",
    "tuning": {"procs": "LMPT_PROCS", "workers": "LMPT_WORKERS", "workers_default": 2, "set": {}},
    "backends": [
     {"key": "lammps", "name": "LAMMPS", "doc": "lammps", "without": "nothing runs (inputs can still be written)"}
@@ -163,6 +166,7 @@
    "status": true,
    "bench": true,
    "executor": {"prefix": "OMCT", "kind": "threads", "min_minutes": 1},
+   "after_since": "2026.11.18.1",
    "tuning": {"procs": "OMCT_PROCS", "workers": "OMCT_WORKERS", "workers_default": 2, "set": {},
               "why": ""},
    "backends": [

@@ -864,11 +864,44 @@ def slurm_info() -> dict | None:
         r = subprocess.run(["scontrol", "show", "config"], capture_output=True, text=True, timeout=20)
         for line in r.stdout.splitlines():
             k, _, v = line.partition("=")
-            if k.strip() in ("SelectType", "SelectTypeParameters", "AccountingStorageType"):
+            if k.strip() in ("SelectType", "SelectTypeParameters", "AccountingStorageType") + SCHED_KEYS:
                 info[k.strip()] = v.strip()
     except (OSError, subprocess.TimeoutExpired):
         pass
+    if any(k in info for k in SCHED_KEYS):
+        info["chain_together"], info["chain_together_why"] = chain_holds(info)
     return info
+
+
+SCHED_KEYS = ("PriorityType", "PriorityFlags", "PriorityWeightAge", "SchedulerType")
+
+
+def chain_holds(cfg: dict) -> tuple[str, str]:
+    """Whether a multi-job run's next job, submitted while the current one runs and waiting for it (cfdt's chain
+    'together'), goes before jobs submitted after it once the current one ends: 'yes', 'no' or 'unknown', and why.
+    It does when the queue is ordered by submission (priority/basic), or when age counts from submission
+    (PriorityFlags ACCRUE_ALWAYS), or when age does not count (PriorityWeightAge 0: equal priorities, the older job
+    first). Under priority/multifactor with an age weight and without ACCRUE_ALWAYS, a job waiting for a dependency
+    gains no age, so jobs that were already eligible when it was submitted rank above it: the run does not keep the
+    node, and 'share' is the honest default there."""
+    pt = (cfg.get("PriorityType") or "").strip()
+    flags = {f.strip().upper() for f in re.split(r"[,\s]+", cfg.get("PriorityFlags") or "") if f.strip()}
+    try:
+        age = float(re.match(r"\s*(\d+(?:\.\d+)?)", str(cfg.get("PriorityWeightAge") or "")).group(1))
+    except (AttributeError, ValueError):
+        age = None
+    if pt.endswith("basic"):
+        return "yes", "priority/basic: jobs go in the order they were submitted"
+    if not pt.endswith("multifactor"):
+        return "unknown", f"PriorityType {pt or 'not reported'}"
+    if "ACCRUE_ALWAYS" in flags:
+        return "yes", "priority/multifactor with ACCRUE_ALWAYS: a waiting job's age counts from its submission"
+    if age == 0:
+        return "yes", "priority/multifactor without an age weight (PriorityWeightAge 0): the earlier job goes first"
+    if age is None:
+        return "unknown", "priority/multifactor, PriorityWeightAge not reported"
+    return "no", (f"priority/multifactor with PriorityWeightAge {age:g} and without ACCRUE_ALWAYS: a job waiting for "
+                  f"a dependency gains no age, so jobs already eligible go first once the current job ends")
 
 
 def slurm_nodes() -> list[dict]:

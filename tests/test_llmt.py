@@ -1267,6 +1267,42 @@ class AfterChainsCancel(unittest.TestCase):
             r.place("run_studies", {"studies": {"p": {}, "q": {"run": {"after": "p"}}}})
         self.assertIn("cfdt does not accept run.after yet", str(cm.exception))
 
+    def test_scheduler_decides_whether_together_holds(self):
+        """llmt status reads PriorityType, PriorityFlags, PriorityWeightAge and SchedulerType; under multifactor with
+        an age weight and without ACCRUE_ALWAYS the next job of a 'together' chain does not go first (2026.11.18.2)."""
+        f = L.chain_holds
+        self.assertEqual(f({"PriorityType": "priority/basic"})[0], "yes")
+        self.assertEqual(f({"PriorityType": "priority/multifactor", "PriorityWeightAge": "1000",
+                            "PriorityFlags": "ACCRUE_ALWAYS,SMALL_RELATIVE_TO_TIME"})[0], "yes")
+        self.assertEqual(f({"PriorityType": "priority/multifactor", "PriorityWeightAge": "0"})[0], "yes")
+        no = f({"PriorityType": "priority/multifactor", "PriorityWeightAge": "1000", "PriorityFlags": ""})
+        self.assertEqual(no[0], "no")
+        self.assertIn("gains no age", no[1])
+        self.assertEqual(f({"PriorityType": "priority/multifactor"})[0], "unknown")
+        self.assertEqual(f({"PriorityType": ""})[0], "unknown")
+        # the router: no block on such a node, and a transient study that does not choose is sent with 'share'
+        st = {"chains": [{"time_left_min": 98.0, "end_min": 610.0, "segment": 2, "max_jobs": 3, "study": "run_A/a",
+                          "job": "349"}], "slurm": {"chain_together": "no", "chain_together_why": no[1]}}
+        self.assertEqual(R.Router.chain_block((100.0, "x"), st), (100.0, "x"))
+        r = self.router()
+        plain = r.statuses
+        r.statuses = lambda names, fresh=False, wait=0: {
+            n: dict(s, slurm=dict(chain_together="no", chain_together_why=no[1])) for n, s in plain(names, fresh, wait).items()}
+        studies = {"t": {"solve": {"transient": {"end_time": 1}}},
+                   "g": {"solve": {"transient": {"end_time": 1, "chain": "together"}}},
+                   "s": {"solve": {}}}
+        name, send, info = r.place("run_studies", {"studies": copy.deepcopy(studies)})
+        self.assertEqual(send["studies"]["t"]["solve"]["transient"]["chain"], "share")
+        self.assertEqual(send["studies"]["g"]["solve"]["transient"]["chain"], "together")    # its own choice
+        self.assertNotIn("transient", send["studies"]["s"]["solve"])
+        self.assertTrue(any("solve.transient.chain set to 'share' for t" in w for w in info["warnings"]))
+        self.assertTrue(any("'together' kept for g" in w for w in info["warnings"]))
+        # where the next job does go first, nothing is changed
+        r.statuses = lambda names, fresh=False, wait=0: {
+            n: dict(s, slurm=dict(chain_together="yes")) for n, s in plain(names, fresh, wait).items()}
+        _, send, _ = r.place("run_studies", {"studies": copy.deepcopy(studies)})
+        self.assertNotIn("chain", send["studies"]["t"]["solve"]["transient"])
+
     def test_together_chain_is_one_block(self):
         st = {"chains": [{"time_left_min": 98.0, "end_min": 610.0, "segment": 2, "max_jobs": 3, "study": "run_A/a",
                           "job": "349"}]}

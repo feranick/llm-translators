@@ -229,7 +229,8 @@ A study waits until every listed run has ended. With `"any"` (the default), it s
 
 - **Where.** A ref names a run of the same machine: `<request>/<study>` under the output folder, an absolute study folder, or `<study>` of the same request. The router places the study on the machine that holds the runs it names. A `run.host` that disagrees, or refs to runs of two machines, are refused before anything is placed.
 - **Validation.** Translators accept `after` and `after_mode` among their `run` keys, and call `RT.jobs.after_problems(request, name, study, studies)`. It checks that the ref exists on this machine, isn't the study itself, and closes no cycle, within the request or through other requests.
-  - Which translators accept it: `translators.json`'s `after_since` names the first release that does (cfdt 2026.11.18.3). The router refuses `run.after` for a translator without one, or on a machine whose installed version is older, naming the version needed (2026.11.18.2). Add `after_since` when a translator's release accepts it.
+  - Only a SLURM job can wait (llmt-runtime 2026.11.18.2): with `P_EXECUTOR=slurm` a study with `run.after` is always a SLURM job, whatever its estimate; where the executor is local, or with `queue: false`, validation refuses it.
+  - Which translators accept it: `translators.json`'s `after_since` names the first release that does (cfdt 2026.11.18.3, feat, lmpt and omct 2026.11.18.1). The router refuses `run.after` for a translator without one, or on a machine whose installed version is older, naming the version needed (2026.11.18.2). Add `after_since` when a translator's release accepts it.
 - **Waiting** is the runtime's `submit`:
   - It registers the study in each listed run's `waiters.json`.
   - It submits with `--dependency=afterany:<their newest jobs>`. A listed study of the same request that isn't submitted yet holds it (`--hold`).
