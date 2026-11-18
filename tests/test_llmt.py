@@ -41,6 +41,7 @@ def load(name: str, file: str):
 
 L = load("llmt", "llmt")
 R = load("llmt_router", "llmt_router.py")
+R.TOOLS_CACHE_DIR = None    # the tests ask the machines at every start (one test turns the saved list on)
 
 FAKE_SERVER = textwrap.dedent('''\
     #!/usr/bin/env python3
@@ -194,6 +195,48 @@ class NewestTools(unittest.TestCase):
                 self.assertIn("2026.10.25.6", r.tools[0]["description"])
             finally:
                 r.close()
+
+    def test_saved_list_answers_at_once(self):
+        """With a saved tool list, initialize answers without asking the machines; the list read afterwards
+        replaces it, is saved, and the client is told it changed."""
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t) / "m"
+            (root / "bin").mkdir(parents=True)
+            (root / "bin" / "mcp").write_text(FAKE_SERVER)
+            (root / "llmt").write_text(FAKE_LLMT)
+            os.chmod(root / "bin" / "mcp", 0o755)
+            (root / "INSTALLED").write_text("2026.10.22.10\n")
+            saved = R.TOOLS_CACHE_DIR
+            R.TOOLS_CACHE_DIR = Path(t) / "cache"
+            try:
+                r = R.Router("lmpt")                       # no saved list: asks the machine, then saves it
+                r.hosts, r.prefer, r.exclude = [{"name": "m", "ssh": "", "root": str(root)}], [], set()
+                r.initialize({"protocolVersion": "2025-06-18"})
+                r.close()
+                f = R.TOOLS_CACHE_DIR / "router_tools_lmpt.json"
+                self.assertEqual(json.loads(f.read_text())["version"], "2026.10.22.10")
+
+                (root / "INSTALLED").write_text("2026.10.25.6\n")   # a deploy since
+                r = R.Router("lmpt")
+                r.hosts, r.prefer, r.exclude = [{"name": "m", "ssh": "", "root": str(root)}], [], set()
+                told = []
+                r.notify = lambda: told.append(1)
+                t0 = time.time()
+                res = r.initialize({"protocolVersion": "2025-06-18"})
+                try:
+                    self.assertLess(time.time() - t0, 0.5)
+                    self.assertEqual(res["protocolVersion"], "2025-06-18")
+                    self.assertIn("2026.10.22.10", r.tools_list()["tools"][0]["description"])
+                    end = time.time() + 15
+                    while not told and time.time() < end:
+                        time.sleep(0.05)
+                    self.assertEqual(told, [1])
+                    self.assertIn("2026.10.25.6", r.tools_list()["tools"][0]["description"])
+                    self.assertEqual(json.loads(f.read_text())["version"], "2026.10.25.6")
+                finally:
+                    r.close()
+            finally:
+                R.TOOLS_CACHE_DIR = saved
 
     def test_vkey(self):
         self.assertEqual(R.vkey("2026.11.02.1"), R.vkey("2026.11.2.1"))

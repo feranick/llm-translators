@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.18.2
+Version: 2026.11.18.3
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.18.2"
+__version__ = "2026.11.18.3"
 
 HERE = Path(__file__).resolve().parent
 
@@ -73,6 +73,7 @@ ALL_TOOLS = {"jobs", "list_geometry"}
 BROADCAST_TOOLS = {"add_geometry"}
 READ_ONLY = {"get_file", "get_image"}
 PATHS_FILE = L.CONFIG_DIR / "router_paths.json"
+TOOLS_CACHE_DIR = L.CONFIG_DIR   # router_tools_<KEY>.json: the last tool list, so initialize answers at once (None: off)
 MB = 1024 * 1024
 UPLOAD_MB = 500.0        # largest local file the router copies to a machine, unless <KEY>_MAX_UPLOAD_MB says otherwise
 STAGE_ALL_MB = 25.0      # placement copies local files to every candidate (to validate there) only up to this in total
@@ -735,6 +736,7 @@ class Router:
                 if changed:
                     self.set_tools(tools)
                 self.tools_version = version
+                self.save_tools_cache((c.init_result or {}).get("protocolVersion"))
                 log(f"{name}: tool definitions of {self.key} {version}" + (" (changed: the client is told)" if changed else ""))
         except ChildError as exc:
             log(f"{name}: could not read the tool definitions of {self.key} {version}: {exc}")
@@ -2207,12 +2209,42 @@ class Router:
                              "run.host in a study chooses; preferred machines win ties (docs/ROUTER.md)"}
 
     # ---- the MCP server side
-    def initialize(self, params: dict) -> dict:
-        self.init_params = params or {}
+    # ---- the last tool list, kept so that initialize answers at once (clients with a short startup limit)
+    def tools_cache_file(self) -> Path | None:
+        return Path(TOOLS_CACHE_DIR) / f"router_tools_{self.key}.json" if TOOLS_CACHE_DIR else None
+
+    def load_tools_cache(self) -> dict | None:
+        p = self.tools_cache_file()
+        if p is None:
+            return None
+        try:
+            d = json.loads(p.read_text())
+        except (OSError, ValueError):
+            return None
+        return d if isinstance(d, dict) and isinstance(d.get("tools"), list) and d["tools"] else None
+
+    def save_tools_cache(self, proto: str | None = None) -> None:
+        p = self.tools_cache_file()
+        if p is None or not self.tools:
+            return
+        data = {"key": self.key, "version": self.tools_version, "router": __version__,
+                "saved": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                "protocolVersion": proto, "instructions": self.instructions, "tools": self.tools}
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_name(f"{p.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")   # saves may overlap
+            tmp.write_text(json.dumps(data, indent=1))
+            os.replace(tmp, p)
+        except OSError as exc:
+            log(f"tool list not saved ({p}): {exc}")
+
+    def discover_tools(self, params: dict, background: bool) -> str | None:
+        """Reads the tool definitions from a machine with the newest version installed (a new server there runs
+        it): a client drops arguments its definitions lack, so an older machine's list would hide new ones.
+        In the background (initialize answered from the saved list), a changed list is announced to the client
+        (notifications/tools/list_changed). -> the protocol version the machine's server answered, if one did."""
         errors = []
         t_end = time.time() + 40.0
-        # the tool definitions come from a machine with the newest version installed (a new server there runs it):
-        # a client drops arguments its definitions lack, so an older machine's list would hide new ones
         order = self.ordered() or self.hosts
         sts = self.statuses([h["name"] for h in order], wait=15.0)
         order = sorted(order, reverse=True,                  # stable: preference order among equal versions
@@ -2221,22 +2253,65 @@ class Router:
         for h in order:
             try:
                 c = self.child(h["name"], timeout=max(3.0, min(30.0, t_end - time.time())))
-                self.instructions = (c.init_result or {}).get("instructions") or ""
-                self.set_tools(c.request("tools/list", {}).get("tools", []))
-                self.tools_version = (sts.get(h["name"]) or {}).get("version")
+                instructions = (c.init_result or {}).get("instructions") or ""
+                tools = c.request("tools/list", {}).get("tools", [])
+                version = (sts.get(h["name"]) or {}).get("version")
                 proto = (c.init_result or {}).get("protocolVersion") or params.get("protocolVersion")
                 break
             except ChildError as exc:
                 errors.append(str(exc))
         else:
-            proto = params.get("protocolVersion", "2025-06-18")
-            self.instructions = (f"llm-translators router for {self.key}: no machine answered ({'; '.join(errors)}). "
-                                 f"Call machines() to see why.")
-        self.ready = True
+            if background:
+                log(f"tool definitions not refreshed: no machine answered ({'; '.join(errors)}); the saved ones stay")
+            else:
+                self.instructions = (f"llm-translators router for {self.key}: no machine answered "
+                                     f"({'; '.join(errors)}). Call machines() to see why.")
+            return None
+        changed = bool(tools) and tools != self.tools
+        if tools:
+            self.set_tools(tools)
+        self.instructions = instructions      # in the background: for the next start (the client has its copy)
+        self.tools_version = version
+        self.save_tools_cache(proto)
+        if background:
+            log(f"{h['name']}: tool definitions of {self.key} {version}"
+                + (" (changed since the saved list: the client is told)" if changed else " (same as the saved list)"))
+            if changed and self.notify:
+                try:
+                    self.notify()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"tools/list_changed not sent: {exc}")
+        return proto
+
+    def warm_all(self) -> None:
         for h in self.ordered():           # warm the connections (and statuses not asked yet), so first calls don't wait
             if h["name"] not in self.status_cache:
                 self.refresh(h["name"])
             self.warm(h["name"])
+
+    def initialize(self, params: dict) -> dict:
+        self.init_params = params = params or {}
+        cached = self.load_tools_cache()
+        if cached:
+            # answer at once with the list saved last time; the machines are asked in the background, and a
+            # changed list is announced (some clients, e.g. the Gemini app, give up on a slow startup)
+            self.instructions = cached.get("instructions") or ""
+            self.set_tools(cached["tools"])
+            self.tools_version = cached.get("version")
+            proto = params.get("protocolVersion") or cached.get("protocolVersion") or "2025-06-18"
+            self.ready = True
+
+            def background():
+                try:
+                    self.discover_tools(params, True)
+                except Exception as exc:  # noqa: BLE001
+                    log(f"tool definitions not refreshed: {type(exc).__name__}: {exc}")
+                self.warm_all()
+            threading.Thread(target=background, daemon=True).start()
+        else:
+            proto = self.discover_tools(params, False) or params.get("protocolVersion", "2025-06-18")
+            self.ready = True
+            self.warm_all()
         names = ", ".join(h["name"] for h in self.hosts)
         note = (f"\nMachines: this server runs {self.key} on several machines ({names}). Calls that start work are "
                 f"placed on the machine where they should finish first; answers say which ('machine', 'router'). "
