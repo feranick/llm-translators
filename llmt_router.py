@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.18.1
+Version: 2026.11.18.2
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.18.1"
+__version__ = "2026.11.18.2"
 
 HERE = Path(__file__).resolve().parent
 
@@ -1392,6 +1392,35 @@ class Router:
         return parse_mem_mb(caps.get("mem"))
 
     # ---- run.after: a study that waits until other runs have ended (llmt-runtime 2026.11.18.1)
+    @staticmethod
+    def after_studies(studies: dict) -> list:
+        """The studies that give run.after or run.after_mode."""
+        return [k for k, s in (studies or {}).items() if isinstance(s, dict) and isinstance(s.get("run"), dict)
+                and ("after" in s["run"] or "after_mode" in s["run"])]
+
+    def after_versions(self, cands: list, sts: dict, warnings: list) -> tuple:
+        """-> (the candidates whose translator accepts run.after, {machine: version} of those left out). A translator
+        accepts it from the version translators.json names as after_since (its run keys and validation; llmt-runtime
+        2026.11.18.1 does the rest); without one, none of its releases does, and the call is refused here with what is
+        missing, instead of failing at each machine's validation."""
+        need = self.t.get("after_since")
+        if not need:
+            raise ValueError(f"{self.key} does not accept run.after yet: no {self.key} release has 'after' and "
+                             f"'after_mode' in its run keys (with llmt-runtime's after_problems in its validation). Run "
+                             f"these studies when the runs they wait for have ended, or without run.after. Nothing was "
+                             f"placed or copied.")
+        ok = [n for n in cands if sts.get(n, {}).get("version") and vkey(sts[n]["version"]) >= vkey(need)]
+        old = {n: sts.get(n, {}).get("version") or "?" for n in cands if n not in ok}
+        if not ok:
+            raise ValueError(f"run.after needs {self.key} >= {need}; installed: "
+                             + (", ".join(f"{n} {v}" for n, v in old.items()) or "no machine can take it now")
+                             + f". Deploy {self.key} {need} or later (llmt pin {self.key}, then llmt deploy on each "
+                               f"machine). Nothing was placed or copied.")
+        if old:
+            warnings.append(f"left out for run.after (needs {self.key} >= {need}): "
+                            + ", ".join(f"{n} {v}" for n, v in old.items()))
+        return ok, old
+
     def after_machine(self, studies: dict, sts: dict) -> tuple:
         """-> (the machine holding every run the studies' run.after names in other requests, or None when they name
         none; refusal text or None). '<study>' refs (same request) do not place. A request the router's map does not
@@ -1737,7 +1766,11 @@ class Router:
         if arg:
             needs = {k: (mb, f"run.mem {txt}") for k, (mb, txt) in self.study_mems(studies).items()}
             cands = self.mem_filter(cands, sts, lambda n: needs, manual, wants, warnings)
-        # run.after: a study waits for runs of one machine (llmt-runtime 2026.11.18.1): it goes where they are
+        # run.after: a study waits for runs of one machine (llmt-runtime 2026.11.18.1): it goes where they are, and only
+        # to a machine whose translator accepts it (translators.json after_since)
+        old_after: dict = {}
+        if arg and self.after_studies(studies):
+            cands, old_after = self.after_versions(cands, sts, warnings)
         if arg:
             there, why_after = self.after_machine(studies, sts)
             if why_after:
@@ -1747,6 +1780,10 @@ class Router:
                     raise ValueError(f"run.after waits for runs on {there}, but run.host asks for "
                                      f"{' or '.join(manual)}: a study can only wait for runs of its own machine. Nothing "
                                      f"was placed or copied.")
+                if there in old_after:
+                    raise ValueError(f"run.after waits for runs on {there}, whose {self.key} {old_after[there]} does not "
+                                     f"accept run.after (it needs {self.key} >= {self.t['after_since']}): deploy it "
+                                     f"there first. Nothing was placed or copied.")
                 if there not in cands:
                     raise ValueError(f"run.after waits for runs on {there}, which cannot take {self.key} now. Nothing "
                                      f"was placed or copied.")

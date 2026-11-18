@@ -229,6 +229,7 @@ A study waits until every listed run has ended. With `"any"` (the default), it s
 
 - **Where.** A ref names a run of the same machine: `<request>/<study>` under the output folder, an absolute study folder, or `<study>` of the same request. The router places the study on the machine that holds the runs it names. A `run.host` that disagrees, or refs to runs of two machines, are refused before anything is placed.
 - **Validation.** Translators accept `after` and `after_mode` among their `run` keys, and call `RT.jobs.after_problems(request, name, study, studies)`. It checks that the ref exists on this machine, isn't the study itself, and closes no cycle, within the request or through other requests.
+  - Which translators accept it: `translators.json`'s `after_since` names the first release that does (cfdt 2026.11.18.3). The router refuses `run.after` for a translator without one, or on a machine whose installed version is older, naming the version needed (2026.11.18.2). Add `after_since` when a translator's release accepts it.
 - **Waiting** is the runtime's `submit`:
   - It registers the study in each listed run's `waiters.json`.
   - It submits with `--dependency=afterany:<their newest jobs>`. A listed study of the same request that isn't submitted yet holds it (`--hold`).
@@ -236,15 +237,16 @@ A study waits until every listed run has ended. With `"any"` (the default), it s
 - **The gate.** A `run.after` study's `job.sh` starts with `python -m llmt_runtime.jobs gate <folder>`.
   - If a listed run is still active (a move was missed), the job goes back to wait behind it.
   - With `"ok"`, a listed run that ended otherwise cancels the study: result `state: cancelled`, `cancelled_by: run.after`, with why.
-  - Only its exit code 75 ends the job, so a broken gate never stops a study.
+  - Only its exit code 75 ends the job, so a broken gate never stops a study. The line is safe under `set -e` (llmt-runtime 2026.11.18.2): a job sent back to wait ends COMPLETED with exit 0, not FAILED, and `job.json` names the new job (the old one under `waited_jobs`), so `jobs()` reports it waiting.
 - **Reporting.** `study_status` and `jobs()` show `state: "waiting"` and `reason: "after <ref> (running, t = 1.23 of 3 s, expected finish 21:40 (UTC))"`, from the listed run's `running_progress` (`time`, `end_time`, `eta_min`). They also give an `expected_start` taken from that finish.
 - **Cancel.** Cancelling a listed run releases the waiting study. With `"any"` it starts; with `"ok"` it is cancelled, with the reason.
+- **Checking a machine.** `llmt selftest slurm` (llmt-runtime 2026.11.18.2) runs four 30-second jobs through this code on the machine's real queue, with no translator, and prints PASS, FAIL or SKIP per step: `wait`, `chain`, `move` (`scontrol update Dependency=` on a pending job), `hold` (`sbatch --hold`), `release` (`scontrol release`), `job_end`, `gate` (sent back to wait: COMPLETED, exit 0, not failed in `jobs()`), `finish`. `--like cfdt` uses cfdt's `SLURM_ARGS` and `SLURM_NODE`; `--seconds` sets the jobs' length. It takes about two minutes on an idle node.
 
 ### Stop at the end of the current job: `cancel(at="job_end")`
 
 `RT.jobs.cancel_request(..., at="job_end")` (or `stop_after_job`):
 
-- It writes `stop_after_job` in each unfinished SLURM study's folder (cfdt's file name), and cancels a next job already waiting (`next_job`).
+- It writes `stop_after_job` in each unfinished SLURM study's folder (cfdt's file name), and cancels a next job already waiting (`next_job`). From 2026.11.18.2 the next job is first marked `dropped` and the studies waiting for the run moved back to its current job, then cancelled: `afterany` counts a cancel.
 - The running job finishes, with its results at the time it reached. `submit` refuses to chain a next job from inside the run's own job while the flag is there (`stopped: true`), so the run can be continued later.
 - The router offers `at` on `cancel` for every translator. When a translator's own `cancel` lacks it, the router runs `python -m llmt_runtime.jobs stop-after-job <request> [names]` on the machine.
 

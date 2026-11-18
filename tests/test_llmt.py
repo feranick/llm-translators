@@ -1213,6 +1213,9 @@ class AfterChainsCancel(unittest.TestCase):
         r.remember = lambda path, name: r.paths.__setitem__(path, name)
         r.paths["/home/f/cfdt_runs/run_A"] = "spark2"                    # run A ran on spark2
         r.paths["/home/n/cfdt_runs/run_C"] = "carbonio"
+        plain = r.statuses
+        r.statuses = lambda names, fresh=False, wait=0: {          # releases that accept run.after (after_since)
+            n: dict(s, version="2026.11.18.3") for n, s in plain(names, fresh, wait).items()}
         return r
 
     def test_after_placement(self):
@@ -1234,6 +1237,35 @@ class AfterChainsCancel(unittest.TestCase):
         self.assertIn("no machine has that request", str(cm.exception))
         name, _, _ = r.place("run_studies", {"studies": {"p": {}, "q": {"run": {"after": "p"}}}})   # same request
         self.assertEqual(name, "carbonio")
+
+    def test_after_needs_a_release_that_accepts_it(self):
+        """A translator whose installed version does not accept run.after is refused at the router, naming the
+        version needed, instead of failing at validation on the machine (2026.11.18.2)."""
+        r = self.router()
+        vers = {"carbonio": "2026.11.18.3", "spark1": "2026.11.18.2", "spark2": "2026.11.18.2"}
+        plain = r.statuses
+        r.statuses = lambda names, fresh=False, wait=0: {n: dict(s, version=vers[n])
+                                                         for n, s in plain(names, fresh, wait).items()}
+        with self.assertRaises(ValueError) as cm:                          # A's machine has an old cfdt
+            r.place("run_studies", {"studies": {"p": {"run": {"after": "run_A/a"}}}})
+        self.assertIn("spark2, whose cfdt 2026.11.18.2 does not accept run.after (it needs cfdt >= 2026.11.18.3)",
+                      str(cm.exception))
+        name, _, info = r.place("run_studies", {"studies": {"p": {}, "q": {"run": {"after": "p"}}}})
+        self.assertEqual(name, "carbonio")                                 # same request: the machines that accept it
+        self.assertTrue(any("left out for run.after (needs cfdt >= 2026.11.18.3): spark1 2026.11.18.2" in w
+                            for w in info["warnings"]))
+        vers["carbonio"] = "2026.11.17.9"
+        with self.assertRaises(ValueError) as cm:
+            r.place("run_studies", {"studies": {"q": {"run": {"after_mode": "ok"}}}})
+        self.assertIn("run.after needs cfdt >= 2026.11.18.3; installed: carbonio 2026.11.17.9", str(cm.exception))
+        # studies without run.after are placed as before
+        self.assertIn(r.place("run_studies", {"studies": {"p": {}}})[0], vers)
+        # a translator with no release that accepts it
+        r.t = dict(r.t)
+        r.t.pop("after_since")
+        with self.assertRaises(ValueError) as cm:
+            r.place("run_studies", {"studies": {"p": {}, "q": {"run": {"after": "p"}}}})
+        self.assertIn("cfdt does not accept run.after yet", str(cm.exception))
 
     def test_together_chain_is_one_block(self):
         st = {"chains": [{"time_left_min": 98.0, "end_min": 610.0, "segment": 2, "max_jobs": 3, "study": "run_A/a",

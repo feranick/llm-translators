@@ -56,7 +56,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.11.18.1"
+__version__ = "2026.11.18.2"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -3232,6 +3232,24 @@ def cmd_bench(a) -> None:
     os.execv(str(ROOT / "bin" / "run"), [str(ROOT / "bin" / "run"), t["cli"], "bench", *a.names])
 
 
+def cmd_selftest(a) -> None:
+    """llmt selftest slurm: llmt-runtime's own check of this machine's SLURM (run.after, holds, dependency moves, the
+    gate, cancel at job end) with four short jobs and no translator (llmt-runtime >= 2026.11.18.2)."""
+    py = VENV / "bin" / "python"
+    if not py.exists():
+        die(f"no venv at {VENV}: run {ROOT / 'llmt'} setup (or install) first")
+    probe = subprocess.run([str(py), "-c", "import llmt_runtime.selftest, llmt_runtime; print(llmt_runtime.__version__)"],
+                           capture_output=True, text=True)
+    if probe.returncode != 0:
+        have = subprocess.run([str(py), "-c", "import llmt_runtime; print(llmt_runtime.__version__)"],
+                              capture_output=True, text=True).stdout.strip() or "none"
+        die(f"the self-test needs llmt-runtime >= 2026.11.18.2 in {VENV} (it has {have}): pin and deploy it first")
+    args = ["--seconds", f"{a.seconds:g}", "--timeout-min", f"{a.timeout_min:g}"] + (["--keep"] if a.keep else []) \
+        + (["--like", a.like.upper()] if a.like else [])
+    os.execv(str(ROOT / "bin" / "run"), [str(ROOT / "bin" / "run"), str(py), "-m", "llmt_runtime.selftest",
+                                         a.what, *args])
+
+
 def cmd_alias(a) -> None:
     if a.print:
         print(alias_line(a.name))
@@ -3442,6 +3460,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--keep", type=int, default=3, help="always keep the newest N (default 3)")
     p.add_argument("--prefix")
     p.add_argument("--yes", action="store_true")
+    p = sub.add_parser("selftest", help="check this machine without a translator: 'slurm' submits four short jobs "
+                                        "(run.after waits, chain, hold, dependency move, release, job_end, gate) and "
+                                        "prints PASS/FAIL per step")
+    p.add_argument("what", choices=["slurm"])
+    p.add_argument("--seconds", type=float, default=30, help="each job's length (default 30)")
+    p.add_argument("--timeout-min", type=float, default=15, help="how long to wait for the jobs (default 15)")
+    p.add_argument("--keep", action="store_true", help="keep the jobs' folder (~/.llmt/selftest/run_<time>)")
+    p.add_argument("--like", help="use this translator's SLURM_ARGS and SLURM_NODE (cfdt, feat, ...)")
     sub.add_parser("gui", help="a window: setup of this machine, settings, and the machines (tkinter)")
     p = sub.add_parser("web", help="the same in a browser: a server on 127.0.0.1 only, with an access token")
     p.add_argument("--port", type=int, help="default 8790; 0: any free port")
@@ -3472,7 +3498,8 @@ def main(argv: list[str] | None = None) -> None:
         return
     {"setup": cmd_setup, "list": cmd_list, "install": cmd_install, "remove": cmd_remove, "status": cmd_status,
      "update": cmd_update, "pin": cmd_pin, "test": cmd_test, "bench": cmd_bench, "alias": cmd_alias, "tune": cmd_tune, "jobs": cmd_jobs, "env": cmd_env,
-     "deploy": cmd_deploy, "releases": cmd_releases, "rollback": cmd_rollback, "servers": cmd_servers, "gc": cmd_gc, "router": cmd_router, "mcp": cmd_mcp, "gui": cmd_gui, "web": cmd_web}[a.cmd](a)
+     "deploy": cmd_deploy, "releases": cmd_releases, "rollback": cmd_rollback, "servers": cmd_servers, "gc": cmd_gc, "router": cmd_router, "mcp": cmd_mcp, "gui": cmd_gui, "web": cmd_web,
+     "selftest": cmd_selftest}[a.cmd](a)
 
 
 if __name__ == "__main__":

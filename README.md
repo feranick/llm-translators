@@ -284,6 +284,8 @@ llmt releases                   the releases, which is current, which are in use
 llmt rollback [RELEASE]         point 'current' to the previous (or the named) release
 llmt gc [--keep N] [--yes]      remove old releases that nobody uses
 llmt servers [--stop]           the translator MCP servers running here, with their release; --stop ends those not on 'current'
+llmt selftest slurm [--seconds S] [--like KEY] [--keep]   check this machine's SLURM for run.after, holds, dependency
+                                moves, the gate and cancel at job end: four short jobs, PASS/FAIL per step
                                 (deploy also compares each pin with its branch's newest commit: --no-pin-check, --yes)
 ```
 
