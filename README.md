@@ -5,7 +5,7 @@ One place to install and run the translators that connect LLMs to engineering an
 - one Python venv;
 - an installer that lets you choose which translators each machine gets;
 - settings per machine and per user;
-- the MCP server entries for the Claude app, local or over ssh;
+- the MCP server entries for the Claude app (and other MCP clients, such as the Gemini Mac app), local or over ssh;
 - optionally, a shared install for every user of a server.
 
 | Key | Translator | What | Backends |
@@ -32,6 +32,7 @@ Version: 2026.10.25.2.
 **Contents:**
 
 - [Installation](#installation): prerequisites, then three paths (one machine; a Mac and Linux workstations; a shared server), what setup does, and checking an install
+- [Connecting an app: Claude or Gemini](#connecting-an-app-claude-or-gemini)
 - [Commands](#commands)
 - [A window: llmt gui and llmt web](#a-window-llmt-gui-and-llmt-web)
 - [Settings](#settings)
@@ -245,7 +246,99 @@ Setup can be run again at any time: it remembers the earlier answers (`config/se
 ./llmt mcp test            # starts every MCP entry as the Claude app does (also over ssh): handshake and tools
 ```
 
-**Then restart the Claude app.** Each server's tools appear in a new chat; a quick check is to ask for a translator's benchmarks, e.g. "run lmpt's madelung_nacl benchmark". If a server shows "Server disconnected", see [Troubleshooting](#troubleshooting).
+**Then restart the Claude app.** Each server's tools appear in a new chat; a quick check is to ask for a translator's benchmarks, e.g. "run lmpt's madelung_nacl benchmark". If a server shows "Server disconnected", see [Troubleshooting](#troubleshooting). To use the Gemini Mac app instead, or as well, see [Connecting an app](#connecting-an-app-claude-or-gemini).
+
+---
+
+## Connecting an app: Claude or Gemini
+
+Each translator is one MCP server that the app starts as a local command on the Mac:
+
+| How the translator runs | Command |
+|---|---|
+| here (*local*) | `~/Software/llm-translators/bin/mcp KEY` |
+| through the router (*auto*) | `~/Software/llm-translators/bin/router KEY` |
+| on one other machine (*remote*) | `ssh -o BatchMode=yes HOST <its llm-translators>/bin/mcp KEY` |
+
+`llmt mcp config --print` prints the exact entries for this Mac, with full paths.
+
+### Claude desktop app
+
+`llmt setup` (step 4), `llmt mcp setup` or `llmt router setup` writes the entries into the Claude config, keeping a backup:
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`;
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`;
+- Linux: `~/.config/Claude/claude_desktop_config.json`.
+
+```json
+"mcpServers": {
+  "b3dt": {"command": "/Users/<you>/Software/llm-translators/bin/mcp", "args": ["b3dt"]},
+  "cfdt": {"command": "/Users/<you>/Software/llm-translators/bin/router", "args": ["cfdt"]}
+}
+```
+
+Then:
+
+1. **Check:** run `./llmt mcp test`. It starts each entry as the app does (bare environment, also over ssh), and lists its tools.
+2. **Restart the Claude app.** Each translator's tools appear in a new chat.
+3. **Fix it by hand, if needed:** `llmt mcp config` writes the entries again.
+
+- **Logs:** `~/Library/Logs/Claude/mcp-server-KEY.log` ([Troubleshooting](#troubleshooting)).
+- **Claude Code:** `llmt mcp config --claude-code` prints the `claude mcp add-json` commands.
+- **Other clients that read a JSON config:** use `llmt mcp config --print`.
+
+### Gemini Mac app (Local MCP)
+
+**Requirements:**
+
+- **Gemini build:** a Gemini Mac app build that offers *Local MCP* under *Connected Apps → + Custom*. It came with Gemini Spark on the Mac. Google doesn't document it yet, so availability depends on the build and the account.
+- **llm-translators:** set up on the Mac as for the Claude app ([layout B](#b-a-mac-and-linux-workstations)), with the router at 2026.11.18.3 or later.
+- **ssh:** connecting to the servers must work without prompts: `ssh -o BatchMode=yes HOST true` must succeed.
+
+**1. Create the saved tool lists, once, from Terminal:**
+
+```bash
+cd ~/Software/llm-translators && ./llmt mcp test feat cfdt lmpt omct
+```
+
+This writes `config/router_tools_<KEY>.json` (per machine; not committed). With those files, the routers answer the app's startup at once ([docs/ROUTER.md](docs/ROUTER.md)). Without them, Gemini gives up first: "Timed out waiting for the MCP server to complete its startup handshake". The router asks every machine before answering, which takes 5–10 s, longer when one is slow or down. Run the command again after adding a translator.
+
+**2. Add each translator in Gemini.** In *Connected Apps → + Custom → Local MCP*, enter one app per translator:
+
+| Server Name | Command | Sandbox |
+|---|---|---|
+| b3dt | `/Users/<you>/Software/llm-translators/bin/mcp b3dt` | Customize: llm-translators R W X, `~/b3d_parts` R W |
+| feat | `/Users/<you>/Software/llm-translators/bin/router feat` | Full Access |
+| cfdt | `/Users/<you>/Software/llm-translators/bin/router cfdt` | Full Access |
+| lmpt | `/Users/<you>/Software/llm-translators/bin/router lmpt` | Full Access |
+| omct | `/Users/<you>/Software/llm-translators/bin/router omct` | Full Access |
+
+- **Full paths:** write them out, not `~`. Gemini's Local MCP has no separate place for environment variables, so the Command field holds everything: the command and its arguments, as `llmt mcp config --print` shows them.
+- **A translator that runs locally,** like feat in layout B (`bin/mcp feat`): a customized sandbox needs llm-translators (R W X) and its output folder (R W), e.g. `~/feat_runs`.
+- **Hidden folders:** to add one like `~/.ssh` in the folder picker, press ⌘⇧G and type the path.
+
+**Why Full Access for the routers:** a custom sandbox with `~/.ssh` (R W), llm-translators (R W X) and outbound network access still timed out. ssh needs something outside those folders: the ssh-agent socket, the Keychain or DNS. We didn't narrow down which. Full Access matches how the Claude app runs local servers: as plain processes with your permissions.
+
+Suggested descriptions, which help Gemini choose the right translator:
+
+| Server | Description |
+|---|---|
+| b3dt | CAD parts from goals → STEP files and build123d scripts |
+| feat | FEA (static, modal, buckling, thermal, electric) |
+| cfdt | CFD with OpenFOAM |
+| lmpt | atomistic simulations with LAMMPS |
+| omct | system dynamics with OpenModelica |
+
+**3. Use it.** Type `@` and pick the translator, to make sure Gemini uses it. Spark's reasoning runs in Google's cloud: the translators run on the Mac and the servers, but their answers go to Google.
+
+**Troubleshooting.** Each app's *Show Logs* has its server's error output.
+
+| Error | Cause and fix |
+|---|---|
+| `/bin/sh: …/bin/mcp: Operation not permitted` (exit 126) | Gemini's sandbox can't run files in llm-translators. Add the folder with X, or use Full Access. |
+| Startup handshake timed out (routers) | No saved tool list: run step 1. Or the router is older than 2026.11.18.3: `git pull`. |
+| Tools missing after a deploy | The router updates the saved list in the background and notifies the app. If Gemini ignores the notice, restart the app. |
+| A router reaches no machine | Check `./llmt router status`, and `ssh -o BatchMode=yes HOST true`. |
 
 ---
 
@@ -284,9 +377,9 @@ llmt releases                   the releases, which is current, which are in use
 llmt rollback [RELEASE]         point 'current' to the previous (or the named) release
 llmt gc [--keep N] [--yes]      remove old releases that nobody uses
 llmt servers [--stop]           the translator MCP servers running here, with their release; --stop ends those not on 'current'
+                                (deploy also compares each pin with its branch's newest commit: --no-pin-check, --yes)
 llmt selftest slurm [--seconds S] [--like KEY] [--keep]   check this machine's SLURM for run.after, holds, dependency
                                 moves, the gate and cancel at job end: four short jobs, PASS/FAIL per step
-                                (deploy also compares each pin with its branch's newest commit: --no-pin-check, --yes)
 ```
 
 **`KEY`** is `b3dt`, `feat`, `cfdt`, `lmpt` or `omct`, or the repository name, a number from `llmt list`, or `all`.
