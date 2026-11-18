@@ -1,6 +1,6 @@
 # The router: one translator, several machines
 
-Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2); tool definitions that follow deploys, per-node queues, request names 2026.11.06.1; init_from across machines 2026.11.13.1 (copies judged by the fields' time 2026.11.13.2); run.host checked study by study, memory per study with its reason 2026.11.14.1; inspect 2026.11.16.1.
+Status: design and implementation, llmt 2026.10.22.3; time limits 2026.10.23.1; servers on an old release 2026.10.25.2; files on this computer 2026.10.31.1 (default output folder 2026.10.31.2); tool definitions that follow deploys, per-node queues, request names 2026.11.06.1; init_from across machines 2026.11.13.1 (copies judged by the fields' time 2026.11.13.2); run.host checked study by study, memory per study with its reason 2026.11.14.1; inspect 2026.11.16.1; run.after placement, 'together' chains as one block, cancel at='job_end', start times with their offset 2026.11.18.1.
 
 Until now, each MCP entry in the Claude app pointed to one machine (`ssh mochi .../bin/mcp cfdt`). With several machines able to run a translator (mochi, carbonio, a DGX Spark), choosing one by hand wastes the others, and one entry per machine (`cfdt-mochi`, `cfdt-carbonio`, ...) multiplies the tools in every chat.
 
@@ -106,6 +106,18 @@ The DGX Sparks are one cluster of two nodes. Each one is still a machine of its 
 - **Queue per node.** `queue` counts the machine's own node only: running jobs on it, and pending jobs whose `--nodelist` names it. `cluster_queue` counts the whole cluster, and `pending_for_node` the pending jobs for the node. It needs llmt 2026.11.06.1 on the machine for pending jobs (`squeue %n`). With an older llmt, only running jobs are counted per node.
 - **The result.** The router picks the spark whose own node frees up first.
 - **With shared homes (`any`)** both machines report the cluster's estimate, and SLURM chooses the node: in effect, one machine.
+
+### Runs that wait for other runs, and runs that keep their node (2026.11.18.1)
+
+- **`run.after`.** A study that waits for other runs (docs/EXECUTION.md, `run.after`) goes to the machine that holds them. The router finds that machine from its request map, else by asking each machine's output folder.
+  - A `run.host` that names another machine is refused, and so are refs to runs on two machines. Both are refused before anything is placed or copied.
+  - The study is passed on with its `run.after`: the machine's llmt-runtime does the waiting, and the answer shows `state: "waiting"`.
+  - `<study>` refs within the same request don't constrain placement.
+- **`together` runs as one block.** A multi-job run whose next job is already submitted and waiting for the running one keeps its node for all of its jobs (`job.json` `next_job`; cfdt's `solve.transient.chain: "together"`). SLURM's `sbatch --test-only` doesn't plan jobs waiting on a dependency, so it frees those CPUs when the current job ends.
+  - `llmt status` reports such a running job's `chain` (`segment`, `max_jobs`, `job_min`, `time_left_min`, `end_min`), and the router keeps the node's `chains`.
+  - When another study would start at about that job's end, the router moves its start to the block's end: the time left, plus each remaining job's limit, an upper bound. The candidate's `why` says so.
+- **Start times with their offset.** Placement candidates carry `expected_start` and `machines()` carries `typical_job_expected_start`, as this computer's local time with its UTC offset. The servers' clocks run on UTC.
+- **`cancel(at="job_end")`.** The router offers `at` on every translator's `cancel`. When the translator's own `cancel` lacks it, `at: "job_end"` runs llmt-runtime's `stop-after-job` on the request's machine, and `at: "now"` is the usual cancel.
 
 ## Following up: where each request lives
 

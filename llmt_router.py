@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.16.3
+Version: 2026.11.18.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.16.3"
+__version__ = "2026.11.18.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -81,6 +81,11 @@ BUSY_STATUS_WAIT = 20.0  # study_status / bench_status wait at most this on a ma
 INIT_FROM_KEYS = {"cfdt"}  # translators whose studies may start from a run of another machine (solve.init_from)
 COPY_MB_S = 50.0         # assumed speed of a copy between two machines through this computer (placement's estimate)
 INIT_CHECK_TTL = 60.0
+
+
+def iso_in(minutes: float) -> str:
+    """Now plus minutes, as this computer's local time with its UTC offset (2026-11-18T14:38:00-05:00)."""
+    return (_dt.datetime.now().astimezone() + _dt.timedelta(minutes=float(minutes))).isoformat(timespec="seconds")
 
 
 def parse_json_out(text: str):
@@ -664,6 +669,15 @@ class Router:
                     out["queue"] = self.count_jobs([j for j in jobs if on_node(j, nodes)])
                     out["cluster_queue"] = self.count_jobs(jobs)
                     out["pending_for_node"] = out["queue"]["waiting"]
+                # multi-job runs whose next job already waits for the running one (cfdt's chain 'together'), of every
+                # translator, on this machine's node: one block for other studies' start estimates
+                alljobs = sl.get("jobs") or [] if sl else []
+                on_me = (lambda j: on_node(j, {x for x in node.split(",") if x})) if node and \
+                    (sl.get("cluster_nodes") or 1) > 1 else (lambda j: True)
+                chains = [dict(j["chain"], job=j.get("id"), key=j.get("key"), study=f"{j.get('request')}/{j.get('study')}")
+                          for j in alljobs if isinstance(j.get("chain"), dict) and on_me(j)]
+                if chains:
+                    out["chains"] = chains
             nums = [x for x in re.split(r"[\s{}]+", load) if x]
             try:
                 out["load"] = float(nums[0])
@@ -845,6 +859,26 @@ class Router:
             return sl["node"]
         return None
 
+    @staticmethod
+    def chain_block(res: tuple, st: dict) -> tuple:
+        """A multi-job run in 'together' mode (cfdt 2026.11.18: its next job is submitted when the current one starts,
+        so it is ahead of anything submitted later) keeps its node for all of its jobs. SLURM's estimate for another
+        study frees the CPUs when the current job ends, because a job waiting on a dependency is not planned. So when the study
+        would start at about that job's end, it starts when the block ends (status 'chains': end_min, an upper bound
+        from the jobs' limits)."""
+        wait, why = res
+        if wait is None or wait < 0.5:
+            return res
+        blocks = [c for c in st.get("chains") or [] if c.get("time_left_min") is not None and c.get("end_min")
+                  and c["time_left_min"] <= wait + 5 and c["end_min"] > wait]
+        if not blocks:
+            return res
+        c = min(blocks, key=lambda x: x["end_min"])
+        left = max(0, (c.get("max_jobs") or c.get("segment", 1) + 1) - c.get("segment", 1))
+        return (float(c["end_min"]), f"{why}; but {c.get('study')} (job {c.get('job')}) runs as one block (chain "
+                                     f"'together': {left} more job(s) follow at once), so the node is busy until about "
+                                     f"{c['end_min']:.0f} min")
+
     def expected_start(self, name: str, st: dict, procs: int, minutes: float, mem_mb: float | None) -> tuple:
         """Minutes until a job of this size would start on the machine, and why."""
         ex = st.get("executor") or {}
@@ -860,7 +894,7 @@ class Router:
             ck = (name, procs, mins, mem)
             hit = self.start_cache.get(ck)
             if hit and time.time() - hit[0] < START_TTL:
-                return hit[1]
+                return self.chain_block(hit[1], st)
             script = (f'd=$(sbatch --test-only {size} -t {mins}{mem} --wrap=true 2>&1); echo "$d"; '
                       f's=$(echo "$d" | sed -n "s/.*to start at \\([^ ]*\\).*/\\1/p" | head -1); '
                       f'[ -n "$s" ] && echo "@@START $(date -d "$s" +%s 2>/dev/null) $(date +%s)"')
@@ -898,7 +932,7 @@ class Router:
             except (OSError, subprocess.TimeoutExpired) as exc:
                 res = (None, f"sbatch --test-only failed: {exc}")
             self.start_cache[ck] = (time.time(), res)
-            return res                       # a SLURM machine without a start time is not judged by its load
+            return self.chain_block(res, st)  # a SLURM machine without a start time is not judged by its load
         load, cores = st.get("load"), st.get("cores")
         if load is None or not cores:
             return 0.0, "load unknown"
@@ -1357,6 +1391,61 @@ class Router:
             return float(v)
         return parse_mem_mb(caps.get("mem"))
 
+    # ---- run.after: a study that waits until other runs have ended (llmt-runtime 2026.11.18.1)
+    def after_machine(self, studies: dict, sts: dict) -> tuple:
+        """-> (the machine holding every run the studies' run.after names in other requests, or None when they name
+        none; refusal text or None). '<study>' refs (same request) do not place. A request the router's map does not
+        know is looked for in each machine's output folder."""
+        refs = []
+        for k, s in (studies or {}).items():
+            run = s.get("run") if isinstance(s, dict) else None
+            a = run.get("after") if isinstance(run, dict) else None
+            for ref in ([a] if isinstance(a, str) else list(a) if isinstance(a, (list, tuple)) else []):
+                if isinstance(ref, str) and "/" in ref.strip().rstrip("/"):
+                    refs.append((k, ref.strip().rstrip("/")))
+        if not refs:
+            return None, None
+        where: dict = {}
+        for k, ref in refs:
+            hits = {h[0] for h in self.ref_hits(ref)}
+            if not hits and not ref.startswith("/"):
+                hits = set(self.request_on(ref.split("/", 1)[0], sts))
+            if not hits:
+                return None, (f"run.after {ref!r} ({k}): no machine has that request (machines() lists them; give "
+                              f"'<request>/<study>' of a request that ran there). Nothing was placed or copied.")
+            if len(hits) > 1:
+                return None, (f"run.after {ref!r} ({k}): the request exists on {', '.join(sorted(hits))}; give its "
+                              f"absolute path on the machine that ran it. Nothing was placed or copied.")
+            where.setdefault(hits.pop(), []).append(ref)
+        if len(where) > 1:
+            return None, ("run.after names runs on different machines (" + "; ".join(
+                f"{m}: {', '.join(r)}" for m, r in where.items()) + "): a study can only wait for runs of its own "
+                "machine; split the request. Nothing was placed or copied.")
+        return next(iter(where)), None
+
+    def request_on(self, req: str, sts: dict) -> list:
+        """The machines whose output folder holds request req (one ssh per machine, in parallel)."""
+        found: dict = {}
+
+        def one(h):
+            out = (sts.get(h["name"]) or {}).get("out_dir")
+            if not out:
+                return
+            try:
+                r = remote_cmd(h, f"test -f {shlex.quote(out + '/' + req + '/request.json')} && echo yes", timeout=15)
+                if "yes" in r.stdout:
+                    found[h["name"]] = out + "/" + req
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        ths = [threading.Thread(target=one, args=(h,), daemon=True) for h in self.ordered()]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join(20)
+        for n, path in found.items():
+            self.remember(path, n)
+        return [h["name"] for h in self.ordered() if h["name"] in found]
+
     # ---- init_from: a study starting from a finished run of another machine (cfdt 2026.11.13.6)
     def ref_hits(self, ref: str) -> list:
         """[(machine, request folder there, study)] for '<request>/<study>' or an absolute study path, from the
@@ -1544,6 +1633,36 @@ class Router:
                 staged[r["study"]] = {"from": f"{n}:{r['ref']}", "to": got[s], "bytes": nbytes.get(s)}
         return new, staged, (pending or None)
 
+    def stop_after_job(self, args: dict) -> dict:
+        """cancel(request, names, at='job_end') for a translator whose cancel lacks 'at': on the request's machine,
+        `python -m llmt_runtime.jobs stop-after-job <request> [names]` (the current jobs finish; no next job is chained;
+        a next job already waiting is cancelled)."""
+        try:
+            name, send = self.route_path({"request": args.get("request")})
+            req = str(send.get("request") or "").rstrip("/")
+            if not req:
+                raise ValueError("give 'request'")
+            if not name:
+                where = self.locate(req)
+                if len(where) != 1:
+                    raise ValueError(f"no machine has {req}" if not where else
+                                     f"{req} exists on {', '.join(where)}: say which, as machine:{req}")
+                name = where[0]
+                self.remember(req, name)
+            names = args.get("names") or []
+            names = [names] if isinstance(names, str) else [str(n) for n in names]
+            h = self.host(name)
+            r = remote_cmd(h, f"{root_expr(h['root'])}/bin/run python -m llmt_runtime.jobs stop-after-job "
+                              f"{shlex.quote(req)} {' '.join(shlex.quote(n) for n in names)}", timeout=40)
+            out = parse_json_out(r.stdout)
+            if out is None:
+                raise ValueError(f"{name}: no answer ({(r.stderr or r.stdout).strip()[-300:]}); its llmt-runtime may be "
+                                 f"older than 2026.11.18.1")
+            return self.text_result({**out, "machine": name, "via": "llm-translators router (llmt-runtime)"},
+                                    bool(out.get("error")))
+        except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+            return self.text_result({"error": str(exc), "router": "cancel at='job_end'"}, True)
+
     def post_validate(self, machine: str, tool: str, args: dict, r: dict) -> dict:
         """validate_studies answered by machine: studies whose init_from is a run of another machine are checked
         there (init-check; nothing is copied) instead of failing for 'no case ... on this machine'."""
@@ -1618,6 +1737,21 @@ class Router:
         if arg:
             needs = {k: (mb, f"run.mem {txt}") for k, (mb, txt) in self.study_mems(studies).items()}
             cands = self.mem_filter(cands, sts, lambda n: needs, manual, wants, warnings)
+        # run.after: a study waits for runs of one machine (llmt-runtime 2026.11.18.1): it goes where they are
+        if arg:
+            there, why_after = self.after_machine(studies, sts)
+            if why_after:
+                raise ValueError(why_after)
+            if there:
+                if manual and there not in manual:
+                    raise ValueError(f"run.after waits for runs on {there}, but run.host asks for "
+                                     f"{' or '.join(manual)}: a study can only wait for runs of its own machine. Nothing "
+                                     f"was placed or copied.")
+                if there not in cands:
+                    raise ValueError(f"run.after waits for runs on {there}, which cannot take {self.key} now. Nothing "
+                                     f"was placed or copied.")
+                cands = [there]
+                warnings.append(f"kept on {there}: run.after waits for runs there")
         # init_from a finished run of another machine: checked there first (an unfinished one refuses the call
         # before anything is copied); it does not pin the call to that machine, the copy's time counts instead
         refs = self.init_refs(studies) if arg else []
@@ -1729,7 +1863,8 @@ class Router:
             rows.append({"machine": n, "start_min": round(start, 1), "run_min": round(run_min, 1) if minutes else None,
                          "score": round(score, 2), "why": why + (f", estimate {minutes:.0f} min" if minutes else "") +
                          (f", copies {copy_b / MB / 1024:.1f} GB of init_from first (~{copy_min:.0f} min)" if copy_b else ""),
-                         "version": st.get("version")})
+                         "version": st.get("version"),
+                         **({"expected_start": iso_in(start)} if start < NO_START_MIN else {})})
         rows.sort(key=lambda r: (r["score"], cands.index(r["machine"])))
         best = rows[0]
         info = {"chose": best["machine"], "why": best["why"], "candidates": rows}
@@ -1841,6 +1976,15 @@ class Router:
                 return self.text_result(INSPECT.run(remote_cmd, h, self.router_cfg, args))
             except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
                 return self.text_result({"error": str(exc), "router": "inspect (read-only)"}, True)
+        if tool == "cancel" and args.get("at") is not None and "at" not in self.tool_args("cancel"):
+            # a translator whose cancel has no 'at' yet: the router does it with llmt-runtime (2026.11.18.1)
+            at = args.get("at")
+            if at == "now":
+                args = {k: v for k, v in args.items() if k != "at"}
+            elif at == "job_end":
+                return self.stop_after_job(args)
+            else:
+                return self.text_result({"error": f"at: 'now' (default) or 'job_end', not {at!r}"}, True)
         if tool == "machines":
             return self.text_result(self.machines())
         try:
@@ -1982,6 +2126,8 @@ class Router:
                 ex = st.get("executor") or {}
                 start, why = self.expected_start(h["name"], st, int(ex.get("procs") or 1), 10, None)
                 row["typical_job_start_min"] = None if start is None else round(start, 1)
+                if start is not None:          # with this computer's UTC offset (the servers' clocks run on UTC)
+                    row["typical_job_expected_start"] = iso_in(start)
                 row["typical_job"] = f"{int(ex.get('procs') or 1)} procs, 10 min: {why}"
             out.append(row)
         return {"translator": self.key, "machines": out,
@@ -2041,7 +2187,19 @@ class Router:
                               "backends, executor (local or SLURM), CPUs and their use, this translator's queued and "
                               "running jobs, load, the expected start of a typical job, speed, preferred or excluded.",
                "inputSchema": {"type": "object", "properties": {}}}
-        return {"tools": [t for t in self.tools if t.get("name") not in ("machines", "inspect")] + [own, INSPECT.TOOL]}
+        tools = []
+        for t in self.tools:
+            if t.get("name") in ("machines", "inspect"):
+                continue
+            props = ((t.get("inputSchema") or {}).get("properties") or {})
+            if t.get("name") == "cancel" and "at" not in props:      # the router adds it (llmt-runtime's stop_after_job)
+                t = copy.deepcopy(t)
+                t.setdefault("inputSchema", {"type": "object"}).setdefault("properties", {})["at"] = {
+                    "type": "string", "enum": ["now", "job_end"],
+                    "description": "'now' (default): stop at once. 'job_end': a multi-job run finishes its current SLURM "
+                                   "job and chains no next one (a new request can continue it)"}
+            tools.append(t)
+        return {"tools": tools + [own, INSPECT.TOOL]}
 
     def close(self) -> None:
         for pool in self.children.values():

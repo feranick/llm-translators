@@ -56,7 +56,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.11.17.1"
+__version__ = "2026.11.18.1"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -937,20 +937,74 @@ def slurm_jobs() -> list[dict]:
     """The user's queued and running translator jobs (job names '<cli>:<request>:<study>', docs/EXECUTION.md)."""
     clis = {t["cli"]: k for k, t in REGISTRY.items()}
     try:
-        r = subprocess.run(["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i|%j|%T|%M|%l|%C|%R|%S|%N|%n"],
-                           capture_output=True, text=True, timeout=20)
+        r = subprocess.run(["squeue", "-h", "-u", os.environ.get("USER", ""), "-o",
+                            "%i|%j|%T|%M|%l|%C|%R|%S|%N|%n|%L|%Z"], capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         return []
     out = []
     for line in r.stdout.splitlines():
-        f = (line.split("|") + [""] * 10)[:10]
+        f = (line.split("|") + [""] * 12)[:12]
         cli, _, rest = f[1].partition(":")
         if cli not in clis:
             continue
         req, _, study = rest.partition(":")
         # nodes: where it runs (%N); req_nodes: the --nodelist it asked for (%n), which the router counts per node
-        out.append({"id": f[0], "key": clis[cli], "request": req, "study": study, "state": f[2], "elapsed": f[3],
-                    "limit": f[4], "cpus": f[5], "reason": f[6], "start": f[7], "nodes": f[8], "req_nodes": f[9]})
+        j = {"id": f[0], "key": clis[cli], "request": req, "study": study, "state": f[2], "elapsed": f[3],
+             "limit": f[4], "cpus": f[5], "reason": f[6], "start": f[7], "nodes": f[8], "req_nodes": f[9],
+             "time_left": f[10]}
+        if f[2] == "RUNNING" and f[11]:
+            c = chain_info(Path(f[11]), f[10])
+            if c:
+                j["chain"] = c
+        out.append(j)
+    return out
+
+
+def slurm_minutes(t: str | None) -> float | None:
+    """A SLURM duration ([D-]HH:MM:SS, MM:SS, or minutes) in minutes; None for UNLIMITED, N/A and the unreadable."""
+    t = str(t or "").strip()
+    if not t or t.upper() in ("UNLIMITED", "INFINITE", "N/A", "NOT_SET"):
+        return None
+    try:
+        days = 0
+        if "-" in t:
+            d, t = t.split("-", 1)
+            days = int(d)
+        parts = [float(x) for x in t.split(":")]
+        if len(parts) == 1 and not days:
+            return parts[0]                      # plain minutes (sbatch --time=510)
+        while len(parts) < 3:
+            parts.insert(0, 0.0)
+        h, m, s = parts[-3:]
+        return days * 1440 + h * 60 + m + s / 60
+    except ValueError:
+        return None
+
+
+def chain_info(folder: Path, time_left: str) -> dict | None:
+    """A running job of a multi-job run whose next job already waits for it (job.json 'next_job': cfdt's chain
+    'together'): its runs follow one another as a block. {mode, segment, max_jobs, job_min, time_left_min, end_min}:
+    end_min is when the block ends at the latest (this job's time left, then each remaining job's limit)."""
+    try:
+        j = json.loads((folder / "job.json").read_text())
+    except (OSError, ValueError):
+        return None
+    nx = j.get("next_job") or {}
+    if not nx.get("job_id") or nx.get("dropped"):
+        return None
+    try:
+        meta = json.loads((folder.parent / "request.json").read_text())
+        tr = (((meta.get("studies") or {}).get(folder.name) or {}).get("solve") or {}).get("transient") or {}
+        max_jobs = int(tr.get("max_jobs") or 0) or None
+    except (OSError, ValueError, TypeError, AttributeError):
+        max_jobs = None
+    seg = int(j.get("segment") or 1)
+    job_min = slurm_minutes(nx.get("slurm_time") or j.get("slurm_time"))
+    left = slurm_minutes(time_left)
+    out = {"mode": "together", "segment": seg, "max_jobs": max_jobs, "job_min": job_min, "time_left_min": left,
+           "next_job": str(nx["job_id"])}
+    if left is not None and job_min is not None:
+        out["end_min"] = round(left + max(0, (max_jobs or seg + 1) - seg) * job_min, 1)
     return out
 
 

@@ -219,6 +219,44 @@ With llmt-runtime the key also has `"runtime": "<llmt-runtime version>"`, `node_
 - **Record.** `execution.limits = {timeout_s, mem, from_study: [keys the study set]}` in every result. `job.json` keeps the study's `run`.
 - **Status.** Implemented in omct 2026.10.21.7 (threads: `procs` is sweep points at once, `--cpus-per-task`), cfdt 2026.10.20.1 and lmpt 2026.10.20.1 (top-level `procs` / `queue` for lmpt's `solve.procs`; ranks capped at atoms / `LMPT_ATOMS_PER_RANK`, 2000). Same keys and variables for feat (feat: `procs` is threads, `--cpus-per-task`).
 
+### One run after another: `run.after` (llmt-runtime 2026.11.18.1)
+
+```json
+"run": {"after": "<request>/<study>" | "<study>" | ["...", "..."], "after_mode": "any" | "ok"}
+```
+
+A study waits until every listed run has ended. With `"any"` (the default), it starts however they ended; with `"ok"`, only if they all ended with ok true, else it is cancelled with the reason. The case behind it (cfdt, 2026-11-18): run B on spark2 should start only when run A, another request of 6–20 chained jobs, has finished.
+
+- **Where.** A ref names a run of the same machine: `<request>/<study>` under the output folder, an absolute study folder, or `<study>` of the same request. The router places the study on the machine that holds the runs it names. A `run.host` that disagrees, or refs to runs of two machines, are refused before anything is placed.
+- **Validation.** Translators accept `after` and `after_mode` among their `run` keys, and call `RT.jobs.after_problems(request, name, study, studies)`. It checks that the ref exists on this machine, isn't the study itself, and closes no cycle, within the request or through other requests.
+- **Waiting** is the runtime's `submit`:
+  - It registers the study in each listed run's `waiters.json`.
+  - It submits with `--dependency=afterany:<their newest jobs>`. A listed study of the same request that isn't submitted yet holds it (`--hold`).
+  - Whenever a listed run submits a job (its next segment, or a pre-submitted `together` job), `notify_waiters` moves the wait to it with `scontrol update … Dependency=`, and releases a held study. This needs no translator change: chained jobs go through `RT.jobs.submit`.
+- **The gate.** A `run.after` study's `job.sh` starts with `python -m llmt_runtime.jobs gate <folder>`.
+  - If a listed run is still active (a move was missed), the job goes back to wait behind it.
+  - With `"ok"`, a listed run that ended otherwise cancels the study: result `state: cancelled`, `cancelled_by: run.after`, with why.
+  - Only its exit code 75 ends the job, so a broken gate never stops a study.
+- **Reporting.** `study_status` and `jobs()` show `state: "waiting"` and `reason: "after <ref> (running, t = 1.23 of 3 s, expected finish 21:40 (UTC))"`, from the listed run's `running_progress` (`time`, `end_time`, `eta_min`). They also give an `expected_start` taken from that finish.
+- **Cancel.** Cancelling a listed run releases the waiting study. With `"any"` it starts; with `"ok"` it is cancelled, with the reason.
+
+### Stop at the end of the current job: `cancel(at="job_end")`
+
+`RT.jobs.cancel_request(..., at="job_end")` (or `stop_after_job`):
+
+- It writes `stop_after_job` in each unfinished SLURM study's folder (cfdt's file name), and cancels a next job already waiting (`next_job`).
+- The running job finishes, with its results at the time it reached. `submit` refuses to chain a next job from inside the run's own job while the flag is there (`stopped: true`), so the run can be continued later.
+- The router offers `at` on `cancel` for every translator. When a translator's own `cancel` lacks it, the router runs `python -m llmt_runtime.jobs stop-after-job <request> [names]` on the machine.
+
+### Multi-job runs: `job.json` keys other tools read
+
+- **`next_job`** (`{job_id, slurm_time, dropped?}`): a next job already submitted and waiting for the running one (cfdt's `solve.transient.chain: "together"`). The runtime's gate, cancel and `run.after` count it.
+- **`segment`:** the job's number in the run.
+
+`llmt status` reads these, with the study's `solve.transient.max_jobs`, as `chain` of a running job. The router treats such a run as one block when it estimates other studies' starts (docs/ROUTER.md).
+
+**Times** are given with their UTC offset (llmt-runtime 2026.11.18.1). `clock()` gives "19:38 (UTC)", and `expected_start` gives SLURM's time with the offset, "2026-11-17T19:38:17+00:00". The servers run on UTC, so a bare "19:38" read on a Mac in EST was five hours off.
+
 ## Sizing jobs and timing (found with cfdt on mochi, 2026-10-19)
 
 Worth carrying over to lmpt and feat:

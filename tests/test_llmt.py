@@ -1203,6 +1203,92 @@ class Inspect(unittest.TestCase):
         self.assertTrue(res.get("isError"))
 
 
+class AfterChainsCancel(unittest.TestCase):
+    """run.after placement, 'together' chains as one block, cancel at='job_end' through the router, start times with
+    their offset (router and llmt 2026.11.18.1; llmt-runtime 2026.11.18.1 does the waiting itself)."""
+
+    def router(self):
+        r = HostConsistency().router()
+        r.paths = {}
+        r.remember = lambda path, name: r.paths.__setitem__(path, name)
+        r.paths["/home/f/cfdt_runs/run_A"] = "spark2"                    # run A ran on spark2
+        r.paths["/home/n/cfdt_runs/run_C"] = "carbonio"
+        return r
+
+    def test_after_placement(self):
+        r = self.router()
+        name, send, info = r.place("run_studies", {"studies": {"plain": {"run": {"after": "run_A/a"}}}})
+        self.assertEqual(name, "spark2")                                  # not carbonio, the first of equals
+        self.assertIn("kept on spark2: run.after waits for runs there", info["warnings"])
+        self.assertEqual(send["studies"]["plain"]["run"], {"after": "run_A/a"})   # passed on: the machine waits
+        self.assertEqual(r.place("run_studies", {"studies": {"plain": {"run": {"after": ["/home/f/cfdt_runs/run_A/a"]}}}})[0],
+                         "spark2")
+        with self.assertRaises(ValueError) as cm:                          # run.host must match
+            r.place("run_studies", {"studies": {"plain": {"run": {"after": "run_A/a", "host": "spark1"}}}})
+        self.assertIn("run.after waits for runs on spark2, but run.host asks for spark1", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:                          # runs of two machines
+            r.place("run_studies", {"studies": {"p": {"run": {"after": ["run_A/a", "run_C/c"]}}}})
+        self.assertIn("different machines", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:                          # nobody has it
+            r.place("run_studies", {"studies": {"p": {"run": {"after": "run_Z/z"}}}})
+        self.assertIn("no machine has that request", str(cm.exception))
+        name, _, _ = r.place("run_studies", {"studies": {"p": {}, "q": {"run": {"after": "p"}}}})   # same request
+        self.assertEqual(name, "carbonio")
+
+    def test_together_chain_is_one_block(self):
+        st = {"chains": [{"time_left_min": 98.0, "end_min": 610.0, "segment": 2, "max_jobs": 3, "study": "run_A/a",
+                          "job": "349"}]}
+        wait, why = R.Router.chain_block((100.0, "SLURM expects a start in 100 min"), st)
+        self.assertEqual(wait, 610.0)
+        self.assertIn("run_A/a (job 349) runs as one block", why)
+        self.assertIn("1 more job(s)", why)
+        self.assertEqual(R.Router.chain_block((0.0, "starts now"), st), (0.0, "starts now"))
+        self.assertEqual(R.Router.chain_block((400.0, "x"), st)[0], 610.0)   # waits past the block's current job
+        far = {"chains": [dict(st["chains"][0], time_left_min=300.0)]}
+        self.assertEqual(R.Router.chain_block((100.0, "x"), far), (100.0, "x"))   # it does not wait for that job
+
+    def test_llmt_chain_info(self):
+        with tempfile.TemporaryDirectory() as t:
+            req = Path(t) / "run_A"
+            (req / "a").mkdir(parents=True)
+            (req / "request.json").write_text(json.dumps({"studies": {"a": {"solve": {"transient": {"max_jobs": 6}}}}}))
+            (req / "a" / "job.json").write_text(json.dumps({"job_id": "349", "segment": 2, "slurm_time": "8:30:00",
+                                                            "next_job": {"job_id": "350", "slurm_time": "510"}}))
+            c = L.chain_info(req / "a", "2:00:00")
+            self.assertEqual((c["segment"], c["max_jobs"], c["job_min"], c["time_left_min"]), (2, 6, 510.0, 120.0))
+            self.assertEqual(c["end_min"], 120 + 4 * 510)
+            (req / "a" / "job.json").write_text(json.dumps({"job_id": "349"}))          # no waiting next job: no block
+            self.assertIsNone(L.chain_info(req / "a", "2:00:00"))
+        self.assertEqual(L.slurm_minutes("1-02:03:00"), 1440 + 123)
+        self.assertEqual(L.slurm_minutes("45:00"), 45)
+        self.assertIsNone(L.slurm_minutes("UNLIMITED"))
+
+    def test_cancel_job_end_through_the_router(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t) / "root"
+            (root / "bin").mkdir(parents=True)
+            (root / "bin" / "run").write_text('#!/bin/sh\n# bin/run python -m llmt_runtime.jobs stop-after-job REQ NAMES\n'
+                                              'shift 3; echo "{\\"stop_after_job\\": [\\"$3\\"], \\"request\\": \\"$2\\"}"\n')
+            os.chmod(root / "bin" / "run", 0o755)
+            r = R.Router("cfdt")
+            r.hosts = [{"name": "spark2", "ssh": "", "root": str(root)}]
+            r.tools = [{"name": "cancel", "inputSchema": {"type": "object", "properties": {"request": {"type": "string"}}}}]
+            r.paths = {"/h/cfdt_runs/run_A": "spark2"}
+            cancel = next(x for x in r.tools_list()["tools"] if x["name"] == "cancel")
+            self.assertEqual(cancel["inputSchema"]["properties"]["at"]["enum"], ["now", "job_end"])
+            out = R.Router.parse(r.tool_call("cancel", {"request": "/h/cfdt_runs/run_A", "names": ["a"], "at": "job_end"}))
+            self.assertEqual((out["machine"], out["stop_after_job"], out["request"]), ("spark2", ["a"], "/h/cfdt_runs/run_A"))
+            self.assertTrue(R.Router.parse(r.tool_call("cancel", {"request": "/x", "at": "later"}))["error"])
+            # a translator whose cancel declares 'at' gets it as given
+            r.tools[0]["inputSchema"]["properties"]["at"] = {"type": "string"}
+            self.assertNotIn("enum", next(x for x in r.tools_list()["tools"] if x["name"] == "cancel")["inputSchema"]
+                             ["properties"]["at"])
+
+    def test_iso_in(self):
+        s = R.iso_in(90)
+        self.assertRegex(s, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$")
+
+
 class ServersList(unittest.TestCase):
     """Item 3: the process list; a symlinked prefix; no match for shells or jobs; own process skipped."""
 
