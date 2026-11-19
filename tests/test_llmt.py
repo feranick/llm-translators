@@ -18,6 +18,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import re
 import os
 import subprocess
 import sys
@@ -1988,6 +1989,30 @@ class Runtime(unittest.TestCase):
             L.print_status(data, False)
         self.assertIn("llmt-runtime; needed by: feat >=2026.11.09.1", out.getvalue())
         self.assertIn("! lmpt needs llmt-runtime>=2026.11.10.1", out.getvalue())
+
+
+class RegistryExtras(unittest.TestCase):
+    """Every extra translators.json asks pip for exists in the translator's pyproject.toml (feat asked for 'remnder'
+    from 2026-10-28 to 2026-11-19: pip skipped it with a warning, so feat installed without VTK rendering)."""
+
+    @staticmethod
+    def extras_of(text: str) -> set:
+        m = re.search(r"^\[project\.optional-dependencies\]\s*$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+        return set(re.findall(r"^([A-Za-z0-9_.-]+)\s*=", m.group(1), re.M)) if m else set()
+
+    def test_extras_exist(self):
+        checked = 0
+        for k, t in L.REGISTRY.items():
+            pp = L.ROOT / t["repo"] / "pyproject.toml"
+            if not pp.exists():
+                continue                       # not checked out here
+            have = self.extras_of(pp.read_text())
+            want = set(t.get("extras") or []) | set(t.get("optional_extras") or {}) | \
+                ({t["test_extra"]} if t.get("test_extra") else set())
+            self.assertEqual(sorted(want - have), [], f"{k}: extras not in {t['repo']}/pyproject.toml")
+            checked += 1
+        if not checked:
+            self.skipTest("no translator checked out")
 
 
 if __name__ == "__main__":

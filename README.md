@@ -27,7 +27,7 @@ Each translator's README has the details. This table describes the commits pinne
 
 That only works when they are installed in the same venv, which is why there is a single venv here.
 
-Version: 2026.10.25.2.
+Version: 2026.11.19.1 (`llmt` 2026.11.18.3, the router 2026.11.19.1). `llmt status` shows the commit and each translator's version.
 
 **Contents:**
 
