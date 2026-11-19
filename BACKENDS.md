@@ -78,7 +78,7 @@ Check: `bin/run lmpt status` (version, packages, potential folders), then `llmt 
 
 ## OpenModelica
 
-openmodelica-translator runs `omc` (OpenModelica 1.27.1 on mochi) with the Modelica Standard Library 4.0.0. omc compiles each model to C with gcc or clang, so a C compiler must be installed too; it works headless (over ssh).
+openmodelica-translator runs `omc` (OpenModelica 1.27.2 on carbonio, mochi, spark1 and spark2, since 2026-10-31; 1.27.1 before) with the Modelica Standard Library 4.0.0. omc compiles each model to C with gcc or clang, so a C compiler must be installed too; it works headless (over ssh).
 
 - **Ubuntu/Debian (x86-64):** OpenModelica's own apt repository (mochi has exactly this, `/etc/apt/sources.list.d/openmodelica.list`):
 
@@ -111,7 +111,7 @@ openmodelica-translator runs `omc` (OpenModelica 1.27.1 on mochi) with the Model
 
 How it is found: `OMCT_OMC` (the omc executable), else `omc` on the PATH. The library version is `OMCT_MSL_VERSION` (4.0.0), loaded with `loadModel(Modelica, {"4.0.0"})`.
 
-Check: `bin/run omct status` (omc version, the MSL path, the C compiler, the build cache), then `llmt bench omct` (11 closed-form benchmarks, a minute). `bin/run omct bench chain_feat_modal chain_b3dt_mass` checks the chains with feat and b3dt.
+Check: `bin/run omct status` (omc version, the MSL path, the C compiler, the build cache), then `llmt bench omct` (the closed-form benchmarks: 37 at omct 2026.10.31, a few minutes). `bin/run omct bench chain_feat_modal chain_b3dt_mass` checks the chains with feat and b3dt.
 
 ## MPI
 
