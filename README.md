@@ -314,10 +314,11 @@ This writes `config/router_tools_<KEY>.json` (per machine; not committed). With 
 | omct | `/Users/<you>/Software/llm-translators/bin/router omct` | Full Access |
 
 - **Full paths:** write them out, not `~`. Gemini's Local MCP has no separate place for environment variables, so the Command field holds everything: the command and its arguments, as `llmt mcp config --print` shows them.
-- **A translator that runs locally,** like feat in layout B (`bin/mcp feat`): a customized sandbox needs llm-translators (R W X) and its output folder (R W), e.g. `~/feat_runs`.
+- **A translator that runs locally on the Mac** (feat in layout B: `bin/mcp feat`) needs Full Access, as the routers do. Its runs and its pictures go to worker processes, and a customized sandbox refuses those: with llmt-runtime 2026.11.18.5 the call fails with "worker processes are not permitted here (the MCP client's sandbox): give this app Full Access, or run through the router". Before that, it failed with `PermissionError: [Errno 1] Operation not permitted` from SemLock. In-process runs are no way around it: runs take minutes to days, far beyond a call's 48 s.
+- **b3dt is the exception.** It is the only translator that can keep a customized sandbox. b3dt 2026.11.18.1 and later build parts in the server's own process, so there are no per-part time limits: a part that takes long holds the call until it finishes. Its builds take milliseconds to about a second.
 - **Hidden folders:** to add one like `~/.ssh` in the folder picker, press ⌘⇧G and type the path.
 
-**Why Full Access for the routers:** a custom sandbox with `~/.ssh` (R W), llm-translators (R W X) and outbound network access still timed out. ssh needs something outside those folders: the ssh-agent socket, the Keychain or DNS. We didn't narrow down which. Full Access matches how the Claude app runs local servers: as plain processes with your permissions.
+**Why Full Access for the routers and local translators:** the local translators need worker processes (above). For the routers, a custom sandbox with `~/.ssh` (R W), llm-translators (R W X) and outbound network access still timed out. ssh needs something outside those folders: the ssh-agent socket, the Keychain or DNS. We didn't narrow down which. Full Access matches how the Claude app runs local servers: as plain processes with your permissions.
 
 Suggested descriptions, which help Gemini choose the right translator:
 
@@ -336,6 +337,7 @@ Suggested descriptions, which help Gemini choose the right translator:
 | Error | Cause and fix |
 |---|---|
 | `/bin/sh: …/bin/mcp: Operation not permitted` (exit 126) | Gemini's sandbox can't run files in llm-translators. Add the folder with X, or use Full Access. |
+| "worker processes are not permitted here (the MCP client's sandbox)", or `PermissionError: [Errno 1] Operation not permitted` from SemLock | A translator run locally under a customized sandbox: give it Full Access, or run it through the router. |
 | Startup handshake timed out (routers) | No saved tool list: run step 1. Or the router is older than 2026.11.18.3: `git pull`. |
 | Tools missing after a deploy | The router updates the saved list in the background and notifies the app. If Gemini ignores the notice, restart the app. |
 | A router reaches no machine | Check `./llmt router status`, and `ssh -o BatchMode=yes HOST true`. |
