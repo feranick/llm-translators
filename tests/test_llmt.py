@@ -261,7 +261,8 @@ FAKE_NODE_LLMT = textwrap.dedent('''\
 
 FAKE_SLURM = {
     "sinfo": '#!/bin/sh\necho "$FAKE_C"\n',
-    "squeue": '#!/bin/sh\n[ -n "$FAKE_PD" ] && echo "$FAKE_PD"\nexit 0\n',
+    "squeue": '#!/bin/sh\ncase "$*" in *"-t R "*) [ -n "$FAKE_RUN" ] && echo "$FAKE_RUN";; '
+              '*) [ -n "$FAKE_PD" ] && echo "$FAKE_PD";; esac\nexit 0\n',
     "sbatch": '#!/bin/sh\ntouch "$FAKE_MARK"\n'
               'echo "sbatch: Job 3 to start at $(date -d "+${FAKE_START_IN:-90 min}" +%Y-%m-%dT%H:%M:%S) using 10 processors"\n',
 }
@@ -280,7 +281,8 @@ class NodeQueue(unittest.TestCase):
             (t / "bin" / n).write_text(text)
             os.chmod(t / "bin" / n, 0o755)
         self.t = t
-        self.saved = {k: os.environ.get(k) for k in ("PATH", "FAKE_C", "FAKE_PD", "FAKE_MARK", "FAKE_START_IN")}
+        self.saved = {k: os.environ.get(k) for k in ("PATH", "FAKE_C", "FAKE_PD", "FAKE_MARK", "FAKE_START_IN",
+                                                     "FAKE_RUN")}
         os.environ.update(PATH=f"{t / 'bin'}:{os.environ['PATH']}", FAKE_MARK=str(t / "sbatch-ran"))
         self.r = R.Router("cfdt")
         self.r.hosts = [{"name": "spark1", "ssh": "", "root": str(t / "root")}]
@@ -318,6 +320,16 @@ class NodeQueue(unittest.TestCase):
         self.assertAlmostEqual(start, 90, delta=2)
         (start, why), ran = self.start("0/20/0/20", pd="spark-5da5")   # idle, but a job waits for the node
         self.assertTrue(ran)
+
+    def test_slurms_late_plan_is_replaced_by_the_nodes_own(self):
+        """spark2, 2026-11-19: SLURM planned 183 min; the node's only running job ended in about 68 and the only
+        pending job waited on it."""
+        os.environ.update(FAKE_START_IN="183 min", FAKE_RUN="18|1:08:00")
+        (start, why), _ = self.start("18/2/0/20", pd="18|spark-5da5|Dependency")
+        self.assertAlmostEqual(start, 68, delta=1)
+        self.assertIn("SLURM's plan says 183 min", why)
+        (start, why), _ = self.start("18/2/0/20", pd="18|spark-5da5|Priority")   # one that may go first
+        self.assertAlmostEqual(start, 183, delta=2)
 
     def test_one_year_start_is_no_start(self):
         # SLURM puts a start it cannot plan a year ahead (behind a job with no time limit: carbonio 2026-11-10)
@@ -1345,6 +1357,32 @@ class AfterChainsCancel(unittest.TestCase):
             n: dict(s, slurm=dict(chain_together="yes")) for n, s in plain(names, fresh, wait).items()}
         _, send, _ = r.place("run_studies", {"studies": copy.deepcopy(studies)})
         self.assertNotIn("chain", send["studies"]["t"]["solve"]["transient"])
+
+    def test_node_start_when_slurms_plan_is_late(self):
+        """spark2, 2026-11-19: sbatch --test-only planned a 10-CPU job for 12:41 while the node's only running job
+        (18 of 20 CPUs) ended at 11:06 and the only pending job waited on it (Dependency)."""
+        f = R.Router.node_start
+        out = ("sbatch: Job 721 to start at ...\n@@ALLOC 18/2/0/20\n@@RUN\n18|1:07:40\n@@PD\n"
+               "18|spark-0808|Dependency\n@@END\n")
+        mins, why = f(out, 10, 20, "spark-0808")
+        self.assertAlmostEqual(mins, 67.67, places=1)
+        self.assertIn("10 CPUs free on node spark-0808 in 68 min", why)
+        self.assertEqual(f(out.replace("18|1:07:40", "8|1:07:40").replace("18/2/0/20", "8/12/0/20"), 10, 20,
+                           "spark-0808")[0], 0.0)                                                   # 12 free now
+        self.assertIsNone(f(out.replace("18|1:07:40\n", ""), 10, 20, "spark-0808"))   # 18 CPUs in use by unlisted jobs
+        self.assertIsNone(f(out.replace("@@ALLOC 18/2/0/20\n", ""), 10, 20, "spark-0808"))
+        # a pending job that may go first (not on a dependency or hold): SLURM's plan stands
+        self.assertIsNone(f(out.replace("Dependency", "Priority"), 10, 20, "spark-0808"))
+        self.assertIsNone(f(out.replace("spark-0808|Dependency", "|Resources"), 10, 20, "spark-0808"))
+        # ... unless it is for another node
+        self.assertEqual(f(out.replace("spark-0808|Dependency", "spark-5da5|Resources"), 10, 20, "spark-0808")[0],
+                         mins)
+        self.assertIsNone(f(out.replace("1:07:40", "UNLIMITED"), 10, 20, "spark-0808"))   # never frees its CPUs
+        self.assertIsNone(f("no markers", 10, 20, "spark-0808"))
+        # several running jobs: the CPUs add up in the order they end
+        two = "@@ALLOC 18/2/0/20\n@@RUN\n8|2:00:00\n10|30:00\n@@PD\n@@END\n"
+        self.assertEqual(f(two, 10, 20, "n1")[0], 30.0)
+        self.assertEqual(f(two, 18, 20, "n1")[0], 120.0)
 
     def test_together_chain_is_one_block(self):
         st = {"chains": [{"time_left_min": 98.0, "end_min": 610.0, "segment": 2, "max_jobs": 3, "study": "run_A/a",

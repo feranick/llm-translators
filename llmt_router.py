@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """llmt_router.py — one MCP server for a translator, spread over several machines (docs/ROUTER.md).
-Version: 2026.11.18.3
+Version: 2026.11.19.1
 
     bin/router KEY        (what the Claude app runs; stdio)
 
@@ -31,7 +31,7 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-__version__ = "2026.11.18.3"
+__version__ = "2026.11.19.1"
 
 HERE = Path(__file__).resolve().parent
 
@@ -883,6 +883,50 @@ class Router:
                                      f"'together': {left} more job(s) follow at once), so the node is busy until about "
                                      f"{c['end_min']:.0f} min")
 
+    WAITING_REASONS = ("Dependency", "JobHeldUser", "JobHeldAdmin", "DependencyNeverSatisfied", "BeginTime")
+
+    @staticmethod
+    def node_start(text: str, procs: int, cpus: int, node: str) -> tuple | None:
+        """(minutes, why) until `procs` CPUs are free on the node, from its running jobs' time left (squeue %C|%L,
+        between @@RUN and @@PD), or None when that can't be told: no data, running jobs squeue doesn't show (fewer CPUs
+        than sinfo's allocated count, @@ALLOC A/I/O/T: other users' jobs hidden), or a pending job that could go
+        first (one for this node or for any node, not waiting on a dependency or a hold)."""
+        ma = re.search(r"@@ALLOC (\d+)/\d+/\d+/(\d+)", text)
+        if "@@RUN" not in text or "@@PD" not in text or not ma:
+            return None
+        alloc, cpus = int(ma.group(1)), int(ma.group(2)) or cpus
+        run_part = text.split("@@RUN", 1)[1].split("@@PD", 1)[0]
+        pd_part = text.split("@@PD", 1)[1].split("@@END", 1)[0]
+        for line in pd_part.splitlines():
+            f = line.strip().split("|")
+            if len(f) < 3 or not f[0].strip():
+                continue
+            wants = f[1].strip()
+            if wants and node not in wants.split(",") and "[" not in wants:
+                continue                           # pending for another node (a bracketed list counts as this one)
+            if not any(f[2].strip().startswith(w) for w in Router.WAITING_REASONS):
+                return None                        # it may go first: SLURM's plan stands
+        jobs = []
+        for line in run_part.splitlines():
+            f = line.strip().split("|")
+            if len(f) < 2 or not f[0].strip().isdigit():
+                continue
+            left = L.slurm_minutes(f[1].strip())
+            if left is None:                       # no limit: it never frees its CPUs
+                left = float("inf")
+            jobs.append((left, int(f[0])))
+        if sum(c for _, c in jobs) < alloc:
+            return None                            # CPUs in use by jobs squeue doesn't list
+        free = cpus - sum(c for _, c in jobs)
+        if free >= procs:
+            return 0.0, f"starts now ({free} of {cpus} CPUs free on node {node})"
+        for left, c in sorted(jobs):
+            free += c
+            if free >= procs and left != float("inf"):
+                return float(left), (f"{procs} CPUs free on node {node} in {left:.0f} min, when its running jobs "
+                                     f"end (the jobs pending there wait on a dependency or a hold)")
+        return None
+
     def expected_start(self, name: str, st: dict, procs: int, minutes: float, mem_mb: float | None) -> tuple:
         """Minutes until a job of this size would start on the machine, and why."""
         ex = st.get("executor") or {}
@@ -902,6 +946,14 @@ class Router:
             script = (f'd=$(sbatch --test-only {size} -t {mins}{mem} --wrap=true 2>&1); echo "$d"; '
                       f's=$(echo "$d" | sed -n "s/.*to start at \\([^ ]*\\).*/\\1/p" | head -1); '
                       f'[ -n "$s" ] && echo "@@START $(date -d "$s" +%s 2>/dev/null) $(date +%s)"')
+            node = nl or (st["slurm"].get("node") or "")
+            if node and "," not in node:
+                # the node's own picture, for when SLURM's plan is later than its running jobs allow (spark2,
+                # 2026-11-19: --test-only said 12:41 while the only running job ended at 11:06 and the only pending
+                # one waited on it)
+                script += (f'; echo "@@ALLOC $(sinfo -h -n {shlex.quote(node)} -o %C 2>/dev/null | head -n 1)"; '
+                           f'echo "@@RUN"; squeue -h -t R -w {shlex.quote(node)} -o "%C|%L" 2>/dev/null; '
+                           f'echo "@@PD"; squeue -h -t PD -o "%C|%n|%r" 2>/dev/null; echo "@@END"')
             if nl:
                 # a node of a cluster: SLURM's estimate counts every running job's whole time limit, those on the
                 # other nodes included. All CPUs of the node idle and nothing pending for it: it starts now.
@@ -930,6 +982,11 @@ class Router:
                     free = (sl.get("cpus") or 0) - (sl.get("cpus_allocated") or 0)
                     why = ("starts now" if wait < 0.5 else f"SLURM expects a start in {wait:.0f} min") + \
                           f" ({free} of {sl.get('cpus')} CPUs free" + (f" on node {nl}" if nl else "") + ")"
+                    own = self.node_start(r.stdout, procs, sl.get("cpus") or 0, node)
+                    if own is not None and own[0] < wait - 5:
+                        why = (f"{own[1]} (SLURM's plan says {wait:.0f} min, later than the node's running jobs "
+                               f"allow)")
+                        wait = own[0]
                     res = (wait, why)
                 else:
                     res = (None, "sbatch --test-only gave no start time: " + (r.stdout + r.stderr).strip()[-160:])
