@@ -56,7 +56,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "2026.11.18.2"
+__version__ = "2026.11.18.3"
 
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
@@ -526,13 +526,21 @@ def runtime_status(keys: list[str]) -> dict | None:
         state, commit = ("release", (r_.get("commit") or "")[:7]) if r_ else ("absent", "")
     else:
         state, commit = submodule_states().get(repo, ("absent", ""))
-    installed = None
+    installed = dist = None
     if VPY.exists():
-        r = run([VPY, "-c", "import llmt_runtime; print(llmt_runtime.__version__)"], capture=True, check=False)
-        installed = r.stdout.strip() or None if r.returncode == 0 else None
+        # the code's version, and pip's record of the install: an editable install runs the new code but keeps the
+        # version it was installed with, which is what the translators' floors are checked against (2026.11.18.3:
+        # the Mac showed rt 2026.11.18.5 while feat and lmpt saw 2026.11.18.4)
+        r = run([VPY, "-c", "import llmt_runtime\ntry:\n from importlib.metadata import version; d = version('llmt-runtime')\n"
+                            "except Exception:\n d = ''\nprint(llmt_runtime.__version__); print(d)"],
+                capture=True, check=False)
+        lines = r.stdout.strip().splitlines() if r.returncode == 0 else []
+        installed = (lines[0].strip() or None) if lines else None
+        dist = (lines[1].strip() or None) if len(lines) > 1 else None
     here = [k for k in keys if (ROOT / REGISTRY[k]["repo"] / "pyproject.toml").exists()]
     return {"repo": repo, "submodule": state, "commit": commit, "version": runtime_version_at(),
-            "installed": installed, "floors": runtime_floors(here), "problems": runtime_problems(here)}
+            "installed": installed, "dist_version": dist, "floors": runtime_floors(here),
+            "problems": runtime_problems(here)}
 
 
 def with_uses(keys: list[str], interactive: bool, assume_yes: bool) -> list[str]:
@@ -1467,6 +1475,9 @@ def print_status(data: dict, verbose: bool) -> None:
         say(f"  {'rt':5} {ver:14} {rt['commit'] or '-':8} {rt['submodule']:10} llmt-runtime; needed by: {need}")
         if rt.get("installed") and rt.get("version") and vnorm(rt["installed"]) != vnorm(rt["version"]):
             say(f"{'':8}! llmt-runtime: the venv has {rt['installed']}, the checkout {rt['version']}: llmt update --no-pull")
+        elif rt.get("dist_version") and rt.get("installed") and vnorm(rt["dist_version"]) != vnorm(rt["installed"]):
+            say(f"{'':8}! llmt-runtime: installed as {rt['dist_version']}, code {rt['installed']} (the translators check "
+                f"their floors against {rt['dist_version']}): llmt update --no-pull")
         used = {k: ((d.get("status") or {}).get("executor") or {}).get("runtime")
                 for k, d in data["translators"].items() if isinstance(d.get("status"), dict)}
         for k, v in used.items():
