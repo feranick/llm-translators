@@ -12,7 +12,7 @@ To build a new translator for another backend program, start a new chat with thi
 
 print3d_translator (`p3dt`, OrcaSlicer) is a sixth translator, kept outside llm-translators; it runs only on the Mac.
 
-This guide follows cfd-translator 2026.11.18.8 on llmt-runtime 2026.11.18.5, the most complete of them. It has:
+This guide follows cfd-translator 2026.11.23.1 on llmt-runtime 2026.11.19.2, the most complete of them. It has:
 
 - The shared code from **llmt-runtime** (SLURM executor, worker pools, requests, the MCP server's wrapper), used through its functions, not copied.
 - SLURM jobs sized before submission, per-study `run` settings within machine caps, runs that wait for other runs (`run.after`), multi-job runs, and `cancel(at="job_end")`.
@@ -121,7 +121,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Nicola Ferralis", email = "ferralis@generalflash.com" }]
 license = { text = "MIT" }
-dependencies = ["llmt-runtime>=2026.11.18.5", "numpy>=1.22", "scipy>=1.8"]   # + "matplotlib>=3.5" if it renders
+dependencies = ["llmt-runtime>=2026.11.19.2", "numpy>=1.22", "scipy>=1.8"]   # + "matplotlib>=3.5" if it renders
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.2"]
@@ -139,7 +139,7 @@ packages = ["<name>_translator"]
 **llmt-runtime is a floor only, never an upper bound,** and it is not on PyPI. Inside llm-translators, `llmt install`, `update` and `deploy` install the umbrella's pinned copy first. Outside it, `requirements-standalone.txt` installs it from its git tag:
 
 ```
-llmt-runtime @ git+https://github.com/feranick/llmt-runtime@2026.11.18.5
+llmt-runtime @ git+https://github.com/feranick/llmt-runtime@2026.11.19.2
 ```
 
 Keep the floor and that tag at the same version, and raise both whenever the translator starts using something new in the runtime. A runtime fix gets a new version number: never a second commit under the same number. A floor can't tell two commits of one version apart, and the tag names only one of them (llmt-runtime 2026.11.18.2, November 2026).
@@ -168,7 +168,7 @@ The same functions and shapes as cfdt, so the model, the CLI and llm-translators
 | `status(request, wait)` | The same shape, for an existing request. It works from any server process: read files and the queue, never in-memory handles. SLURM studies still pending are returned after at most about 15 s, because they don't need the server. |
 | `bench(names, solver, wait_s)` | Runs or submits the benchmarks and returns within `wait_s`: `{bench, passed, failed, skipped, pending, cases: {name: {checks: [{what or quantity, expected, got, error, tol, passed}], ...}}}`. |
 | `bench_status(bench, wait_s)` | Evaluates the benchmarks of an earlier `bench` that have finished since. |
-| `jobs(limit, active)`, `cancel(request, names, at)` | As in docs/EXECUTION.md, through `RT.jobs.list_jobs` and `RT.jobs.cancel_request(..., at=at)`. `cancel` also writes a `cancel` flag file, which stops a local run in whatever process runs it. `at` is `"now"` (the default) or `"job_end"`: the running job finishes and no next job follows. The router supplies `at` when the tool lacks it. |
+| `jobs(limit, active)`, `cancel(request, names, at)` | As in docs/EXECUTION.md, through `RT.jobs.list_jobs` and `RT.jobs.cancel_request(..., at=at)`. A translator that runs studies in the local pool too passes `all_requests=True`, so `jobs()` also lists requests and studies without a SLURM job. Its own states and row keys go in through the hooks `jobs_states`, `jobs_row` and `jobs_answer`, not a `jobs()` of its own (omct kept one until 2026.11.19). `cancel` also writes a `cancel` flag file, which stops a local run in whatever process runs it. `at` is `"now"` (the default) or `"job_end"`: the running job finishes and no next job follows. The router supplies `at` when the tool lacks it. |
 | `read_file(path, max_mb)` | Base64 of a file under `<KEY>_OUT` only. |
 | `tool_status()` | Versions and what the machine has: `{translator, <backend key>: ..., procs, executor: {kind, sbatch, min_minutes, procs, time_limit_min, timeout_s, caps, runtime}, <other translator>: version or null}`. `caps` includes `mem`, `mem_mb` and `mem_from`: the router leaves out machines below a study's `run.mem`. llm-translators reads it, as described below. |
 | `inputs(study, name)` | The backend's inputs for one study, without running (cfdt `case`, feat `deck`, lmpt `inputs`). |
@@ -273,11 +273,13 @@ A translator outside llm-translators, like p3dt, gets its settings from its MCP 
 
 Implement [EXECUTION.md](EXECUTION.md) from the start with **llmt-runtime**, not a copy of another translator's `executor.py`:
 - **Setup:** declare `llmt-runtime>=<current version>` in `pyproject.toml`, and build one `Runtime(prefix=..., cli=..., package=..., version=__version__, kind="mpi" | "threads", hooks=Hooks(...))` in `runtime.py`.
-- **Hooks:** give the runtime what is yours: the job's procs and memory from the study's size, the time per study, the advice after an out-of-memory kill, and `running_progress`, which `jobs()` and the `waiting` reason use.
+- **Hooks:** give the runtime what is yours: the job's procs and memory from the study's size, the time per study, the advice after an out-of-memory kill, `running_progress` (which `jobs()` and the `waiting` reason use), and `log_args` (a short summary of each tool call's arguments for the server log).
 - **What else it provides:**
   - `llmt_runtime.server.Server`: the tool wrapper and stale-install handling for `mcp_server.py`;
   - `llmt_runtime.workers`: the pools and their parent watch;
+  - `llmt_runtime.requests`: request folders and names, clock times, and the call's time budget (`within_call(wait)`, `until`): use these rather than a deadline helper of your own;
   - `llmt_runtime.testing.fake_slurm`: the fake SLURM for the tests.
+- **Records the runtime writes:** `job.json` holds the job's own time limit (`time_min`), what the runs need (`need_min`), the study's estimate (`estimate_min`) and where the time came from (`time_from`), and the node a job ran on (`ran_on`). Don't write these through `extra`. `Runtime(queue_user_only=True)` makes queue counts the user's own jobs only.
 - **Docs:** its README lists the API and hooks, and its `TRANSLATOR_CHATS.md` says what changed for translators, version by version.
 
 Shared behaviour belongs in the runtime. When this translator needs something every translator would need, ask for it there instead of writing it here.
@@ -431,6 +433,7 @@ Add an entry; cfdt's is the fullest example. The fields, with what `llmt` and th
 - **`backends[].key` must match a key of the translator's `tool_status()`.** `llmt` reads that value as:
   - **missing:** `null`, `false`, or a dict with `error`;
   - **found:** a dict with `version`, `exe`, `foamRun` or `bashrc`, or a string such as a path. An absolute path that does not exist counts as missing.
+- **`extras` and `optional_extras` must exist** in the translator's `pyproject.toml` (`[project.optional-dependencies]`). pip skips an extra a package doesn't define, with only a warning: feat asked for `remnder` from 2026-10-28 to 2026-11-19 and installed without rendering. llm-translators' tests check this for every checked-out translator.
 - **`env` lists every setting the translator reads,** each with a one-line description and its default. It becomes the commented template in `config/env`, and setup prompts for the backend paths among them. To list them all, search the code: `grep -rhoE "<KEY>_[A-Z_]+" <name>_translator/*.py | sort -u`.
 
 ### 4. Document the backend
@@ -502,7 +505,7 @@ Later versions: `./llmt pin <key> --commit --push` here, then `./llmt update` on
 **In llm-translators:**
 
 - [ ] Submodule added (relative URL, branch main).
-- [ ] `translators.json` entry; backend keys match `tool_status()`; all settings in `env`; `after_since`, and `chain` if it has a chain mode.
+- [ ] `translators.json` entry; backend keys match `tool_status()`; every extra defined in its `pyproject.toml`; all settings in `env`; `after_since`, and `chain` if it has a chain mode.
 - [ ] `BACKENDS.md` section and table row; `README.md` row.
 - [ ] `llmt install / status / test / bench / tune / mcp test` pass.
 - [ ] Committed and pushed; `llmt install <key>` and `llmt tune <key>` on the machines that run it (or `deploy` on shared servers); `llmt mcp setup` and `llmt mcp test <key>` on the clients.
