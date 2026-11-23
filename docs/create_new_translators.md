@@ -32,6 +32,8 @@ Part 1 describes the translator (its own repository). Part 2 adds it to the umbr
 
 ### The idea
 
+[how_a_translator_works.pdf](how_a_translator_works.pdf) explains this in ten slides, for an audience new to it.
+
 An LLM is good at turning a request into a structured description, and bad at the bookkeeping a solver needs. A translator splits the work:
 
 1. **The LLM writes a study.** This is JSON, with a short, documented format: the physical problem in the user's terms (geometry or structure, materials, conditions, what to compute, expected values).

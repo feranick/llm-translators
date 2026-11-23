@@ -640,5 +640,6 @@ Users then remove their entries and alias as above, plus `~/.config/llm-translat
 - [docs/EXECUTION.md](docs/EXECUTION.md): the SLURM contract the translators implement.
 - [docs/ROUTER.md](docs/ROUTER.md): the router, which spreads one translator over several machines.
 - [docs/create_new_translators.md](docs/create_new_translators.md): building a new translator and adding it here.
+- [docs/how_a_translator_works.pdf](docs/how_a_translator_works.pdf): ten slides on how a request in words becomes a checked solver run (the study, validation, translation, checks).
 
   
