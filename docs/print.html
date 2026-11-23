@@ -1,0 +1,317 @@
+<!doctype html><html><head><meta charset='utf-8'><title>How a Translator Works</title><style>@font-face{font-family:'IBM Plex Sans';font-weight:400;src:url('file:///tmp/fnt/fontsource-ibm-plex-sans-5.3.0/files/ibm-plex-sans-latin-400-normal.woff')}@font-face{font-family:'IBM Plex Sans';font-weight:500;src:url('file:///tmp/fnt/fontsource-ibm-plex-sans-5.3.0/files/ibm-plex-sans-latin-500-normal.woff')}@font-face{font-family:'IBM Plex Sans';font-weight:600;src:url('file:///tmp/fnt/fontsource-ibm-plex-sans-5.3.0/files/ibm-plex-sans-latin-600-normal.woff')}@font-face{font-family:'IBM Plex Sans';font-weight:700;src:url('file:///tmp/fnt/fontsource-ibm-plex-sans-5.3.0/files/ibm-plex-sans-latin-700-normal.woff')}@font-face{font-family:'JetBrains Mono';font-weight:400;src:url('file:///tmp/fnt/fontsource-jetbrains-mono-5.3.0/files/jetbrains-mono-latin-400-normal.woff')}@font-face{font-family:'JetBrains Mono';font-weight:600;src:url('file:///tmp/fnt/fontsource-jetbrains-mono-5.3.0/files/jetbrains-mono-latin-600-normal.woff')}
+@page { size: 1920px 1080px; margin: 0 }
+* { margin: 0 }
+body { font: 32px/1.2 'IBM Plex Sans', 'DejaVu Sans', sans-serif }
+section { width: 1920px; height: 1080px; overflow: hidden; position: relative; page-break-after: always; box-sizing: border-box }
+section:last-of-type { page-break-after: auto }
+aside { display: none }
+h1 { font-size: 96px; font-weight: 600 } h2 { font-size: 64px; font-weight: 600 } h3 { font-size: 44px; font-weight: 600 }
+table { border-collapse: separate; border-spacing: 0 }
+th, td { padding: .35em .6em; text-align: left; border-bottom: 2px solid #0002 }
+.arrow { font-size: 44px; font-weight: 700; color: #14213D; line-height: 1 }
+:root {
+  --ink: #14213D;
+  --paper: #F7F5EF;
+  --paper2: #ECE9E0;
+  --soft: #4A5568;
+  --accent: #D9662B;
+  --accent-dark: #A8481A;
+  --accent-light: #F2A65A;
+  --on-dark-soft: #C3CCDB;
+  --code-bg: #1B2A4A;
+}
+
+body {
+  font-family: 'IBM Plex Sans', Arial, sans-serif;
+  color: var(--ink);
+}
+
+section {
+  padding: 128px;
+  background: var(--paper);
+  color: var(--ink);
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+section.dark { background: var(--ink); color: var(--paper); }
+section.alt { background: var(--paper2); }
+section.statement { background: var(--accent); color: var(--ink); justify-content: center; }
+
+.eyebrow {
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--accent-dark);
+  margin: 0 0 16px 0;
+}
+section.dark .eyebrow { color: var(--accent-light); }
+section.statement .eyebrow { color: var(--ink); }
+
+h1 { font-size: 104px; font-weight: 700; line-height: 1.05; margin: 0; }
+h2 { font-size: 64px; font-weight: 600; line-height: 1.1; margin: 0 0 48px 0; }
+h3 { font-size: 36px; font-weight: 600; line-height: 1.2; margin: 0 0 12px 0; }
+
+.lead { font-size: 36px; line-height: 1.4; color: var(--soft); margin: 0; }
+section.dark .lead { color: var(--on-dark-soft); }
+.body { font-size: 28px; line-height: 1.45; color: var(--soft); margin: 0; }
+.small { font-size: 24px; line-height: 1.4; color: var(--soft); margin: 0; }
+
+/* cover */
+.cover-rule { width: 160px; height: 8px; background: var(--accent); margin: 48px 0 40px 0; }
+.cover-sub { font-size: 40px; line-height: 1.35; color: var(--on-dark-soft); margin: 0; width: 1300px; }
+.cover-foot { position: absolute; left: 128px; bottom: 96px; width: 1200px; font-size: 24px; color: var(--on-dark-soft); margin: 0; }
+
+/* statement */
+.big-quote { font-size: 88px; font-weight: 700; line-height: 1.1; margin: 0 0 40px 0; width: 1500px; }
+.statement-note { font-size: 40px; line-height: 1.35; margin: 0; width: 1400px; }
+
+/* pipeline */
+.flow { display: flex; flex-direction: row; align-items: stretch; margin-top: 8px; }
+.stage {
+  width: 280px;
+  box-sizing: border-box;
+  padding: 28px 24px;
+  border: 4px solid var(--ink);
+  border-radius: 20px;
+  background: var(--paper);
+  display: flex;
+  flex-direction: column;
+}
+.stage.llm { border-color: var(--accent); background: #FBEBDD; }
+.stage.user { border-color: var(--soft); border-style: dashed; }
+.stage .who { font-size: 24px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; color: var(--soft); margin: 0 0 12px 0; }
+.stage.llm .who { color: var(--accent-dark); }
+.stage h3 { font-size: 34px; margin: 0 0 12px 0; }
+.stage .what { font-size: 26px; line-height: 1.35; color: var(--soft); margin: 0; }
+.flow-gap { width: 66px; display: flex; align-items: center; justify-content: center; }
+.flow-gap x-connector { width: 50px; color: var(--ink); border-width: 4px; }
+.legend { display: flex; flex-direction: row; gap: 56px; margin-top: 56px; align-items: center; }
+.swatch-row { display: flex; flex-direction: row; gap: 16px; align-items: center; }
+.swatch { width: 40px; height: 28px; border-radius: 6px; border: 4px solid var(--ink); background: var(--paper); }
+.swatch.llm { border-color: var(--accent); background: #FBEBDD; }
+.legend p { font-size: 26px; color: var(--soft); margin: 0; }
+.loop-note { font-size: 30px; line-height: 1.4; color: var(--ink); margin: 40px 0 0 0; width: 1500px; }
+
+/* study */
+.two-col { display: flex; flex-direction: row; gap: 64px; align-items: flex-start; }
+.col-left { width: 600px; display: flex; flex-direction: column; gap: 32px; }
+.col-right { width: 1000px; display: flex; flex-direction: column; }
+.bubble { background: var(--ink); color: var(--paper); border-radius: 24px; padding: 36px 40px; font-size: 34px; line-height: 1.35; margin: 0; }
+.code-panel { background: var(--code-bg); border-radius: 20px; padding: 40px 44px; display: flex; flex-direction: column; }
+.code { font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 24px; line-height: 1.6; color: #E8EDF5; margin: 0; white-space: nowrap; }
+.code.i1 { padding-left: 24px; }
+.code.i2 { padding-left: 48px; }
+.code.i3 { padding-left: 72px; }
+.code .k { color: #F2A65A; }
+.code .s { color: #9FD8C2; }
+.code .c { color: #9AA8C0; }
+.caption { font-size: 24px; color: var(--soft); margin: 20px 0 0 0; }
+
+/* validate */
+.msg-list { display: flex; flex-direction: column; gap: 20px; }
+.msg { display: flex; flex-direction: row; gap: 20px; align-items: flex-start; background: var(--paper); border-radius: 16px; padding: 24px 28px; border-left: 8px solid var(--accent); }
+.msg.warn { border-left: 8px solid var(--soft); }
+.msg .tag { font-size: 24px; font-weight: 700; color: var(--accent-dark); margin: 0; width: 130px; flex-shrink: 0; }
+.msg.warn .tag { color: var(--soft); }
+.msg .txt { font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 25px; line-height: 1.45; color: var(--ink); margin: 0; }
+
+/* translate */
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+.card { background: var(--paper2); border-radius: 20px; padding: 36px 40px; display: flex; flex-direction: column; }
+.card .num { font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 24px; font-weight: 600; color: var(--accent-dark); margin: 0 0 8px 0; }
+.card .body { font-size: 27px; }
+.bar { margin: 40px 0 0 0; background: var(--ink); color: var(--paper); border-radius: 16px; padding: 28px 40px; font-size: 32px; font-weight: 500; }
+.bar .hl { color: var(--accent-light); }
+
+/* checks */
+.grid4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 28px; }
+.check { background: var(--paper); border-top: 8px solid var(--ink); border-radius: 12px; padding: 32px 28px; display: flex; flex-direction: column; }
+.check h3 { font-size: 32px; }
+.check .body { font-size: 26px; }
+.verdict { display: flex; flex-direction: row; gap: 28px; margin-top: 48px; align-items: center; }
+.pill { font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 28px; font-weight: 600; padding: 14px 28px; border-radius: 40px; margin: 0; white-space: nowrap; }
+.pill.ok { background: #D7EBDF; color: #1D5A3A; }
+.pill.no { background: #F6D9CB; color: #8A3412; }
+.verdict .small { width: 780px; font-size: 26px; }
+
+/* analogy table */
+table.map { font-size: 30px; color: var(--ink); width: 1664px; }
+table.map tr.head { background: var(--ink); color: var(--paper); }
+table.map tr.band { background: var(--paper2); }
+
+/* why */
+.why-row { display: flex; flex-direction: row; gap: 64px; }
+.why-col { width: 800px; display: flex; flex-direction: column; }
+.why-col h3 { margin: 0 0 24px 0; }
+.why-col ul { margin: 0; padding-left: 36px; font-size: 30px; line-height: 1.55; color: var(--soft); }
+.why-col.llm h3 { color: var(--accent-dark); }
+
+/* example */
+.steps { display: flex; flex-direction: column; gap: 22px; }
+.step { display: flex; flex-direction: row; gap: 40px; align-items: flex-start; }
+.step .lab { width: 300px; flex-shrink: 0; font-size: 28px; font-weight: 600; color: var(--accent-light); margin: 0; }
+.step .val { width: 1320px; font-size: 30px; line-height: 1.4; color: var(--paper); margin: 0; }
+.step .val .m { color: #F2D4B5; }
+.divider { height: 2px; background: #2E3D5E; }
+</style></head><body><section id="cover" class="dark">
+<p class="eyebrow">llm-translators</p>
+<h1>From intent to simulation</h1>
+<div class="cover-rule"></div>
+<p class="cover-sub">How a request in plain words becomes a solver run whose numbers you can trust</p>
+<p class="cover-foot">llm-translators · github.com/feranick/llm-translators</p>
+
+</section>
+<section id="question" class="statement">
+<p class="eyebrow">The question everyone asks</p>
+<p class="big-quote">“How does a sentence become a simulation?”</p>
+<p class="statement-note">Short answer: the LLM never writes the solver’s input. It fills in a short, documented description of the problem. Ordinary code does everything after that, and checks the result.</p>
+
+</section>
+<section id="pipeline">
+<p class="eyebrow">The pipeline</p>
+<h2>Five stages, and the LLM owns one</h2>
+<div class="flow">
+<div class="stage user"><p class="who">User</p><h3>Intent</h3><p class="what">A question in words, in the user’s own terms</p></div>
+<div class="flow-gap"><span class="arrow">&#8594;</span></div>
+<div class="stage llm"><p class="who">LLM</p><h3>Study</h3><p class="what">A short JSON description of the problem</p></div>
+<div class="flow-gap"><span class="arrow">&#8594;</span></div>
+<div class="stage"><p class="who">Code</p><h3>Validation</h3><p class="what">Static checks; every error says the fix</p></div>
+<div class="flow-gap"><span class="arrow">&#8594;</span></div>
+<div class="stage"><p class="who">Code</p><h3>Translation</h3><p class="what">Mesh, conditions, the solver’s input files</p></div>
+<div class="flow-gap"><span class="arrow">&#8594;</span></div>
+<div class="stage"><p class="who">Solver + code</p><h3>Run and checks</h3><p class="what">A result, marked reliable or not</p></div>
+</div>
+<p class="loop-note">Validation loops back to the LLM until the study is clean. The checked result goes back to the LLM, which explains it to the user.</p>
+<div class="legend">
+<div class="swatch-row"><div class="swatch llm"></div><p>The LLM: language to structure</p></div>
+<div class="swatch-row"><div class="swatch"></div><p>Deterministic code: the same study always gives the same run</p></div>
+</div>
+
+</section>
+<section id="study" class="alt">
+<p class="eyebrow">Step 1 · The LLM</p>
+<h2>Intent becomes a study</h2>
+<div class="two-col">
+<div class="col-left">
+<p class="bubble">“What’s the pressure drop of water through a 20 mm pipe at 2 L/min?”</p>
+<p class="body">The model first calls <b>study_format</b>: the vocabulary, units, conventions, an example, and what this machine can run.</p>
+<p class="body">The study is in the user’s terms. No mesh, no node numbers, no solver files.</p>
+</div>
+<div class="col-right">
+<div class="code-panel">
+<p class="code">{</p>
+<p class="code i1"><span class="k">"pipe_dp"</span>: {</p>
+<p class="code i2"><span class="k">"geometry"</span>: {<span class="k">"cylinder"</span>: {<span class="k">"d"</span>: 20, <span class="k">"l"</span>: 400}},</p>
+<p class="code i2"><span class="k">"fluid"</span>: <span class="s">"water"</span>, <span class="k">"model"</span>: <span class="s">"laminar"</span>,</p>
+<p class="code i2"><span class="k">"bcs"</span>: [</p>
+<p class="code i3">{<span class="k">"kind"</span>: <span class="s">"inlet"</span>, <span class="k">"faces"</span>: {<span class="k">"nz"</span>: -1}, <span class="k">"flow"</span>: 3.33e-5},</p>
+<p class="code i3">{<span class="k">"kind"</span>: <span class="s">"outlet"</span>, <span class="k">"faces"</span>: {<span class="k">"nz"</span>: 1}, <span class="k">"p"</span>: 0}</p>
+<p class="code i2">]</p>
+<p class="code i1">}</p>
+<p class="code">}</p>
+</div>
+<p class="caption">Simplified; key names illustrative. Units: mm, m³/s, Pa. Faces are chosen by direction, not by number.</p>
+</div>
+</div>
+
+</section>
+<section id="validate" class="alt">
+<p class="eyebrow">Step 2 · Code</p>
+<h2>Validation: errors that say the fix</h2>
+<p class="lead">Static checks before anything is computed. The model reads the messages, fixes the study, and tries again.</p>
+<div class="msg-list" style="margin-top:40px">
+<div class="msg"><p class="tag">Error</p><p class="txt">bcs[0].faces {nz: 1}: took the outlet end; the inlet is at z = 0: use {nz: -1}</p></div>
+<div class="msg"><p class="tag">Error</p><p class="txt">run.mem 200G: at most 96G on this machine; choose a machine with more, or ask for less</p></div>
+<div class="msg warn"><p class="tag">Warning</p><p class="txt">mesh.size not given: the default (1/30 of the domain diagonal) is coarse; give one</p></div>
+</div>
+<p class="caption" style="margin-top:28px">Examples of the kind of messages validation returns.</p>
+
+</section>
+<section id="translate">
+<p class="eyebrow">Step 3 · Code</p>
+<h2 style="margin-bottom:36px">The translation itself is ordinary code</h2>
+<div class="grid2">
+<div class="card"><p class="num">01</p><h3>Geometry and mesh</h3><p class="body">Built from a CAD description or a STEP file, then meshed with our own numbering.</p></div>
+<div class="card"><p class="num">02</p><h3>Boundary conditions</h3><p class="body">Placed by geometric rules; the result reports which faces each condition took.</p></div>
+<div class="card"><p class="num">03</p><h3>Physics bookkeeping</h3><p class="body">Properties, unit conversions, coefficients and solver settings, from tested code.</p></div>
+<div class="card"><p class="num">04</p><h3>Solver input</h3><p class="body">OpenFOAM case, CalculiX deck, LAMMPS script or Modelica model, written by us, then run.</p></div>
+</div>
+<p class="bar">No LLM here: <span class="hl">the same study always gives the same files</span>, and every file can be inspected.</p>
+
+</section>
+<section id="checks" class="alt">
+<p class="eyebrow">Step 4 · Code</p>
+<h2>Every run checks itself</h2>
+<div class="grid4">
+<div class="check"><h3>Invariants</h3><p class="body">Mass, momentum and energy balances; force equilibrium. On every run.</p></div>
+<div class="check"><h3>Reference</h3><p class="body">An independent solver recomputes what it can, to catch translation errors.</p></div>
+<div class="check"><h3>Benchmarks</h3><p class="body">Closed-form and published answers, each with a stated tolerance.</p></div>
+<div class="check"><h3>Expected values</h3><p class="body">The study can state what it expects; each is checked after the run.</p></div>
+</div>
+<div class="verdict">
+<p class="pill ok">reliable: true</p>
+<p class="pill no">reliable: false</p>
+<p class="small">With the reasons. The model is told not to report numbers from an unreliable run.</p>
+</div>
+
+</section>
+<section id="analogy">
+<p class="eyebrow">An analogy that lands</p>
+<h2>It works like a compiler</h2>
+<table class="map">
+<tr class="head"><th style="width:42%">Compiler</th><th>Translator</th></tr>
+<tr><td>Source code</td><td>The user’s request</td></tr>
+<tr class="band"><td>Front end: parse to an intermediate form</td><td>The LLM writes the study</td></tr>
+<tr><td>Type checker</td><td>Validation</td></tr>
+<tr class="band"><td>Back end: generate machine code</td><td>The translator writes the solver input</td></tr>
+<tr><td>Test suite</td><td>The checks on every run</td></tr>
+</table>
+<p class="body" style="margin-top:40px">The study is the intermediate form: small enough for a model to write, exact enough for code to compile.</p>
+
+</section>
+<section id="why" class="alt">
+<p class="eyebrow">Why split it this way</p>
+<h2>Each side does what it is reliable at</h2>
+<div class="why-row">
+<div class="why-col llm">
+<h3>LLMs are good at</h3>
+<ul>
+<li>Understanding what the user means</li>
+<li>Choosing the right analysis</li>
+<li>Filling in a structured form</li>
+<li>Reading results and explaining them</li>
+</ul>
+</div>
+<div class="why-col">
+<h3>Code is good at</h3>
+<ul>
+<li>Consistent numbering and bookkeeping</li>
+<li>Units and thousands of coefficients</li>
+<li>Doing the same thing every time</li>
+<li>Checking conservation laws exactly</li>
+</ul>
+</div>
+</div>
+<p class="bar">Every run is <span class="hl">reproducible and auditable</span>: the study and the generated inputs are saved.</p>
+
+</section>
+<section id="example" class="dark">
+<p class="eyebrow">Putting it together</p>
+<h2>One request, end to end</h2>
+<div class="steps">
+<div class="step"><p class="lab">You ask</p><p class="val">“What’s the pressure drop of water through a 20 mm pipe at 2 L/min?”</p></div>
+<div class="divider"></div>
+<div class="step"><p class="lab">The LLM writes</p><p class="val">A study of about 20 lines: a cylinder, water, an inlet and an outlet named by direction</p></div>
+<div class="divider"></div>
+<div class="step"><p class="lab">Validation</p><p class="val">Clean, or errors with fixes; the LLM corrects the study and resubmits</p></div>
+<div class="divider"></div>
+<div class="step"><p class="lab">The translator</p><p class="val">Meshes the pipe, applies the conditions, writes and runs the OpenFOAM case</p></div>
+<div class="divider"></div>
+<div class="step"><p class="lab">You get</p><p class="val"><span class="m">Δp in Pa · the mass balance · reliable: true</span>, explained in words</p></div>
+</div>
+
+</section>
+</body></html>
